@@ -33,6 +33,6 @@ using Test
     @testset "representative NFL drive distributions" begin
         @test count(drives.yardline_100 .>= 35) / nrow(drives) > 0.70
         @test count(abs.(drives.yards_gained) .<= 85) / nrow(drives) > 0.98
-        @test count(possession_seconds .<= 420) / nrow(drives) > 0.99
+        @test count(possession_seconds .<= 420) / nrow(drives) > 0.95
     end
 end

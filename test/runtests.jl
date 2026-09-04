@@ -167,6 +167,36 @@ using Test
         @test d.home_spread_change == 0.0
     end
 
+    @testset "summarize_drives: realistic time-of-possession sanity checks" begin
+        pbp = DataFrame(
+            game_id=[
+                "2025_01_REALISTIC", "2025_01_REALISTIC", "2025_01_REALISTIC",
+                "2025_01_REALISTIC", "2025_01_REALISTIC", "2025_01_REALISTIC",
+                "2025_01_REALISTIC", "2025_01_REALISTIC",
+            ],
+            fixed_drive=[1, 1, 1, 2, 2, 2, 3, 3],
+            home_team=["BUF", "BUF", "BUF", "BUF", "BUF", "BUF", "BUF", "BUF"],
+            away_team=["MIA", "MIA", "MIA", "MIA", "MIA", "MIA", "MIA", "MIA"],
+            posteam=["BUF", "BUF", "BUF", "MIA", "MIA", "MIA", "BUF", "BUF"],
+            defteam=["MIA", "MIA", "MIA", "BUF", "BUF", "BUF", "MIA", "MIA"],
+            play_type=["pass", "run", "punt", "pass", "run", "field_goal", "run", "run"],
+            fixed_drive_result=["Punt", "Punt", "Punt", "Field goal", "Field goal", "Field goal", "Touchdown", "Touchdown"],
+            drive_time_of_possession=["1:12", "1:12", "1:12", "5:48", "5:48", "5:48", "9:31", "9:31"],
+            yardline_100=[75.0, 70.0, 65.0, 45.0, 40.0, 28.0, 62.0, 28.0],
+            yards_gained=[8.0, 4.0, -2.0, 12.0, 4.0, 10.0, 18.0, 12.0],
+            total_home_score=[0.0, 0.0, 0.0, 0.0, 3.0, 3.0, 3.0, 10.0],
+            total_away_score=[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        )
+
+        drives = summarize_drives(pbp)
+        @test nrow(drives) == 3
+        @test count(ismissing, drives.time_of_possession) == 0
+        @test minimum(skipmissing(drives.time_of_possession)) == Second(72)
+        @test maximum(skipmissing(drives.time_of_possession)) == Second(571)
+        @test all(x -> x > Second(0), skipmissing(drives.time_of_possession))
+        @test all(x -> x < Minute(10), skipmissing(drives.time_of_possession))
+    end
+
     @testset "summarize_drives: drops synthetic marker-only drives" begin
         # nflverse inserts bookkeeping rows (e.g. "GAME", "END GAME", "END
         # QUARTER N") with `play_type === missing` to mark the start/end of a

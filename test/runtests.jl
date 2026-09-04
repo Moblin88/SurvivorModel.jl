@@ -4,12 +4,6 @@ using Dates
 using Test
 
 @testset "SurvivorModel.jl" begin
-    @testset "_first_nonmissing" begin
-        @test SurvivorModel._first_nonmissing([missing, missing, "a", "b"]) == "a"
-        @test SurvivorModel._first_nonmissing(["a", "b"]) == "a"
-        @test ismissing(SurvivorModel._first_nonmissing([missing, missing]))
-    end
-
     @testset "_parse_time_of_possession" begin
         @test SurvivorModel._parse_time_of_possession("4:01") == Second(241)
         @test SurvivorModel._parse_time_of_possession("10:00") == Minute(10)
@@ -50,6 +44,11 @@ using Test
             defteam=[
                 missing, "HOME", "HOME", "AWAY", "AWAY", "AWAY", "HOME",
                 "Y", "Y",
+            ],
+            play_type=[
+                missing, "punt", "punt", "field_goal", "field_goal",
+                "run", "pass",
+                "pass", "run",
             ],
             fixed_drive_result=[
                 "Punt", "Punt", "Punt", "Field goal", "Field goal",
@@ -138,7 +137,7 @@ using Test
         @test d4.home_spread_change == -6.0
     end
 
-    @testset "summarize_drives: all-missing yardage/time" begin
+    @testset "summarize_drives: all-missing yards_gained" begin
         pbp = DataFrame(
             game_id=["2023_01_TEST_GAME3"],
             fixed_drive=[1],
@@ -146,9 +145,10 @@ using Test
             away_team=["AWAY"],
             posteam=["HOME"],
             defteam=["AWAY"],
+            play_type=["qb_kneel"],
             fixed_drive_result=["End of half"],
-            drive_time_of_possession=[missing],
-            yardline_100=[missing],
+            drive_time_of_possession=["0:05"],
+            yardline_100=[25.0],
             yards_gained=[missing],
             total_home_score=[3.0],
             total_away_score=[7.0],
@@ -161,9 +161,39 @@ using Test
         @test d.defteam == "AWAY"
         @test d.posteam_home == true
         @test d.defteam_home == false
-        @test ismissing(d.time_of_possession)
-        @test ismissing(d.yardline_100)
-        @test ismissing(d.yards_gained)
+        @test d.time_of_possession == Second(5)
+        @test d.yardline_100 == 25.0
+        @test d.yards_gained == 0
         @test d.home_spread_change == 0.0
+    end
+
+    @testset "summarize_drives: drops synthetic marker-only drives" begin
+        # nflverse inserts bookkeeping rows (e.g. "GAME", "END GAME", "END
+        # QUARTER N") with `play_type === missing` to mark the start/end of a
+        # game, half, or quarter. These usually merge into an adjacent real
+        # drive, but occasionally end up isolated in their own drive group
+        # (e.g. when the game ends on the very last play). Such drives should
+        # be dropped entirely rather than showing up with all-missing fields.
+        pbp = DataFrame(
+            game_id=[
+                "2023_01_TEST_GAME4", "2023_01_TEST_GAME4", "2023_01_TEST_GAME4",
+            ],
+            fixed_drive=[1, 2, 2],
+            home_team=["HOME", "HOME", "HOME"],
+            away_team=["AWAY", "AWAY", "AWAY"],
+            posteam=["HOME", "AWAY", "AWAY"],
+            defteam=["AWAY", "HOME", "HOME"],
+            play_type=["run", missing, missing],
+            fixed_drive_result=["Turnover", "End of half", "End of half"],
+            drive_time_of_possession=["0:09", missing, missing],
+            yardline_100=[80.0, missing, missing],
+            yards_gained=[5.0, missing, missing],
+            total_home_score=[0.0, 0.0, 0.0],
+            total_away_score=[0.0, 0.0, 0.0],
+        )
+
+        drives = summarize_drives(pbp)
+        @test nrow(drives) == 1
+        @test only(drives.fixed_drive) == 1
     end
 end

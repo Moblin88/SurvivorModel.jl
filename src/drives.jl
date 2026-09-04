@@ -11,7 +11,7 @@ function _parse_time_of_possession(::Missing)
     return missing
 end
 function _parse_time_of_possession(s::AbstractString)
-    return canonicalize(Second(Time(s, dateformat"M:S") - Time(0)))
+    return Second(Time(s, dateformat"M:S") - Time(0))
 end
 
 """

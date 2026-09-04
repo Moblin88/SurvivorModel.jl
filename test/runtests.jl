@@ -191,7 +191,7 @@ using Test
         @test all(x -> x <= Minute(15), skipmissing(drives.time_of_possession))
         @test all(x -> 0.0 <= x <= 100.0, skipmissing(drives.yardline_100))
         @test all(x -> -80 <= x <= 80, skipmissing(drives.yards_gained))
-        @test all(x -> -28 <= x <= 28, skipmissing(drives.home_spread_change))
+        @test all(x -> -8 <= x <= 8, skipmissing(drives.home_spread_change))
     end
 
     @testset "summarize_drives: drops synthetic marker-only drives" begin

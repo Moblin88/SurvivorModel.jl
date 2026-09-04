@@ -4,7 +4,7 @@ using Dates
 using Test
 
 @testset "live drive data sanity" begin
-    drives = load_drive_pbp(seasons=[2023])
+    drives = load_drive_pbp(2023)
 
     possession_seconds = Dates.value.(drives.time_of_possession)
 

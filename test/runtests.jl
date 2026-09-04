@@ -167,17 +167,31 @@ using Test
         @test d.home_spread_change == 0.0
     end
 
-    @testset "summarize_drives: live 2025 time-of-possession sanity check" begin
-        pbp = NFLData.load_pbp(seasons=2025)
-        drives = summarize_drives(pbp)
+    @testset "load_drive_pbp: live 2025 sanity checks" begin
+        drives = load_drive_pbp(seasons=2025)
 
         @test nrow(drives) > 0
-        @test count(ismissing, drives.time_of_possession) == 0
+        @test issubset([
+            :game_id, :fixed_drive, :posteam, :defteam, :posteam_home,
+            :defteam_home, :drive_result, :time_of_possession,
+            :yardline_100, :yards_gained, :home_spread_change,
+        ], names(drives))
+
+        @test count(ismissing, drives.game_id) == 0
+        @test count(ismissing, drives.fixed_drive) == 0
         @test count(ismissing, drives.posteam) == 0
-        @test minimum(skipmissing(drives.time_of_possession)) >= Second(0)
-        @test maximum(skipmissing(drives.time_of_possession)) <= Minute(15)
+        @test count(ismissing, drives.defteam) == 0
+        @test count(ismissing, drives.drive_result) == 0
+        @test count(ismissing, drives.time_of_possession) == 0
+        @test count(ismissing, drives.yardline_100) == 0
+        @test count(ismissing, drives.yards_gained) == 0
+        @test count(ismissing, drives.home_spread_change) == 0
+
         @test all(x -> x >= Second(0), skipmissing(drives.time_of_possession))
         @test all(x -> x <= Minute(15), skipmissing(drives.time_of_possession))
+        @test all(x -> 0.0 <= x <= 100.0, skipmissing(drives.yardline_100))
+        @test all(x -> -200 <= x <= 200, skipmissing(drives.yards_gained))
+        @test all(x -> -50 <= x <= 50, skipmissing(drives.home_spread_change))
     end
 
     @testset "summarize_drives: drops synthetic marker-only drives" begin

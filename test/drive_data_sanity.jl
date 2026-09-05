@@ -30,6 +30,34 @@ using Test
         @test all(-10 .<= drives.home_spread_change .<= 10)
     end
 
+    @testset "score changes agree with drive results" begin
+        scoring_magnitudes = Dict(
+            "Field goal" => [3],
+            "Safety" => [2],
+            "Touchdown" => [4, 6, 7, 8],
+            "Opp touchdown" => [4, 6, 7, 8],
+        )
+        non_scoring_results = [
+            "End of half",
+            "Missed field goal",
+            "Punt",
+            "Turnover",
+            "Turnover on downs",
+        ]
+
+        for (result, allowed_magnitudes) in scoring_magnitudes
+            changes = drives.home_spread_change[drives.drive_result .== result]
+            @test !isempty(changes)
+            @test all(change -> abs(change) in allowed_magnitudes, changes)
+        end
+
+        for result in non_scoring_results
+            changes = drives.home_spread_change[drives.drive_result .== result]
+            @test !isempty(changes)
+            @test all(iszero, changes)
+        end
+    end
+
     @testset "representative NFL drive distributions" begin
         @test count(drives.yardline_100 .>= 35) / nrow(drives) > 0.70
         @test count(abs.(drives.yards_gained) .<= 85) / nrow(drives) > 0.98

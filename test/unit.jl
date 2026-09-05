@@ -150,8 +150,8 @@ using Test
             drive_time_of_possession=["0:05"],
             yardline_100=[25.0],
             yards_gained=[missing],
-            total_home_score=[3.0],
-            total_away_score=[7.0],
+            total_home_score=[0.0],
+            total_away_score=[0.0],
         )
 
         drives = summarize_drives(pbp)
@@ -195,5 +195,31 @@ using Test
         drives = summarize_drives(pbp)
         @test nrow(drives) == 1
         @test only(drives.fixed_drive) == 1
+    end
+
+    @testset "summarize_drives: includes score at drive start" begin
+        # A kickoff-return touchdown is scored on the first row of its
+        # fixed_drive group, so the score at the end of the previous drive is
+        # the correct baseline.
+        pbp = DataFrame(
+            game_id=["KICK_RETURN_GAME", "KICK_RETURN_GAME", "KICK_RETURN_GAME"],
+            fixed_drive=[1, 2, 2],
+            home_team=["HOME", "HOME", "HOME"],
+            away_team=["AWAY", "AWAY", "AWAY"],
+            posteam=["HOME", "AWAY", "AWAY"],
+            defteam=["AWAY", "HOME", "HOME"],
+            play_type=["punt", "kickoff", "extra_point"],
+            fixed_drive_result=["Punt", "Touchdown", "Touchdown"],
+            drive_time_of_possession=["1:00", "0:00", "0:00"],
+            yardline_100=[75.0, 100.0, 15.0],
+            yards_gained=[0.0, 0.0, 0.0],
+            total_home_score=[0.0, 0.0, 0.0],
+            total_away_score=[0.0, 6.0, 7.0],
+        )
+
+        drives = summarize_drives(pbp)
+        @test nrow(drives) == 2
+        drives = sort(drives, [:game_id, :fixed_drive])
+        @test drives.home_spread_change == [0.0, -7.0]
     end
 end

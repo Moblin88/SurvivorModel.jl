@@ -34,11 +34,10 @@ Notes on the individual fields:
   from the first play where it is present).
 - `yards_gained` is the sum of every play's `yards_gained` within the drive
   (`missing` plays are skipped; `0` if there are no non-`missing` plays).
-- `home_spread_change` is computed from the change in `total_home_score` and
-  `total_away_score` from the first to the last play of the drive, so it
-  reflects the *net* effect of the drive on the scoreboard from the home
-  team's perspective (e.g. a made field goal is `+3`, an opponent pick-six
-  with a good PAT is `-7`).
+- The ending home and away scores are retained temporarily so
+  [`summarize_drives`](@ref) can calculate `home_spread_change` against the
+  previous drive's ending score. This captures scoring plays that occur on
+  the first row of a drive, such as kickoff-return touchdowns.
 """
 function _summarize_drive(sub::AbstractDataFrame)
     home_team = sub.home_team[1]
@@ -58,13 +57,13 @@ function _summarize_drive(sub::AbstractDataFrame)
 
     yards_gained = sum(skipmissing(sub.yards_gained); init=0)
 
-    home_score_change = sub.total_home_score[end] - sub.total_home_score[begin]
-    away_score_change = sub.total_away_score[end] - sub.total_away_score[begin]
-    home_spread_change = home_score_change - away_score_change
+    end_home_score = sub.total_home_score[end]
+    end_away_score = sub.total_away_score[end]
 
     return (;
         posteam, defteam, posteam_home, defteam_home,
-        drive_result, time_of_possession, yardline_100, yards_gained, home_spread_change,
+        drive_result, time_of_possession, yardline_100, yards_gained,
+        end_home_score, end_away_score,
     )
 end
 
@@ -88,8 +87,9 @@ Given a play-by-play `DataFrame` as returned by `NFLData.load_pbp`, return a
   drive (nflverse's `yardline_100` convention: 0 = opponent's goal line, 100 =
   own goal line).
 - `yards_gained`: net yards gained over the course of the drive.
-- `home_spread_change`: change in the score margin from the home team's
-  perspective (positive means the home team gained ground).
+- `home_spread_change`: net score change relative to the previous drive's
+  ending score (or 0-0 for the first drive), from the home team's perspective.
+  This includes scoring that occurs on the first row of a drive.
 
 Some plays are missing data (e.g. the synthetic "GAME" row, timeouts, or
 administrative plays), so fields that are constant across a drive are pulled
@@ -108,7 +108,17 @@ summarizing, rather than appearing as a drive with all-`missing` fields.
 function summarize_drives(pbp::AbstractDataFrame)
     grouped = groupby(pbp, [:game_id, :fixed_drive]; skipmissing=true)
     real_drives = filter(sub -> !all(ismissing, sub.play_type), grouped)
-    return combine(_summarize_drive, real_drives)
+    drives = combine(_summarize_drive, real_drives)
+    sort!(drives, [:game_id, :fixed_drive])
+
+    transform!(
+        groupby(drives, :game_id),
+        [:end_home_score, :end_away_score] => ((home, away) ->
+            vcat(home[1], diff(home)) .- vcat(away[1], diff(away))) =>
+        :home_spread_change,
+    )
+
+    return select!(drives, Not([:end_home_score, :end_away_score]))
 end
 
 """

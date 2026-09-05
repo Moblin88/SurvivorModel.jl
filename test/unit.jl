@@ -11,6 +11,13 @@ using Test
         @test ismissing(SurvivorModel._parse_time_of_possession(missing))
     end
 
+    @testset "_parse_drive_start_yards_to_goal" begin
+        @test SurvivorModel._parse_drive_start_yards_to_goal("HOME 25", "HOME") == 75
+        @test SurvivorModel._parse_drive_start_yards_to_goal("AWAY 25", "HOME") == 25
+        @test SurvivorModel._parse_drive_start_yards_to_goal("50", "HOME") == 50
+        @test ismissing(SurvivorModel._parse_drive_start_yards_to_goal(missing, "HOME"))
+    end
+
     @testset "summarize_drives" begin
         # A hand-built play-by-play DataFrame exercising the tricky cases:
         #   - a "GAME" marker row with missing posteam/defteam/etc. (drive 1)
@@ -44,6 +51,10 @@ using Test
             defteam=[
                 missing, "HOME", "HOME", "AWAY", "AWAY", "AWAY", "HOME",
                 "Y", "Y",
+            ],
+            drive_start_yard_line=[
+                missing, "AWAY 25", "AWAY 30", "HOME 40", "HOME 45",
+                "HOME 20", "HOME 20", "X 35", "X 40",
             ],
             play_type=[
                 missing, "punt", "punt", "field_goal", "field_goal",
@@ -91,7 +102,7 @@ using Test
         @test d1.defteam_home == true
         @test d1.drive_result == "Punt"
         @test d1.time_of_possession == Second(120)
-        @test d1.yardline_100 == 75.0 # first non-missing (GAME row is missing)
+        @test d1.drive_start_yards_to_goal == 75
         @test d1.yards_gained == 8.0
         @test d1.home_spread_change == 0.0
 
@@ -104,7 +115,7 @@ using Test
         @test d2.defteam_home == false
         @test d2.drive_result == "Field goal"
         @test d2.time_of_possession == Second(210)
-        @test d2.yardline_100 == 60.0
+        @test d2.drive_start_yards_to_goal == 60
         @test d2.yards_gained == 30.0
         @test d2.home_spread_change == 3.0
 
@@ -118,7 +129,7 @@ using Test
         @test d3.defteam_home == false
         @test d3.drive_result == "Opp touchdown"
         @test d3.time_of_possession == Second(75)
-        @test d3.yardline_100 == 80.0
+        @test d3.drive_start_yards_to_goal == 80
         @test d3.yards_gained == -5.0 # missing play skipped
         @test d3.home_spread_change == -7.0
 
@@ -132,7 +143,7 @@ using Test
         @test d4.defteam_home == true
         @test d4.drive_result == "Touchdown"
         @test d4.time_of_possession == Second(45)
-        @test d4.yardline_100 == 65.0
+        @test d4.drive_start_yards_to_goal == 65
         @test d4.yards_gained == 75.0
         @test d4.home_spread_change == -6.0
     end
@@ -145,6 +156,7 @@ using Test
             away_team=["AWAY"],
             posteam=["HOME"],
             defteam=["AWAY"],
+            drive_start_yard_line=["HOME 25"],
             play_type=["qb_kneel"],
             fixed_drive_result=["End of half"],
             drive_time_of_possession=["0:05"],
@@ -162,7 +174,7 @@ using Test
         @test d.posteam_home == true
         @test d.defteam_home == false
         @test d.time_of_possession == Second(5)
-        @test d.yardline_100 == 25.0
+        @test d.drive_start_yards_to_goal == 75
         @test d.yards_gained == 0
         @test d.home_spread_change == 0.0
     end
@@ -183,6 +195,7 @@ using Test
             away_team=["AWAY", "AWAY", "AWAY"],
             posteam=["HOME", "AWAY", "AWAY"],
             defteam=["AWAY", "HOME", "HOME"],
+            drive_start_yard_line=["HOME 20", missing, missing],
             play_type=["run", missing, missing],
             fixed_drive_result=["Turnover", "End of half", "End of half"],
             drive_time_of_possession=["0:09", missing, missing],
@@ -208,6 +221,7 @@ using Test
             away_team=["AWAY", "AWAY", "AWAY"],
             posteam=["HOME", "AWAY", "AWAY"],
             defteam=["AWAY", "HOME", "HOME"],
+            drive_start_yard_line=["HOME 25", "AWAY 20", "AWAY 20"],
             play_type=["punt", "kickoff", "extra_point"],
             fixed_drive_result=["Punt", "Touchdown", "Touchdown"],
             drive_time_of_possession=["1:00", "0:00", "0:00"],

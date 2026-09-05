@@ -15,6 +15,23 @@ function _parse_time_of_possession(s::AbstractString)
 end
 
 """
+    _parse_drive_start_yards_to_goal(s, posteam)
+
+Convert nflverse's `drive_start_yard_line` string to the offense's distance
+from the opponent's goal line. A value such as `"DET 25"` is 75 yards to go
+when `posteam == "DET"`, while `"KC 25"` is 25 yards to go for Detroit.
+`"50"` remains 50 yards to go.
+"""
+function _parse_drive_start_yards_to_goal(::Missing, ::AbstractString)
+    return missing
+end
+function _parse_drive_start_yards_to_goal(s::AbstractString, posteam::AbstractString)
+    fields = split(s)
+    yardline = parse(Int, last(fields))
+    return length(fields) == 1 || first(fields) != posteam ? yardline : 100 - yardline
+end
+
+"""
     _summarize_drive(sub::AbstractDataFrame)
 
 Reduce the play-by-play rows belonging to a single drive (already grouped by
@@ -29,9 +46,10 @@ Notes on the individual fields:
   same as at the end (e.g. a "Opp touchdown" drive, where the defense returns
   a turnover or blocked kick for a touchdown). `posteam_home`/`defteam_home`
   are boolean indicators for whether each of those teams is the home team.
-- `yardline_100` is the distance (in yards) to the opponent's end zone at the
-  start of the drive, i.e. nflverse's own `yardline_100` convention (taken
-  from the first play where it is present).
+- `drive_start_yards_to_goal` is parsed from nflverse's
+  `drive_start_yard_line` and gives the offense's distance to the opponent's
+  goal line. It is `missing` for special-teams-only groups where nflverse does
+  not provide a drive-start yard line.
 - `yards_gained` is the sum of every play's `yards_gained` within the drive
   (`missing` plays are skipped; `0` if there are no non-`missing` plays).
 - The ending home and away scores are retained temporarily so
@@ -53,7 +71,12 @@ function _summarize_drive(sub::AbstractDataFrame)
     defteam_home = defteam == home_team
     drive_result = first(skipmissing(sub.fixed_drive_result))
     time_of_possession = _parse_time_of_possession(first(skipmissing(sub.drive_time_of_possession)))
-    yardline_100 = first(skipmissing(sub.yardline_100))
+    start_yard_line_index = findfirst(!ismissing, sub.drive_start_yard_line)
+    drive_start_yards_to_goal = isnothing(start_yard_line_index) ? missing :
+        _parse_drive_start_yards_to_goal(
+            sub.drive_start_yard_line[start_yard_line_index],
+            posteam,
+        )
 
     yards_gained = sum(skipmissing(sub.yards_gained); init=0)
 
@@ -62,7 +85,7 @@ function _summarize_drive(sub::AbstractDataFrame)
 
     return (;
         posteam, defteam, posteam_home, defteam_home,
-        drive_result, time_of_possession, yardline_100, yards_gained,
+        drive_result, time_of_possession, drive_start_yards_to_goal, yards_gained,
         end_home_score, end_away_score,
     )
 end
@@ -83,9 +106,9 @@ Given a play-by-play `DataFrame` as returned by `NFLData.load_pbp`, return a
   `"Turnover"`, `"Field goal"`, `"Opp touchdown"`, etc.
 - `time_of_possession`: duration of possession during the drive, as a
   `Dates.CompoundPeriod` in mixed minutes/seconds (or `missing`).
-- `yardline_100`: distance to the opponent's end zone at the start of the
-  drive (nflverse's `yardline_100` convention: 0 = opponent's goal line, 100 =
-  own goal line).
+- `drive_start_yards_to_goal`: offensive distance to the opponent's goal line
+  at the start of the drive, parsed from nflverse's
+  `drive_start_yard_line` (or `missing` when nflverse does not provide it).
 - `yards_gained`: net yards gained over the course of the drive.
 - `home_spread_change`: net score change relative to the previous drive's
   ending score (or 0-0 for the first drive), from the home team's perspective.

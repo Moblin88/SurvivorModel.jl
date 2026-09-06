@@ -171,3 +171,49 @@ SURVIVORMODEL_RUN_CALIBRATION=true julia --project=. test/calibration_live.jl
 
 The live report is diagnostic and does not impose an arbitrary model-quality
 threshold on CI.
+
+## Survivor-pool planning
+
+Use a fitted regular-season context to create one forward survivor pick per
+week while preventing team reuse:
+
+```julia
+context = fit_regular_season_forecast(2025; as_of_week=1)
+
+plan = optimize_survivor_pool(
+    context;
+    picks_made=Dict{Int,String}(),
+    strikes_remaining=1,
+    weekly_survival_probability=0.65,
+)
+
+plan.current_pick
+plan.selections
+plan.objective_value
+```
+
+The optimizer expands each unplayed forecast game into a home-team and
+away-team candidate, excludes teams in `picks_made`, and solves one binary
+assignment model with JuMP and HiGHS. It selects exactly one team for every
+week in the requested horizon and allows each team to be selected at most
+once. `plan.selections` includes each selected team's win probability, reach
+discount, and discounted objective contribution; `plan.current_pick` is the
+row to use for the current week.
+
+The objective is expected future wins weighted by your personal probability of
+still being alive before each week. It does not estimate the probability that
+the entire pool survives and does not use sportsbook lines. With fixed weekly
+survival probability `q`, no remaining strikes uses `d[k] = q^k`, where `k`
+is the number of prior planned weeks. With `s` remaining strikes, the
+discount is the probability of having at most `s` losses in those prior weeks:
+`d[k] = sum(binomial(k, losses) * (1-q)^losses * q^(k-losses))` for
+`losses = 0:min(s, k)`. For example, with `q = 0.65` and one unused strike,
+the first discounts are `1.0, 1.0, 0.8775, 0.71825`.
+
+After each week, refresh the forecast context with the new `as_of_week`,
+record the team picked in `picks_made`, update `strikes_remaining`, and call
+`optimize_survivor_pool` again. The optimizer itself performs one forecast
+pass and one solve; it does not iteratively recompute discounts from the
+selected teams' probabilities. For deterministic evaluation or custom
+forecasts, call `build_survivor_candidates` and pass its result to
+`optimize_survivor_pool(candidates, state)`.

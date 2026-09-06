@@ -4,10 +4,12 @@ using DataFrames
 using Dates
 using Distributions
 using ForwardDiff
+using HiGHS
 using NFLData
 using Optim
 using SpecialFunctions
 using Statistics
+using JuMP
 
 export load_drive_pbp, summarize_drives
 export DEFAULT_TIME_EDGES, GAME_CLOCK_SECONDS
@@ -23,6 +25,10 @@ export expected_game_metrics
 export load_schedule, regular_season_results
 export RegularSeasonForecastContext, fit_regular_season_forecast
 export forecast_win_probabilities, forecast_spreads, forecast_regular_season
+export DEFAULT_SURVIVOR_WEEKLY_SURVIVAL_PROBABILITY
+export SurvivorPoolState, SurvivorPoolPlan
+export build_survivor_candidates, survivor_reach_discounts
+export optimize_survivor_pool
 export CalibrationReport, brier_score, log_loss, reliability_bins
 export score_difference_metrics, spread_reliability_bins
 export spread_interval_coverage
@@ -31,6 +37,7 @@ export evaluate_calibration
 include("drives.jl")
 include("model.jl")
 include("schedule.jl")
+include("survivor.jl")
 include("calibration.jl")
 
 end

@@ -85,6 +85,21 @@ spreads = forecast_spreads(context)
 results = regular_season_results(2024; from_week=10)
 ```
 
+When generating several weekly snapshots for the same target season, fit the
+historical prior once and pass it to each call as `prior=...`. This avoids
+repeating the empirical-Bayes hyperparameter and recency fits while retaining
+the week-specific current-season update:
+
+```julia
+first_context = fit_regular_season_forecast(2024; as_of_week=10)
+prior = first_context.model.prior
+next_context = fit_regular_season_forecast(
+    2024;
+    as_of_week=11,
+    prior=prior,
+)
+```
+
 `forecast_regular_season(2024; as_of_week=10)` remains the convenience
 function that returns schedule scores/results, home and away probabilities,
 `expected_spread`, `predictive_spread_variance`, and `game_completed` in one
@@ -217,3 +232,31 @@ pass and one solve; it does not iteratively recompute discounts from the
 selected teams' probabilities. For deterministic evaluation or custom
 forecasts, call `build_survivor_candidates` and pass its result to
 `optimize_survivor_pool(candidates, state)`.
+
+To replay the strategy against completed historical seasons, run the opt-in
+survivor harness:
+
+```sh
+SURVIVORMODEL_RUN_SURVIVOR=true julia --project=. test/survivor_live.jl
+```
+
+By default it evaluates the three most recent completed regular seasons with
+one and two initial strikes and `weekly_survival_probability = 0.65`. It
+refits the forecast context before each week using only drives before that
+week, reuses the same weekly forecast for both strike scenarios, applies
+historical wins and losses (ties count as losses), and prints a summary with
+the last week survived, elimination week/reason, wins, losses, and picks.
+Override the inputs with environment variables such as:
+
+```sh
+SURVIVORMODEL_RUN_SURVIVOR=true \
+SURVIVORMODEL_SURVIVOR_SEASONS=2021,2022,2023,2024 \
+SURVIVORMODEL_SURVIVOR_WEEKLY_SURVIVAL=0.65 \
+julia --project=. test/survivor_live.jl
+```
+
+Use `SURVIVORMODEL_SURVIVOR_RECENT_SEASONS` when selecting the latest completed
+seasons, and `SURVIVORMODEL_SURVIVOR_MAX_SEASONS` to change the historical
+training window. The harness is opt-in because it downloads live schedules and
+play-by-play data and reruns one pre-week forecast per regular-season week
+(17 weeks for seasons through 2020 and 18 weeks from 2021 onward).

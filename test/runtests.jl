@@ -11,4 +11,7 @@ using Test
     if get(ENV, "SURVIVORMODEL_RUN_CALIBRATION", "false") == "true"
         include("calibration_live.jl")
     end
+    if get(ENV, "SURVIVORMODEL_RUN_SURVIVOR", "false") == "true"
+        include("survivor_live.jl")
+    end
 end

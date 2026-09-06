@@ -162,6 +162,21 @@ end
             horizon=60.0,
         )
         @test direct_probability ≈ metrics.expected_win_probability
+
+        reused_prior_context = fit_regular_season_forecast(
+            2023;
+            as_of_week=2,
+            schedule=schedule,
+            historical_drives=historical,
+            current_drives=current,
+            prior=context.model.prior,
+            time_edges=[0, Inf],
+        )
+        reused_prior = forecast_win_probabilities(reused_prior_context)
+        @test reused_prior.home_win_probability ≈
+            probabilities.home_win_probability
+        @test reused_prior.away_win_probability ≈
+            probabilities.away_win_probability
     end
 
     @testset "schedule-only historical results" begin

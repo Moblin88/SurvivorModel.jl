@@ -121,16 +121,22 @@ plays entirely.
 
 nflverse also inserts synthetic bookkeeping rows with no real play (e.g. the
 "GAME", "END GAME", and "END QUARTER N" marker rows, identifiable by having
-`play_type === missing`) to mark the start/end of a game, half, or quarter.
+`play_type === missing` or, in some older seasons, `play_type == "no_play"`).
 These normally merge into an adjacent real drive, but occasionally end up
 isolated in their own `fixed_drive` group (e.g. when the game/half ends on
-the very last play). Such groups have no real plays at all
-(`all(ismissing, play_type)`), so they are dropped entirely before
-summarizing, rather than appearing as a drive with all-`missing` fields.
+the very last play). Such groups have no real drive result
+(`all(ismissing, fixed_drive_result)`), so they are dropped entirely before
+summarizing, rather than appearing as a drive with all-`missing` fields or
+causing the summary to fail while looking for the first drive result.
 """
 function summarize_drives(pbp::AbstractDataFrame)
     grouped = groupby(pbp, [:game_id, :fixed_drive]; skipmissing=true)
-    real_drives = filter(sub -> !all(ismissing, sub.play_type), grouped)
+    real_drives = filter(
+        sub ->
+            !all(ismissing, sub.play_type) &&
+            !all(ismissing, sub.fixed_drive_result),
+        grouped,
+    )
     drives = combine(_summarize_drive, real_drives)
     sort!(drives, [:game_id, :fixed_drive])
 

@@ -183,13 +183,16 @@ end
         max_seasons=3,
         time_edges=DEFAULT_TIME_EDGES,
         recency_half_life=nothing,
+        prior=nothing,
     ) -> RegularSeasonForecastContext
 
 Fit a frozen model using regular-season data available before `as_of_week`.
 Historical seasons provide the empirical-Bayes prior; target-season drives
 from weeks before the cutoff provide the current-season update. The returned
 context can be reused to request probabilities, spreads, or the full metric
-table without reloading data or refitting the model.
+table without reloading data or refitting the model. A prior fitted for the
+same target season can be supplied when evaluating multiple weekly snapshots
+to avoid repeating the historical empirical-Bayes fit.
 """
 function fit_regular_season_forecast(
     season::Integer;
@@ -200,6 +203,7 @@ function fit_regular_season_forecast(
     max_seasons::Int=3,
     time_edges=DEFAULT_TIME_EDGES,
     recency_half_life::Union{Nothing,Real}=nothing,
+    prior::Union{Nothing,HazardPrior}=nothing,
 )
     1 <= as_of_week <= 18 ||
         throw(ArgumentError("as_of_week must be between 1 and 18"))
@@ -224,14 +228,14 @@ function fit_regular_season_forecast(
         current,
     )
 
-    prior = fit_empirical_bayes_prior(
+    fitted_prior = prior === nothing ? fit_empirical_bayes_prior(
         historical;
         time_edges=time_edges,
         max_seasons=max_seasons,
         recency_half_life=recency_half_life,
         current_season=season,
-    )
-    model = fit_hazard_model(cutoff; prior=prior, time_edges=time_edges)
+    ) : prior
+    model = fit_hazard_model(cutoff; prior=fitted_prior, time_edges=time_edges)
     marks = fit_score_marks(training)
     games = target_schedule[target_schedule.week .>= as_of_week, :]
 

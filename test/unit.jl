@@ -182,27 +182,29 @@ using Test
     @testset "summarize_drives: drops synthetic marker-only drives" begin
         # nflverse inserts bookkeeping rows (e.g. "GAME", "END GAME", "END
         # QUARTER N") with `play_type === missing` to mark the start/end of a
-        # game, half, or quarter. These usually merge into an adjacent real
-        # drive, but occasionally end up isolated in their own drive group
-        # (e.g. when the game ends on the very last play). Such drives should
-        # be dropped entirely rather than showing up with all-missing fields.
+        # game, half, or quarter. Older seasons also contain isolated
+        # `no_play` markers without a drive result. These usually merge into
+        # an adjacent real drive, but occasionally end up isolated in their
+        # own drive group. Such drives should be dropped entirely rather than
+        # showing up with all-missing fields.
         pbp = DataFrame(
             game_id=[
                 "2023_01_TEST_GAME4", "2023_01_TEST_GAME4", "2023_01_TEST_GAME4",
+                "2023_01_TEST_GAME4",
             ],
-            fixed_drive=[1, 2, 2],
-            home_team=["HOME", "HOME", "HOME"],
-            away_team=["AWAY", "AWAY", "AWAY"],
-            posteam=["HOME", "AWAY", "AWAY"],
-            defteam=["AWAY", "HOME", "HOME"],
-            drive_start_yard_line=["HOME 20", missing, missing],
-            play_type=["run", missing, missing],
-            fixed_drive_result=["Turnover", "End of half", "End of half"],
-            drive_time_of_possession=["0:09", missing, missing],
-            yardline_100=[80.0, missing, missing],
-            yards_gained=[5.0, missing, missing],
-            total_home_score=[0.0, 0.0, 0.0],
-            total_away_score=[0.0, 0.0, 0.0],
+            fixed_drive=[1, 2, 2, 3],
+            home_team=["HOME", "HOME", "HOME", "HOME"],
+            away_team=["AWAY", "AWAY", "AWAY", "AWAY"],
+            posteam=["HOME", "AWAY", "AWAY", missing],
+            defteam=["AWAY", "HOME", "HOME", missing],
+            drive_start_yard_line=["HOME 20", missing, missing, missing],
+            play_type=["run", missing, missing, "no_play"],
+            fixed_drive_result=["Turnover", "End of half", "End of half", missing],
+            drive_time_of_possession=["0:09", missing, missing, missing],
+            yardline_100=[80.0, missing, missing, missing],
+            yards_gained=[5.0, missing, missing, missing],
+            total_home_score=[0.0, 0.0, 0.0, 0.0],
+            total_away_score=[0.0, 0.0, 0.0, 0.0],
         )
 
         drives = summarize_drives(pbp)

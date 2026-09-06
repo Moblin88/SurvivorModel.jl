@@ -40,7 +40,9 @@ home_defensive_rate = hazard_rate(model, :defensive, "SF", 2; home=true)
 for each outcome and elapsed-time bin, plus one global offensive touchdown
 multiplier and one global defensive-event multiplier. The multipliers are
 positive, may be above or below 1.0, and are fitted from historical data
-alongside the league hyperparameters. Inspect them with
+alongside the league hyperparameters. The default `fit_strategy=:moments`
+uses exposure-weighted Negative Binomial moments; pass `fit_strategy=:mle`
+to use the slower iterative likelihood fit. Inspect the multipliers with
 `home_multiplier(prior, :td)` and `home_multiplier(prior, :defensive)`.
 They remain fixed when current-season data are added. The prior uses the
 most recent three seasons to form team-specific priors, measuring recency from

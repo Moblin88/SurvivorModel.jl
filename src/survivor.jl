@@ -478,6 +478,7 @@ function optimize_survivor_pool(
     max_seasons::Int=3,
     time_edges=DEFAULT_TIME_EDGES,
     recency_half_life::Union{Nothing,Real}=DEFAULT_RECENCY_HALF_LIFE,
+    fit_strategy::Symbol=:moments,
     include_completed::Bool=false,
     horizon::Real=GAME_CLOCK_SECONDS,
     optimizer=HiGHS.Optimizer,
@@ -497,6 +498,7 @@ function optimize_survivor_pool(
         max_seasons=max_seasons,
         time_edges=time_edges,
         recency_half_life=recency_half_life,
+        fit_strategy=fit_strategy,
     )
     return optimize_survivor_pool(
         context,

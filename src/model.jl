@@ -403,6 +403,110 @@ function _fit_gamma_poisson_hyperparameters(
     return GammaParams(shape, rate)
 end
 
+function _fit_gamma_poisson_moment_parameters(
+    counts::AbstractVector{<:Real},
+    exposures::AbstractVector{<:Real},
+    weights::AbstractVector{<:Real},
+)
+    length(counts) == length(exposures) == length(weights) ||
+        throw(ArgumentError("Gamma-Poisson observations must have matching lengths"))
+    valid = findall(
+        i ->
+            isfinite(counts[i]) &&
+            isfinite(exposures[i]) &&
+            isfinite(weights[i]) &&
+            exposures[i] > 0 &&
+            weights[i] > 0,
+        eachindex(exposures),
+    )
+    isempty(valid) && return GammaParams(1.0, 1.0)
+
+    total_weight = sum(weights[i] for i in valid)
+    weighted_events = sum(weights[i] * counts[i] for i in valid)
+    weighted_exposure = sum(weights[i] * exposures[i] for i in valid)
+    mean_rate = weighted_events / weighted_exposure
+    isfinite(mean_rate) && mean_rate > 0 ||
+        return GammaParams(1.0, 1.0)
+
+    second_rate_moment = sum(
+        weights[i] * (
+            counts[i]^2 - exposures[i] * mean_rate
+        ) / exposures[i]^2 for i in valid
+    ) / total_weight
+    latent_variance = second_rate_moment - mean_rate^2
+    minimum_variance = mean_rate^2 * 1e-8
+    if !isfinite(latent_variance) || latent_variance <= minimum_variance
+        return GammaParams(1.0, 1.0 / mean_rate)
+    end
+
+    shape = mean_rate^2 / latent_variance
+    rate = mean_rate / latent_variance
+    return GammaParams(
+        exp(clamp(log(shape), -12.0, 12.0)),
+        exp(clamp(log(rate), -20.0, 20.0)),
+    )
+end
+
+function _fit_home_multiplier_moments(observations)
+    home_events = 0.0
+    away_events = 0.0
+    home_exposure = 0.0
+    away_exposure = 0.0
+    for (
+        home_counts,
+        away_counts,
+        home_exposures,
+        away_exposures,
+        weights,
+    ) in observations
+        home_events += sum(weights .* home_counts)
+        away_events += sum(weights .* away_counts)
+        home_exposure += sum(weights .* home_exposures)
+        away_exposure += sum(weights .* away_exposures)
+    end
+    home_exposure > 0.0 && away_exposure > 0.0 || return 1.0
+
+    total_events = home_events + away_events
+    total_exposure = home_exposure + away_exposure
+    total_events > 0.0 || return 1.0
+    prior_exposure = total_exposure / total_events
+    home_rate = (home_events + 1.0) / (home_exposure + prior_exposure)
+    away_rate = (away_events + 1.0) / (away_exposure + prior_exposure)
+    multiplier = home_rate / away_rate
+    isfinite(multiplier) && multiplier > 0.0 ||
+        return 1.0
+    return exp(clamp(log(multiplier), -12.0, 12.0))
+end
+
+function _fit_outcome_hyperparameters_moments(observations)
+    home_multiplier = _fit_home_multiplier_moments(observations)
+    parameters = GammaParams[]
+    for (
+        home_counts,
+        away_counts,
+        home_exposures,
+        away_exposures,
+        weights,
+    ) in observations
+        effective_exposures = away_exposures .+ home_multiplier .* home_exposures
+        push!(
+            parameters,
+            _fit_gamma_poisson_moment_parameters(
+                home_counts .+ away_counts,
+                effective_exposures,
+                weights,
+            ),
+        )
+    end
+    return parameters, home_multiplier
+end
+
+function _validate_fit_strategy(fit_strategy::Symbol)
+    fit_strategy in (:moments, :mle) ||
+        throw(ArgumentError("fit_strategy must be :moments or :mle"))
+    return fit_strategy
+end
+
 function _log_gamma_poisson_home_kernel(
     home_count::Real,
     away_count::Real,
@@ -432,13 +536,18 @@ function _fit_outcome_hyperparameters(
     time_edges::AbstractVector{<:Real},
     kind::Symbol,
     reference::Int,
-    half_life::Real,
+    half_life::Real;
+    fit_strategy::Symbol=:moments,
 )
+    _validate_fit_strategy(fit_strategy)
     n_bins = length(time_edges) - 1
     observations = [
         _cell_observations(byseason, seasons, kind, k, reference, half_life)
         for k in 1:n_bins
     ]
+    fit_strategy === :moments &&
+        return _fit_outcome_hyperparameters_moments(observations)
+
     initial_parameters = GammaParams[]
     initial_values = Float64[]
     for (home_counts, away_counts, home_exposures, away_exposures, weights) in observations
@@ -496,13 +605,16 @@ function _fit_hyperparameter_vectors(
     seasons::AbstractVector{<:Integer},
     time_edges::AbstractVector{<:Real},
     reference::Int,
-    half_life::Real,
+    half_life::Real;
+    fit_strategy::Symbol=:moments,
 )
     td, td_home_multiplier = _fit_outcome_hyperparameters(
         byseason, seasons, time_edges, :td, reference, half_life,
+        fit_strategy=fit_strategy,
     )
     defensive, defensive_home_multiplier = _fit_outcome_hyperparameters(
         byseason, seasons, time_edges, :defensive, reference, half_life,
+        fit_strategy=fit_strategy,
     )
     return td, defensive, td_home_multiplier, defensive_home_multiplier
 end
@@ -762,23 +874,26 @@ end
 
 Fit separate league-level Gamma-Poisson hyperparameters for each outcome and
 elapsed-time bin using historical drives, along with one global offensive and
-one global defensive home multiplier. Team-specific priors are formed from
-at most the most recent three seasons. The default recency half-life is
-`DEFAULT_RECENCY_HALF_LIFE`; pass `recency_half_life=nothing` to estimate it
-from lag-one correlations of shrunk team-season hazard moments. The
-`half_life_candidates` keyword is retained for compatibility but is no longer
-used by the moment estimator. `current_season` is the reference point for the
-final historical weights; when omitted, it defaults to one season after the
-latest historical season.
+one global defensive home multiplier. By default, the hyperparameters use the
+fast moments fit; pass `fit_strategy=:mle` to use the iterative likelihood
+fit. Team-specific priors are formed from at most the most recent three
+seasons. The default recency half-life is `DEFAULT_RECENCY_HALF_LIFE`; pass
+`recency_half_life=nothing` to estimate it from lag-one correlations of
+shrunk team-season hazard moments. The `half_life_candidates` keyword is
+retained for compatibility but is no longer used by the moment estimator.
+`current_season` is the reference point for the final historical weights; when
+omitted, it defaults to one season after the latest historical season.
 """
 function fit_empirical_bayes_prior(
     historical_drives::AbstractDataFrame;
     time_edges=DEFAULT_TIME_EDGES,
     max_seasons::Int=3,
     recency_half_life::Union{Nothing,Real}=DEFAULT_RECENCY_HALF_LIFE,
+    fit_strategy::Symbol=:moments,
     half_life_candidates=(0.25, 0.5, 1.0, 2.0, 4.0, 8.0, Inf),
     current_season::Union{Nothing,Integer}=nothing,
 )
+    _validate_fit_strategy(fit_strategy)
     data, edges = build_exposure_data(historical_drives; time_edges=time_edges)
     byseason = _season_stats(data)
     max_seasons > 0 || throw(ArgumentError("max_seasons must be positive"))
@@ -812,7 +927,12 @@ function fit_empirical_bayes_prior(
     )
     td_hyper, defensive_hyper, td_home_multiplier, defensive_home_multiplier =
         _fit_hyperparameter_vectors(
-        byseason, seasons, edges, reference, half_life,
+        byseason,
+        seasons,
+        edges,
+        reference,
+        half_life;
+        fit_strategy=fit_strategy,
     )
     td_priors, defensive_priors = _build_team_priors(
         byseason,
@@ -895,8 +1015,10 @@ function fit_hazard_model(
     time_edges=DEFAULT_TIME_EDGES,
     max_seasons::Int=3,
     recency_half_life::Union{Nothing,Real}=DEFAULT_RECENCY_HALF_LIFE,
+    fit_strategy::Symbol=:moments,
     current_season::Union{Nothing,Integer}=nothing,
 )
+    _validate_fit_strategy(fit_strategy)
     edges = _validate_time_edges(time_edges)
     fitted_prior = if prior !== nothing
         prior.time_edges == edges ||
@@ -910,6 +1032,7 @@ function fit_hazard_model(
             time_edges=edges,
             max_seasons=max_seasons,
             recency_half_life=recency_half_life,
+            fit_strategy=fit_strategy,
             current_season=reference_season,
         )
     else
@@ -1421,11 +1544,16 @@ function _expected_game_win_probability(
             marks;
             horizon=horizon,
         ).win_probability
-    return _second_order_expectation(
+    approximation = _second_order_expectation(
         win_function,
         theta.log_mean,
         theta.covariance,
     )
+    isfinite(approximation) ||
+        throw(ArgumentError("posterior win probability is not finite"))
+    # The Hessian approximation can leave [0, 1] under high posterior
+    # uncertainty even though the underlying probability is bounded.
+    return clamp(approximation, 0.0, 1.0)
 end
 
 function _expected_game_spread_metrics(

@@ -196,6 +196,20 @@ using Test
         @test SurvivorModel.MIN_RECENCY_HALF_LIFE <=
             automatic_prior.recency_half_life <=
             SurvivorModel.MAX_RECENCY_HALF_LIFE
+        mle_prior = fit_empirical_bayes_prior(
+            historical;
+            time_edges=[0, Inf],
+            max_seasons=99,
+            recency_half_life=Inf,
+            fit_strategy=:mle,
+            current_season=2024,
+        )
+        @test all(p -> p.shape > 0 && p.rate > 0, mle_prior.td_hyperparameters)
+        @test all(p -> p.shape > 0 && p.rate > 0, mle_prior.defensive_hyperparameters)
+        @test_throws ArgumentError fit_empirical_bayes_prior(
+            historical;
+            fit_strategy=:invalid,
+        )
 
         function _moment_drives(results_by_season)
             rows = DataFrame(

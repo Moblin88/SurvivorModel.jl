@@ -184,6 +184,7 @@ end
         max_seasons=3,
         time_edges=DEFAULT_TIME_EDGES,
         recency_half_life=DEFAULT_RECENCY_HALF_LIFE,
+        fit_strategy=:moments,
         prior=nothing,
     ) -> RegularSeasonForecastContext
 
@@ -204,6 +205,7 @@ function fit_regular_season_forecast(
     max_seasons::Int=3,
     time_edges=DEFAULT_TIME_EDGES,
     recency_half_life::Union{Nothing,Real}=DEFAULT_RECENCY_HALF_LIFE,
+    fit_strategy::Symbol=:moments,
     prior::Union{Nothing,HazardPrior}=nothing,
 )
     1 <= as_of_week <= 18 ||
@@ -234,6 +236,7 @@ function fit_regular_season_forecast(
         time_edges=time_edges,
         max_seasons=max_seasons,
         recency_half_life=recency_half_life,
+        fit_strategy=fit_strategy,
         current_season=season,
     ) : prior
     model = fit_hazard_model(cutoff; prior=fitted_prior, time_edges=time_edges)
@@ -355,6 +358,7 @@ function forecast_win_probabilities(
     max_seasons::Int=3,
     time_edges=DEFAULT_TIME_EDGES,
     recency_half_life::Union{Nothing,Real}=DEFAULT_RECENCY_HALF_LIFE,
+    fit_strategy::Symbol=:moments,
     horizon::Real=GAME_CLOCK_SECONDS,
     full_schedule::Bool=false,
 )
@@ -367,6 +371,7 @@ function forecast_win_probabilities(
         max_seasons=max_seasons,
         time_edges=time_edges,
         recency_half_life=recency_half_life,
+        fit_strategy=fit_strategy,
     )
     return forecast_win_probabilities(
         context;
@@ -436,6 +441,7 @@ function forecast_spreads(
     max_seasons::Int=3,
     time_edges=DEFAULT_TIME_EDGES,
     recency_half_life::Union{Nothing,Real}=DEFAULT_RECENCY_HALF_LIFE,
+    fit_strategy::Symbol=:moments,
     horizon::Real=GAME_CLOCK_SECONDS,
     full_schedule::Bool=false,
 )
@@ -448,6 +454,7 @@ function forecast_spreads(
         max_seasons=max_seasons,
         time_edges=time_edges,
         recency_half_life=recency_half_life,
+        fit_strategy=fit_strategy,
     )
     return forecast_spreads(
         context;
@@ -523,6 +530,7 @@ function forecast_regular_season(
     max_seasons::Int=3,
     time_edges=DEFAULT_TIME_EDGES,
     recency_half_life::Union{Nothing,Real}=DEFAULT_RECENCY_HALF_LIFE,
+    fit_strategy::Symbol=:moments,
     horizon::Real=GAME_CLOCK_SECONDS,
 )
     context = fit_regular_season_forecast(
@@ -534,6 +542,7 @@ function forecast_regular_season(
         max_seasons=max_seasons,
         time_edges=time_edges,
         recency_half_life=recency_half_life,
+        fit_strategy=fit_strategy,
     )
     return forecast_regular_season(
         context;

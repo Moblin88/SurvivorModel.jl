@@ -504,6 +504,7 @@ end
         recent_seasons=3,
         time_edges=DEFAULT_TIME_EDGES,
         recency_half_life=DEFAULT_RECENCY_HALF_LIFE,
+        fit_strategy=:moments,
         probability_bins=DEFAULT_PROBABILITY_BINS,
         spread_bins=DEFAULT_SPREAD_BINS,
         interval_levels=DEFAULT_SPREAD_INTERVAL_LEVELS,
@@ -525,6 +526,7 @@ function evaluate_calibration(
     recent_seasons::Int=3,
     time_edges=DEFAULT_TIME_EDGES,
     recency_half_life::Union{Nothing,Real}=DEFAULT_RECENCY_HALF_LIFE,
+    fit_strategy::Symbol=:moments,
     probability_bins=DEFAULT_PROBABILITY_BINS,
     spread_bins=DEFAULT_SPREAD_BINS,
     interval_levels=DEFAULT_SPREAD_INTERVAL_LEVELS,
@@ -581,6 +583,7 @@ function evaluate_calibration(
                 max_seasons=max_seasons,
                 time_edges=time_edges,
                 recency_half_life=recency_half_life,
+                fit_strategy=fit_strategy,
             )
             probabilities = forecast_win_probabilities(
                 context;

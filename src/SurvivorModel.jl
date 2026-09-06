@@ -24,6 +24,8 @@ export load_schedule, regular_season_results
 export RegularSeasonForecastContext, fit_regular_season_forecast
 export forecast_win_probabilities, forecast_spreads, forecast_regular_season
 export CalibrationReport, brier_score, log_loss, reliability_bins
+export score_difference_metrics, spread_reliability_bins
+export spread_interval_coverage
 export evaluate_calibration
 
 include("drives.jl")

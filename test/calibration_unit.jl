@@ -1,6 +1,7 @@
 using SurvivorModel
 using DataFrames
 using Dates
+using Distributions
 using Statistics
 using Test
 
@@ -97,6 +98,14 @@ function _recent_season_fixture()
 end
 
 @testset "calibration metrics" begin
+    @testset "report compatibility" begin
+        legacy = CalibrationReport(DataFrame(), DataFrame(), DataFrame())
+        @test isempty(legacy.spread_games)
+        @test isempty(legacy.spread_summary)
+        @test isempty(legacy.spread_reliability)
+        @test isempty(legacy.spread_coverage)
+    end
+
     @testset "scores and ties" begin
         predicted = [0.1, 0.6, 0.9, 0.5]
         actual = [0.0, 1.0, 1.0, 0.5]
@@ -105,6 +114,47 @@ end
         @test log_loss([0.5], [0.5]) ≈ log(2.0)
         @test_throws ArgumentError brier_score([0.5], [0.0, 1.0])
         @test_throws ArgumentError brier_score([1.1], [1.0])
+    end
+
+    @testset "score-difference metrics" begin
+        predicted = [-2.0, 0.0, 3.0, 4.0]
+        actual = [-1.0, 1.0, 1.0, 4.0]
+        metrics = score_difference_metrics(predicted, actual)
+
+        @test metrics.n_games == 4
+        @test metrics.mean_predicted ≈ 1.25
+        @test metrics.mean_actual ≈ 1.25
+        @test metrics.mean_error ≈ 0.0
+        @test metrics.mean_absolute_error ≈ 1.0
+        @test metrics.rmse ≈ sqrt(1.5)
+        @test metrics.above_forecast_rate ≈ 0.5
+        @test metrics.below_forecast_rate ≈ 0.25
+        @test metrics.push_rate ≈ 0.25
+
+        reliability = spread_reliability_bins(
+            predicted,
+            actual;
+            spread_bins=[-Inf, 0.0, Inf],
+        )
+        @test reliability.n_games == [1, 3]
+        @test reliability.mean_predicted_spread[1] ≈ -2.0
+        @test reliability.mean_actual_margin[1] ≈ -1.0
+        @test reliability.mean_error[2] ≈ -1 / 3
+
+        coverage = spread_interval_coverage(
+            [0.0, 0.0],
+            [1.0, 1.0],
+            [0.0, 2.0];
+            interval_levels=[0.5, 0.95],
+        )
+        @test coverage.covered_games == [1, 1]
+        @test coverage.coverage ≈ [0.5, 0.5]
+        @test quantile(Normal(), 0.975) > 1.9
+        @test_throws ArgumentError spread_interval_coverage(
+            [0.0],
+            [-1.0],
+            [0.0],
+        )
     end
 
     @testset "reliability bins" begin
@@ -144,6 +194,17 @@ end
         @test all(isfinite, report.summary.mean_predicted)
         @test all(isfinite, report.summary.observed_rate)
         @test sum(report.reliability.n_games) == nrow(report.games)
+        @test nrow(report.spread_games) == 3
+        @test report.spread_summary.scored_games == [2, 1]
+        @test all(isfinite, report.spread_games.expected_spread)
+        @test all(isfinite, report.spread_games.standardized_error)
+        @test sum(report.spread_reliability.n_games) ==
+            nrow(report.spread_games)
+        @test all(0.0 .<= report.spread_coverage.coverage .<= 1.0)
+        @test all(
+            report.spread_coverage.covered_games .<=
+            report.spread_coverage.n_games
+        )
 
         without_future = evaluate_calibration(
             2023;
@@ -154,6 +215,10 @@ end
         )
         @test report.games.home_win_probability ≈
             without_future.games.home_win_probability
+        @test report.spread_games.expected_spread ≈
+            without_future.spread_games.expected_spread
+        @test report.spread_games.predictive_spread_variance ≈
+            without_future.spread_games.predictive_spread_variance
 
         no_scored_games = evaluate_calibration(
             2023;
@@ -164,6 +229,10 @@ end
         )
         @test no_scored_games.summary.scored_games == [0]
         @test all(iszero, no_scored_games.reliability.n_games)
+        @test no_scored_games.spread_summary.scored_games == [0]
+        @test all(iszero, no_scored_games.spread_reliability.n_games)
+        @test all(iszero, no_scored_games.spread_coverage.n_games)
+        @test all(iszero, no_scored_games.spread_coverage.covered_games)
     end
 
     @testset "recent completed season selection" begin

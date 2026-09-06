@@ -138,6 +138,10 @@ report = evaluate_calibration(;
 report.summary
 report.reliability
 report.games
+report.spread_summary
+report.spread_reliability
+report.spread_coverage
+report.spread_games
 ```
 
 Each snapshot is fit using only drives before its cutoff week and scores games
@@ -147,6 +151,16 @@ calibration gap. Ties are represented as `0.5` in all of these calculations;
 games without a schedule result are excluded from scoring. Reliability rows use
 fixed probability bins and include the number of games, observed rate, and
 calibration gap for each bin.
+
+The spread tables evaluate the expected home-team score difference against the
+schedule's actual home margin. `report.spread_summary` contains signed error,
+mean absolute error, RMSE, and the rates at which the actual margin is above,
+below, or equal to the model forecast. `report.spread_reliability` groups
+games by predicted margin and compares mean predicted and actual margins.
+`report.spread_coverage` checks central 50%, 80%, 90%, and 95% Normal
+predictive intervals built from `expected_spread` and
+`predictive_spread_variance`. These are model-line diagnostics, not
+sportsbook ATS or profitability results.
 
 The deterministic calibration tests run with the normal test suite. To produce
 the opt-in report from live NFLData schedules and play-by-play:

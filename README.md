@@ -122,3 +122,38 @@ the Gamma posterior moments. The predictive spread variance also includes
 between-hazard-posterior variation in the conditional spread mean. This
 calculation treats the empirical-Bayes hyperparameters, fitted home
 multipliers, and `ScoreMarks` as fixed.
+
+## Historical calibration
+
+Evaluate fixed pre-week snapshots against completed schedule results with
+`evaluate_calibration`. If no seasons are supplied, it selects the most recent
+completed regular seasons in the schedule:
+
+```julia
+report = evaluate_calibration(;
+    cutoff_weeks=(1, 5, 10, 15),
+    recent_seasons=3,
+)
+
+report.summary
+report.reliability
+report.games
+```
+
+Each snapshot is fit using only drives before its cutoff week and scores games
+from that week through the end of the season. `report.summary` contains Brier
+score, log loss, mean predicted probability, observed home-win rate, and their
+calibration gap. Ties are represented as `0.5` in all of these calculations;
+games without a schedule result are excluded from scoring. Reliability rows use
+fixed probability bins and include the number of games, observed rate, and
+calibration gap for each bin.
+
+The deterministic calibration tests run with the normal test suite. To produce
+the opt-in report from live NFLData schedules and play-by-play:
+
+```sh
+SURVIVORMODEL_RUN_CALIBRATION=true julia --project=. test/calibration_live.jl
+```
+
+The live report is diagnostic and does not impose an arbitrary model-quality
+threshold on CI.

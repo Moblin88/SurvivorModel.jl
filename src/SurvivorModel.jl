@@ -23,9 +23,12 @@ export expected_game_metrics
 export load_schedule, regular_season_results
 export RegularSeasonForecastContext, fit_regular_season_forecast
 export forecast_win_probabilities, forecast_spreads, forecast_regular_season
+export CalibrationReport, brier_score, log_loss, reliability_bins
+export evaluate_calibration
 
 include("drives.jl")
 include("model.jl")
 include("schedule.jl")
+include("calibration.jl")
 
 end

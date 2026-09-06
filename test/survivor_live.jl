@@ -114,10 +114,9 @@ function _survivor_live_weekly_probability()
 end
 
 function _survivor_live_recency_half_life()
-    half_life = parse(
-        Float64,
-        get(ENV, "SURVIVORMODEL_SURVIVOR_RECENCY_HALF_LIFE", "1.0"),
-    )
+    key = "SURVIVORMODEL_SURVIVOR_RECENCY_HALF_LIFE"
+    haskey(ENV, key) || return nothing
+    half_life = parse(Float64, ENV[key])
     isfinite(half_life) && half_life > 0.0 ||
         throw(ArgumentError(
             "SURVIVORMODEL_SURVIVOR_RECENCY_HALF_LIFE must be finite and positive",
@@ -263,7 +262,7 @@ function _survivor_live_prior(
     schedule::AbstractDataFrame,
     drives::AbstractDataFrame,
     max_seasons::Int,
-    recency_half_life::Real,
+    recency_half_life::Union{Nothing,Real},
 )
     regular_drives = SurvivorModel._regular_season_drives(drives, schedule)
     historical = regular_drives[regular_drives.season .< Int(season), :]
@@ -283,7 +282,7 @@ function _survivor_live_backtest_season(
     initial_strikes_values,
     weekly_survival_probability::Real,
     max_seasons::Int,
-    recency_half_life::Real,
+    recency_half_life::Union{Nothing,Real},
 )
     scenarios = [
         SurvivorLiveScenario(

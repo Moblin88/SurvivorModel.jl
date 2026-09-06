@@ -408,7 +408,8 @@ function _survivor_live_load_data(
     seasons,
     max_seasons::Int,
 )
-    first_data_season = max(1999, first(seasons) - max_seasons)
+    effective_max_seasons = min(max_seasons, MAX_HISTORICAL_SEASONS)
+    first_data_season = max(1999, first(seasons) - effective_max_seasons)
     last_data_season = last(seasons)
     loaded = DataFrame[]
     for data_season in first_data_season:last_data_season

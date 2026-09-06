@@ -23,6 +23,10 @@ current-season updates.
 Default elapsed-drive-time edges in seconds: 0-2, 2-4, 4-6, and 6+ minutes.
 """
 const DEFAULT_TIME_EDGES = (0.0, 120.0, 240.0, 360.0, Inf)
+const DEFAULT_RECENCY_HALF_LIFE = 1.0
+const MAX_HISTORICAL_SEASONS = 3
+const MIN_RECENCY_HALF_LIFE = 0.25
+const MAX_RECENCY_HALF_LIFE = Float64(MAX_HISTORICAL_SEASONS)
 
 """
     _validate_time_edges(edges) -> Vector{Float64}
@@ -577,47 +581,80 @@ function _build_team_priors(
     return td_priors, defensive_priors
 end
 
-function _predictive_loglikelihood(
-    validation::HazardSufficientStats,
-    td_hyperparameters::AbstractVector{GammaParams},
-    defensive_hyperparameters::AbstractVector{GammaParams},
-    td_priors::Dict{String,Vector{GammaParams}},
-    defensive_priors::Dict{String,Vector{GammaParams}},
-    td_home_multiplier::Real,
-    defensive_home_multiplier::Real,
+function _moment_recency_correlation(
+    byseason::Dict{Int,HazardSufficientStats},
+    seasons::AbstractVector{<:Integer},
+    kind::Symbol,
+    time_bin::Int,
 )
-    total = 0.0
-    for (kind, hyperparameters, team_priors, home_multiplier) in (
-        (:td, td_hyperparameters, td_priors, td_home_multiplier),
-        (:defensive, defensive_hyperparameters, defensive_priors, defensive_home_multiplier),
-    )
-        outcome = _outcome_stats(validation, kind)
-        for time_bin in 1:length(hyperparameters)
-            keys_for_bin = Set{Tuple{String,Int}}()
-            for key in keys(outcome.home_exposure)
-                key[2] == time_bin || continue
-                push!(keys_for_bin, key)
-            end
-            for key in keys(outcome.away_exposure)
-                key[2] == time_bin || continue
-                push!(keys_for_bin, key)
-            end
-            for (team, _) in keys_for_bin
-                parameters = get(team_priors, team, hyperparameters)
-                prior = parameters[time_bin]
-                key = (team, time_bin)
-                total += _log_gamma_poisson_home_kernel(
-                    get(outcome.home_counts, key, 0.0),
-                    get(outcome.away_counts, key, 0.0),
-                    get(outcome.home_exposure, key, 0.0),
-                    get(outcome.away_exposure, key, 0.0),
-                    prior,
-                    home_multiplier,
-                )
-            end
+    total_events = 0.0
+    total_exposure = 0.0
+    for season in seasons
+        outcome = _outcome_stats(byseason[Int(season)], kind)
+        for (key, exposure) in outcome.exposure
+            key[2] == time_bin || continue
+            total_exposure += exposure
+            total_events += get(outcome.counts, key, 0.0)
         end
     end
-    return total
+    total_exposure > 0.0 || return nothing
+
+    league_rate = max(total_events / total_exposure, eps(Float64))
+    prior_exposure = 1.0 / league_rate
+    strengths = Dict{Int,Dict{String,Float64}}()
+
+    for season in seasons
+        outcome = _outcome_stats(byseason[Int(season)], kind)
+        season_events = 0.0
+        season_exposure = 0.0
+        for (key, exposure) in outcome.exposure
+            key[2] == time_bin || continue
+            season_exposure += exposure
+            season_events += get(outcome.counts, key, 0.0)
+        end
+        season_exposure > 0.0 || continue
+
+        season_rate = (season_events + 1.0) / (season_exposure + prior_exposure)
+        season_log_rate = log(season_rate)
+        season_strengths = Dict{String,Float64}()
+        for (key, exposure) in outcome.exposure
+            key[2] == time_bin || continue
+            team = key[1]
+            team_rate = (get(outcome.counts, key, 0.0) + 1.0) /
+                (exposure + prior_exposure)
+            season_strengths[team] = log(team_rate) - season_log_rate
+        end
+        strengths[Int(season)] = season_strengths
+    end
+
+    correlations = Float64[]
+    correlation_weights = Float64[]
+    for index in 2:length(seasons)
+        previous = get(strengths, Int(seasons[index - 1]), nothing)
+        current = get(strengths, Int(seasons[index]), nothing)
+        isnothing(previous) && continue
+        isnothing(current) && continue
+        teams = intersect(keys(previous), keys(current))
+        length(teams) >= 3 || continue
+
+        previous_values = [previous[team] for team in teams]
+        current_values = [current[team] for team in teams]
+        std(previous_values; corrected=false) > 0.0 || continue
+        std(current_values; corrected=false) > 0.0 || continue
+        correlation = cor(previous_values, current_values)
+        isfinite(correlation) || continue
+
+        push!(correlations, atanh(clamp(correlation, -0.95, 0.95)))
+        push!(correlation_weights, Float64(length(teams) - 2))
+    end
+
+    isempty(correlations) && return nothing
+    return tanh(
+        sum(weight * value for (weight, value) in zip(
+            correlation_weights,
+            correlations,
+        )) / sum(correlation_weights),
+    )
 end
 
 function _calibrate_recency_half_life(
@@ -626,47 +663,33 @@ function _calibrate_recency_half_life(
     time_edges::AbstractVector{<:Real};
     candidates=(0.25, 0.5, 1.0, 2.0, 4.0, 8.0, Inf),
 )
-    length(seasons) >= 3 || return 1.0
-    scores = fill(-Inf, length(candidates))
+    length(seasons) >= 3 || return DEFAULT_RECENCY_HALF_LIFE
 
-    for (candidate_index, candidate) in enumerate(candidates)
-        score = 0.0
-        folds = 0
-        for target_index in 2:length(seasons)
-            train_seasons = seasons[1:(target_index - 1)]
-            target_season = Int(seasons[target_index])
-            reference = maximum(train_seasons)
-            td_hyper, defensive_hyper, td_home_multiplier, defensive_home_multiplier =
-                _fit_hyperparameter_vectors(
-                byseason, train_seasons, time_edges, reference, candidate,
-            )
-            td_priors, defensive_priors = _build_team_priors(
+    correlations = Float64[]
+    weights = Float64[]
+    for kind in (:td, :defensive)
+        for time_bin in 1:(length(time_edges) - 1)
+            correlation = _moment_recency_correlation(
                 byseason,
-                train_seasons,
-                time_edges,
-                reference,
-                candidate,
-                td_hyper,
-                defensive_hyper,
-                td_home_multiplier,
-                defensive_home_multiplier,
+                seasons,
+                kind,
+                time_bin,
             )
-            score += _predictive_loglikelihood(
-                byseason[target_season],
-                td_hyper,
-                defensive_hyper,
-                td_priors,
-                defensive_priors,
-                td_home_multiplier,
-                defensive_home_multiplier,
-            )
-            folds += 1
+            isnothing(correlation) && continue
+            push!(correlations, correlation)
+            push!(weights, 1.0)
         end
-        folds > 0 && (scores[candidate_index] = score)
     end
+    isempty(correlations) && return DEFAULT_RECENCY_HALF_LIFE
 
-    best_index = argmax(scores)
-    return candidates[best_index]
+    correlation = tanh(
+        sum(weight * value for (weight, value) in zip(weights, correlations)) /
+        sum(weights),
+    )
+    minimum_correlation = exp(-1.0 / MIN_RECENCY_HALF_LIFE)
+    maximum_correlation = exp(-1.0 / MAX_RECENCY_HALF_LIFE)
+    correlation = clamp(correlation, minimum_correlation, maximum_correlation)
+    return -1.0 / log(correlation)
 end
 
 """
@@ -740,11 +763,12 @@ end
 Fit separate league-level Gamma-Poisson hyperparameters for each outcome and
 elapsed-time bin using historical drives, along with one global offensive and
 one global defensive home multiplier. Team-specific priors are formed from
-the most recent `max_seasons` seasons. If `recency_half_life` is omitted, it
-is selected by chronological predictive validation over the available
-historical seasons. `current_season` is the reference point for the final
-historical weights; when omitted, it defaults to one season after the latest
-historical season.
+at most the most recent three seasons. If `recency_half_life` is omitted, it
+is estimated from lag-one correlations of shrunk team-season hazard moments.
+The `half_life_candidates` keyword is retained for compatibility but is no
+longer used by the moment estimator. `current_season` is the reference point
+for the final historical weights; when omitted, it defaults to one season
+after the latest historical season.
 """
 function fit_empirical_bayes_prior(
     historical_drives::AbstractDataFrame;
@@ -756,10 +780,12 @@ function fit_empirical_bayes_prior(
 )
     data, edges = build_exposure_data(historical_drives; time_edges=time_edges)
     byseason = _season_stats(data)
-    seasons = _historical_seasons(byseason, max_seasons)
+    max_seasons > 0 || throw(ArgumentError("max_seasons must be positive"))
+    effective_max_seasons = min(max_seasons, MAX_HISTORICAL_SEASONS)
+    seasons = _historical_seasons(byseason, effective_max_seasons)
     isempty(seasons) && return _default_hazard_prior(edges)
 
-    calibration_seasons = sort!(collect(filter(!=(0), keys(byseason))))
+    calibration_seasons = seasons
     half_life = if recency_half_life === nothing
         _calibrate_recency_half_life(
             byseason,

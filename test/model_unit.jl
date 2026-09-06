@@ -113,6 +113,17 @@ using Test
     @testset "empirical-Bayes prior and recency calibration" begin
         historical = vcat(
             DataFrame(
+                game_id=["2018_1", "2019_1", "2020_1"],
+                fixed_drive=ones(Int, 3),
+                posteam=fill("A", 3),
+                defteam=fill("B", 3),
+                drive_result=fill("Punt", 3),
+                time_of_possession=Second.([60, 60, 60]),
+                posteam_home=fill(true, 3),
+                defteam_home=fill(false, 3),
+                home_spread_change=zeros(3),
+            ),
+            DataFrame(
                 game_id=["2021_1", "2021_2", "2022_1", "2022_2", "2023_1", "2023_2"],
                 fixed_drive=ones(Int, 6),
                 posteam=fill("A", 6),
@@ -138,12 +149,13 @@ using Test
         prior = fit_empirical_bayes_prior(
             historical;
             time_edges=[0, 120, 240, Inf],
-            max_seasons=3,
+            max_seasons=99,
             half_life_candidates=[0.5, 1.0, Inf],
             current_season=2024,
         )
         @test prior.historical_seasons == [2021, 2022, 2023]
-        @test isfinite(prior.recency_half_life) || isinf(prior.recency_half_life)
+        @test SurvivorModel.MIN_RECENCY_HALF_LIFE <= prior.recency_half_life <=
+            SurvivorModel.MAX_RECENCY_HALF_LIFE
         @test all(p -> p.shape > 0 && p.rate > 0, prior.td_hyperparameters)
         @test haskey(prior.td_team_priors, "A")
         @test haskey(prior.defensive_team_priors, "B")
@@ -153,7 +165,7 @@ using Test
         @test weights[2022] ≈ exp(-2 / prior.recency_half_life)
         @test weights[2021] ≈ exp(-3 / prior.recency_half_life)
 
-        current = historical[1:1, :]
+        current = historical[4:4, :]
         model = fit_hazard_model(
             current;
             prior=prior,
@@ -161,6 +173,79 @@ using Test
         )
         @test hazard_posterior(model, :td, "A", 1).shape >
             prior.td_team_priors["A"][1].shape
+
+        short_prior = fit_empirical_bayes_prior(
+            historical[1:2, :];
+            time_edges=[0, 120, 240, Inf],
+            current_season=2023,
+        )
+        @test short_prior.recency_half_life == DEFAULT_RECENCY_HALF_LIFE
+        @test_throws ArgumentError fit_empirical_bayes_prior(
+            historical;
+            time_edges=[0, 120, 240, Inf],
+            max_seasons=0,
+        )
+
+        function _moment_drives(results_by_season)
+            rows = DataFrame(
+                game_id=String[],
+                fixed_drive=Int[],
+                posteam=String[],
+                defteam=String[],
+                drive_result=String[],
+                time_of_possession=Second[],
+                posteam_home=Bool[],
+                defteam_home=Bool[],
+            )
+            teams = ["A", "B", "C", "D"]
+            for (season, results) in zip(2021:2023, results_by_season)
+                for (index, result) in enumerate(results)
+                    push!(
+                        rows,
+                        (
+                            "$(season)_$(index)",
+                            1,
+                            teams[index],
+                            "DEFENSE",
+                            result,
+                            Second(60),
+                            true,
+                            false,
+                        ),
+                    )
+                end
+            end
+            return rows
+        end
+
+        positive_data, positive_edges = build_exposure_data(
+            _moment_drives([
+                ["Touchdown", "Touchdown", "Punt", "Punt"],
+                ["Touchdown", "Touchdown", "Punt", "Punt"],
+                ["Touchdown", "Touchdown", "Punt", "Punt"],
+            ]);
+            time_edges=[0, Inf],
+        )
+        negative_data, negative_edges = build_exposure_data(
+            _moment_drives([
+                ["Touchdown", "Touchdown", "Punt", "Punt"],
+                ["Punt", "Punt", "Touchdown", "Touchdown"],
+                ["Touchdown", "Touchdown", "Punt", "Punt"],
+            ]);
+            time_edges=[0, Inf],
+        )
+        positive_half_life = SurvivorModel._calibrate_recency_half_life(
+            SurvivorModel._season_stats(positive_data),
+            [2021, 2022, 2023],
+            positive_edges,
+        )
+        negative_half_life = SurvivorModel._calibrate_recency_half_life(
+            SurvivorModel._season_stats(negative_data),
+            [2021, 2022, 2023],
+            negative_edges,
+        )
+        @test positive_half_life ≈ SurvivorModel.MAX_RECENCY_HALF_LIFE
+        @test negative_half_life ≈ SurvivorModel.MIN_RECENCY_HALF_LIFE
     end
 
     @testset "empirical-Bayes home multipliers" begin

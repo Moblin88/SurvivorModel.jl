@@ -120,6 +120,7 @@ function _load_forecast_drives(
     current_drives,
 )
     max_seasons > 0 || throw(ArgumentError("max_seasons must be positive"))
+    effective_max_seasons = min(max_seasons, MAX_HISTORICAL_SEASONS)
     current = current_drives === nothing ? load_drive_pbp(season) : current_drives
 
     if historical_drives !== nothing
@@ -130,7 +131,7 @@ function _load_forecast_drives(
         return _empty_drive_data(current), current
     end
 
-    first_season = max(1999, Int(season) - max_seasons)
+    first_season = max(1999, Int(season) - effective_max_seasons)
     historical = load_drive_pbp(first_season:(Int(season) - 1))
     return historical, current
 end

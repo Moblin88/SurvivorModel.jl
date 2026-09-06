@@ -43,11 +43,15 @@ positive, may be above or below 1.0, and are fitted from historical data
 alongside the league hyperparameters. Inspect them with
 `home_multiplier(prior, :td)` and `home_multiplier(prior, :defensive)`.
 They remain fixed when current-season data are added. The prior uses the
-previous three seasons to form team-specific priors, measuring recency from
-`current_season`. The exponential decay is calibrated with chronological
-predictive validation when enough historical seasons are available. Inspect
-the resulting historical weights with `recency_weights(prior)`. New drives
-can be incorporated without refitting the historical prior:
+most recent three seasons to form team-specific priors, measuring recency from
+`current_season`. When no half-life is supplied, the model estimates
+year-to-year persistence from correlations between shrunk team-season hazard
+moments, using at most those three seasons. Inspect the resulting historical
+weights with `recency_weights(prior)`. New drives can be incorporated without
+refitting the historical prior. The effective historical window is capped at
+three seasons even when a larger `max_seasons` value is supplied. The legacy
+`half_life_candidates` keyword is still accepted, but automatic recency
+estimation no longer searches those candidate values.
 
 ```julia
 update_hazard_model!(model, newly_available_drives)

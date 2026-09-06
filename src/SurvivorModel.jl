@@ -13,6 +13,7 @@ using JuMP
 
 export load_drive_pbp, summarize_drives
 export DEFAULT_TIME_EDGES, GAME_CLOCK_SECONDS
+export DEFAULT_RECENCY_HALF_LIFE, MAX_HISTORICAL_SEASONS
 export GammaParams, HazardPrior, HazardModel, ScoreMarks, DriveMoments
 export HazardTheta, ExpectedGameMetrics, ExpectedGameSpreadMetrics
 export build_exposure_data, fit_empirical_bayes_prior, fit_hazard_model

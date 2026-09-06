@@ -546,7 +546,8 @@ function evaluate_calibration(
             recent_seasons,
         ) :
         _calibration_seasons(seasons)
-    first_data_season = max(1999, first(season_values) - max_seasons)
+    effective_max_seasons = min(max_seasons, MAX_HISTORICAL_SEASONS)
+    first_data_season = max(1999, first(season_values) - effective_max_seasons)
     last_data_season = last(season_values)
     all_drives = if drives === nothing
         load_drive_pbp(first_data_season:last_data_season)

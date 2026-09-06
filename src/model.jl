@@ -1338,6 +1338,16 @@ struct ExpectedGameMetrics
     predictive_spread_variance::Float64
 end
 
+"""
+    ExpectedGameSpreadMetrics
+
+Posterior expected spread and predictive spread variance for a matchup.
+"""
+struct ExpectedGameSpreadMetrics
+    expected_spread::Float64
+    predictive_spread_variance::Float64
+end
+
 function _trace_product(
     left::AbstractMatrix{<:Real},
     right::AbstractMatrix{<:Real},
@@ -1371,6 +1381,127 @@ function _second_order_expectation(
     return function_value(theta_mean) + 0.5 * _trace_product(hessian, covariance)
 end
 
+function _expected_game_win_probability(
+    theta::HazardTheta,
+    edges::AbstractVector{<:Real},
+    marks::ScoreMarks;
+    horizon::Real=GAME_CLOCK_SECONDS,
+)
+    win_function = theta_vector ->
+        _game_metrics_from_theta(
+            theta_vector,
+            edges,
+            marks;
+            horizon=horizon,
+        ).win_probability
+    return _second_order_expectation(
+        win_function,
+        theta.log_mean,
+        theta.covariance,
+    )
+end
+
+function _expected_game_spread_metrics(
+    theta::HazardTheta,
+    edges::AbstractVector{<:Real},
+    marks::ScoreMarks;
+    horizon::Real=GAME_CLOCK_SECONDS,
+)
+    spread_function = theta_vector ->
+        _game_metrics_from_theta(
+            theta_vector,
+            edges,
+            marks;
+            horizon=horizon,
+        ).mean_spread
+    variance_function = theta_vector ->
+        _game_metrics_from_theta(
+            theta_vector,
+            edges,
+            marks;
+            horizon=horizon,
+        ).spread_variance
+
+    expected_spread = _second_order_expectation(
+        spread_function,
+        theta.log_mean,
+        theta.covariance,
+    )
+    expected_conditional_variance = _second_order_expectation(
+        variance_function,
+        theta.log_mean,
+        theta.covariance,
+    )
+    spread_gradient = ForwardDiff.gradient(spread_function, theta.log_mean)
+    parameter_spread_variance = _quadratic_form(
+        spread_gradient,
+        theta.covariance,
+    )
+    predictive_spread_variance =
+        expected_conditional_variance + parameter_spread_variance
+
+    return ExpectedGameSpreadMetrics(
+        expected_spread,
+        predictive_spread_variance,
+    )
+end
+
+"""
+    expected_game_win_probability(
+        model,
+        marks,
+        home_team,
+        away_team;
+        horizon=GAME_CLOCK_SECONDS,
+    ) -> Float64
+
+Approximate the posterior expected home win probability without evaluating
+spread or predictive-variance metrics.
+"""
+function expected_game_win_probability(
+    model::HazardModel,
+    marks::ScoreMarks,
+    home_team,
+    away_team;
+    horizon::Real=GAME_CLOCK_SECONDS,
+)
+    theta = hazard_theta(model, home_team, away_team)
+    return _expected_game_win_probability(
+        theta,
+        model.time_edges,
+        marks;
+        horizon=horizon,
+    )
+end
+
+"""
+    expected_game_spread_metrics(
+        model,
+        marks,
+        home_team,
+        away_team;
+        horizon=GAME_CLOCK_SECONDS,
+    ) -> ExpectedGameSpreadMetrics
+
+Compute posterior expected spread and predictive spread variance without
+evaluating the posterior expected win probability.
+"""
+function expected_game_spread_metrics(
+    model::HazardModel,
+    marks::ScoreMarks,
+    home_team,
+    away_team;
+    horizon::Real=GAME_CLOCK_SECONDS,
+)
+    theta = hazard_theta(model, home_team, away_team)
+    return _expected_game_spread_metrics(
+        theta,
+        model.time_edges,
+        marks;
+        horizon=horizon,
+    )
+end
+
 """
     expected_game_metrics(
         model,
@@ -1392,58 +1523,26 @@ function expected_game_metrics(
     model::HazardModel,
     marks::ScoreMarks,
     home_team,
-    away_team;
+    away_team    ;
     horizon::Real=GAME_CLOCK_SECONDS,
 )
     theta = hazard_theta(model, home_team, away_team)
-    spread_function = theta_vector ->
-        _game_metrics_from_theta(
-            theta_vector,
-            model.time_edges,
-            marks;
-            horizon=horizon,
-        ).mean_spread
-    variance_function = theta_vector ->
-        _game_metrics_from_theta(
-            theta_vector,
-            model.time_edges,
-            marks;
-            horizon=horizon,
-        ).spread_variance
-    win_function = theta_vector ->
-        _game_metrics_from_theta(
-            theta_vector,
-            model.time_edges,
-            marks;
-            horizon=horizon,
-        ).win_probability
-
-    expected_spread = _second_order_expectation(
-        spread_function,
-        theta.log_mean,
-        theta.covariance,
+    expected_win_probability = _expected_game_win_probability(
+        theta,
+        model.time_edges,
+        marks;
+        horizon=horizon,
     )
-    expected_win_probability = _second_order_expectation(
-        win_function,
-        theta.log_mean,
-        theta.covariance,
+    spread_metrics = _expected_game_spread_metrics(
+        theta,
+        model.time_edges,
+        marks;
+        horizon=horizon,
     )
-    expected_conditional_variance = _second_order_expectation(
-        variance_function,
-        theta.log_mean,
-        theta.covariance,
-    )
-    spread_gradient = ForwardDiff.gradient(spread_function, theta.log_mean)
-    parameter_spread_variance = _quadratic_form(
-        spread_gradient,
-        theta.covariance,
-    )
-    predictive_spread_variance =
-        expected_conditional_variance + parameter_spread_variance
 
     return ExpectedGameMetrics(
-        expected_spread,
+        spread_metrics.expected_spread,
         expected_win_probability,
-        predictive_spread_variance,
+        spread_metrics.predictive_spread_variance,
     )
 end

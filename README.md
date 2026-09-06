@@ -54,6 +54,47 @@ update_hazard_model!(model, newly_available_drives)
 posterior = hazard_posterior(model, :td, "KC", 2)
 ```
 
+## Regular-season forecasts
+
+Use the schedule-backed forecast API to produce a frozen pre-week forecast for
+every regular-season game from a requested week through week 18:
+
+```julia
+context = fit_regular_season_forecast(2024; as_of_week=10)
+forecast = forecast_win_probabilities(context)
+
+forecast[:, [
+    :game_id,
+    :week,
+    :away_team,
+    :home_team,
+    :away_win_probability,
+    :home_win_probability,
+]]
+```
+
+The model uses regular-season drives from prior seasons for the
+empirical-Bayes prior and target-season drives through week 9 for the
+week-10 snapshot. Later target-season results are not used, so the same call
+works for historical evaluation and for a currently unfolding season. The
+probability-only output does not evaluate spread or predictive-variance
+metrics. Reuse the same context for other views:
+
+```julia
+spreads = forecast_spreads(context)
+results = regular_season_results(2024; from_week=10)
+```
+
+`forecast_regular_season(2024; as_of_week=10)` remains the convenience
+function that returns schedule scores/results, home and away probabilities,
+`expected_spread`, `predictive_spread_variance`, and `game_completed` in one
+table. Pass `include_completed=false` to forecast only games without a
+recorded result. `regular_season_results` reads the schedule only and does not
+load PBP or fit a model. `load_schedule()` can be used to fetch or normalize
+the underlying schedule separately. At the matchup level,
+`expected_game_win_probability` and `expected_game_spread_metrics` provide the
+same split without constructing the full `ExpectedGameMetrics` result.
+
 The posterior rate returned by `hazard_rate` is the Gamma posterior mean.
 Pass `posteam_home=true` to `drive_moments` when the possessing team is at
 home; the defensive team is assigned the complementary away/home status.

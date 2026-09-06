@@ -44,14 +44,15 @@ alongside the league hyperparameters. Inspect them with
 `home_multiplier(prior, :td)` and `home_multiplier(prior, :defensive)`.
 They remain fixed when current-season data are added. The prior uses the
 most recent three seasons to form team-specific priors, measuring recency from
-`current_season`. When no half-life is supplied, the model estimates
-year-to-year persistence from correlations between shrunk team-season hazard
-moments, using at most those three seasons. Inspect the resulting historical
-weights with `recency_weights(prior)`. New drives can be incorporated without
-refitting the historical prior. The effective historical window is capped at
-three seasons even when a larger `max_seasons` value is supplied. The legacy
-`half_life_candidates` keyword is still accepted, but automatic recency
-estimation no longer searches those candidate values.
+`current_season`. The default recency half-life is `1.0`, and the effective
+historical window is capped at three seasons even when a larger `max_seasons`
+value is supplied. Passing `recency_half_life=nothing` opts into the moment
+estimator, which measures year-to-year persistence from correlations between
+shrunk team-season hazard moments. Inspect the resulting historical weights
+with `recency_weights(prior)`. The legacy `half_life_candidates` keyword is
+still accepted, but automatic recency estimation no longer searches those
+candidate values. New drives can be incorporated without refitting the
+historical prior.
 
 ```julia
 update_hazard_model!(model, newly_available_drives)
@@ -261,9 +262,9 @@ julia --project=. test/survivor_live.jl
 
 Use `SURVIVORMODEL_SURVIVOR_RECENT_SEASONS` when selecting the latest completed
 seasons, and `SURVIVORMODEL_SURVIVOR_MAX_SEASONS` to change the historical
-training window. The harness uses automatic moment-based recency calibration
-by default; set `SURVIVORMODEL_SURVIVOR_RECENCY_HALF_LIFE` to a positive,
-finite value to override it for a fixed-half-life replay. The harness is
-opt-in because it downloads live schedules and play-by-play data and reruns
-one pre-week forecast per regular-season week (17 weeks for seasons through
-2020 and 18 weeks from 2021 onward).
+training window. The harness uses a fixed recency half-life of `1.0` by
+default; set `SURVIVORMODEL_SURVIVOR_RECENCY_HALF_LIFE` to a positive, finite
+value to override it. The harness is opt-in because it downloads live
+schedules and play-by-play data and reruns one pre-week forecast per
+regular-season week (17 weeks for seasons through 2020 and 18 weeks from
+2021 onward).

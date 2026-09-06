@@ -477,7 +477,7 @@ function optimize_survivor_pool(
     current_drives::Union{Nothing,AbstractDataFrame}=nothing,
     max_seasons::Int=3,
     time_edges=DEFAULT_TIME_EDGES,
-    recency_half_life::Union{Nothing,Real}=nothing,
+    recency_half_life::Union{Nothing,Real}=DEFAULT_RECENCY_HALF_LIFE,
     include_completed::Bool=false,
     horizon::Real=GAME_CLOCK_SECONDS,
     optimizer=HiGHS.Optimizer,

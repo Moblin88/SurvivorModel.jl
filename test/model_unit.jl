@@ -154,6 +154,7 @@ using Test
             current_season=2024,
         )
         @test prior.historical_seasons == [2021, 2022, 2023]
+        @test prior.recency_half_life == DEFAULT_RECENCY_HALF_LIFE
         @test SurvivorModel.MIN_RECENCY_HALF_LIFE <= prior.recency_half_life <=
             SurvivorModel.MAX_RECENCY_HALF_LIFE
         @test all(p -> p.shape > 0 && p.rate > 0, prior.td_hyperparameters)
@@ -185,6 +186,16 @@ using Test
             time_edges=[0, 120, 240, Inf],
             max_seasons=0,
         )
+        automatic_prior = fit_empirical_bayes_prior(
+            historical;
+            time_edges=[0, Inf],
+            max_seasons=99,
+            recency_half_life=nothing,
+            current_season=2024,
+        )
+        @test SurvivorModel.MIN_RECENCY_HALF_LIFE <=
+            automatic_prior.recency_half_life <=
+            SurvivorModel.MAX_RECENCY_HALF_LIFE
 
         function _moment_drives(results_by_season)
             rows = DataFrame(

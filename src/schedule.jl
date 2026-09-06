@@ -183,7 +183,7 @@ end
         current_drives=nothing,
         max_seasons=3,
         time_edges=DEFAULT_TIME_EDGES,
-        recency_half_life=nothing,
+        recency_half_life=DEFAULT_RECENCY_HALF_LIFE,
         prior=nothing,
     ) -> RegularSeasonForecastContext
 
@@ -203,7 +203,7 @@ function fit_regular_season_forecast(
     current_drives::Union{Nothing,AbstractDataFrame}=nothing,
     max_seasons::Int=3,
     time_edges=DEFAULT_TIME_EDGES,
-    recency_half_life::Union{Nothing,Real}=nothing,
+    recency_half_life::Union{Nothing,Real}=DEFAULT_RECENCY_HALF_LIFE,
     prior::Union{Nothing,HazardPrior}=nothing,
 )
     1 <= as_of_week <= 18 ||
@@ -354,7 +354,7 @@ function forecast_win_probabilities(
     include_completed::Bool=true,
     max_seasons::Int=3,
     time_edges=DEFAULT_TIME_EDGES,
-    recency_half_life::Union{Nothing,Real}=nothing,
+    recency_half_life::Union{Nothing,Real}=DEFAULT_RECENCY_HALF_LIFE,
     horizon::Real=GAME_CLOCK_SECONDS,
     full_schedule::Bool=false,
 )
@@ -435,7 +435,7 @@ function forecast_spreads(
     include_completed::Bool=true,
     max_seasons::Int=3,
     time_edges=DEFAULT_TIME_EDGES,
-    recency_half_life::Union{Nothing,Real}=nothing,
+    recency_half_life::Union{Nothing,Real}=DEFAULT_RECENCY_HALF_LIFE,
     horizon::Real=GAME_CLOCK_SECONDS,
     full_schedule::Bool=false,
 )
@@ -506,7 +506,7 @@ end
         include_completed=true,
         max_seasons=3,
         time_edges=DEFAULT_TIME_EDGES,
-        recency_half_life=nothing,
+        recency_half_life=DEFAULT_RECENCY_HALF_LIFE,
         horizon=GAME_CLOCK_SECONDS,
     ) -> DataFrame
 
@@ -522,7 +522,7 @@ function forecast_regular_season(
     include_completed::Bool=true,
     max_seasons::Int=3,
     time_edges=DEFAULT_TIME_EDGES,
-    recency_half_life::Union{Nothing,Real}=nothing,
+    recency_half_life::Union{Nothing,Real}=DEFAULT_RECENCY_HALF_LIFE,
     horizon::Real=GAME_CLOCK_SECONDS,
 )
     context = fit_regular_season_forecast(

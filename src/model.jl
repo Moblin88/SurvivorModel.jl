@@ -763,18 +763,19 @@ end
 Fit separate league-level Gamma-Poisson hyperparameters for each outcome and
 elapsed-time bin using historical drives, along with one global offensive and
 one global defensive home multiplier. Team-specific priors are formed from
-at most the most recent three seasons. If `recency_half_life` is omitted, it
-is estimated from lag-one correlations of shrunk team-season hazard moments.
-The `half_life_candidates` keyword is retained for compatibility but is no
-longer used by the moment estimator. `current_season` is the reference point
-for the final historical weights; when omitted, it defaults to one season
-after the latest historical season.
+at most the most recent three seasons. The default recency half-life is
+`DEFAULT_RECENCY_HALF_LIFE`; pass `recency_half_life=nothing` to estimate it
+from lag-one correlations of shrunk team-season hazard moments. The
+`half_life_candidates` keyword is retained for compatibility but is no longer
+used by the moment estimator. `current_season` is the reference point for the
+final historical weights; when omitted, it defaults to one season after the
+latest historical season.
 """
 function fit_empirical_bayes_prior(
     historical_drives::AbstractDataFrame;
     time_edges=DEFAULT_TIME_EDGES,
     max_seasons::Int=3,
-    recency_half_life::Union{Nothing,Real}=nothing,
+    recency_half_life::Union{Nothing,Real}=DEFAULT_RECENCY_HALF_LIFE,
     half_life_candidates=(0.25, 0.5, 1.0, 2.0, 4.0, 8.0, Inf),
     current_season::Union{Nothing,Integer}=nothing,
 )
@@ -893,7 +894,7 @@ function fit_hazard_model(
     prior::Union{Nothing,HazardPrior}=nothing,
     time_edges=DEFAULT_TIME_EDGES,
     max_seasons::Int=3,
-    recency_half_life::Union{Nothing,Real}=nothing,
+    recency_half_life::Union{Nothing,Real}=DEFAULT_RECENCY_HALF_LIFE,
     current_season::Union{Nothing,Integer}=nothing,
 )
     edges = _validate_time_edges(time_edges)

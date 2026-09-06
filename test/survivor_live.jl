@@ -115,7 +115,7 @@ end
 
 function _survivor_live_recency_half_life()
     key = "SURVIVORMODEL_SURVIVOR_RECENCY_HALF_LIFE"
-    haskey(ENV, key) || return nothing
+    haskey(ENV, key) || return DEFAULT_RECENCY_HALF_LIFE
     half_life = parse(Float64, ENV[key])
     isfinite(half_life) && half_life > 0.0 ||
         throw(ArgumentError(

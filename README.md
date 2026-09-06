@@ -257,6 +257,10 @@ julia --project=. test/survivor_live.jl
 
 Use `SURVIVORMODEL_SURVIVOR_RECENT_SEASONS` when selecting the latest completed
 seasons, and `SURVIVORMODEL_SURVIVOR_MAX_SEASONS` to change the historical
-training window. The harness is opt-in because it downloads live schedules and
-play-by-play data and reruns one pre-week forecast per regular-season week
-(17 weeks for seasons through 2020 and 18 weeks from 2021 onward).
+training window. The harness uses a fixed recency half-life of `1.0` by
+default, which avoids repeating the expensive chronological half-life
+calibration during a replay; override it with
+`SURVIVORMODEL_SURVIVOR_RECENCY_HALF_LIFE`. The harness is opt-in because it
+downloads live schedules and play-by-play data and reruns one pre-week forecast
+per regular-season week (17 weeks for seasons through 2020 and 18 weeks from
+2021 onward).

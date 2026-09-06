@@ -113,6 +113,18 @@ function _survivor_live_weekly_probability()
     return probability
 end
 
+function _survivor_live_recency_half_life()
+    half_life = parse(
+        Float64,
+        get(ENV, "SURVIVORMODEL_SURVIVOR_RECENCY_HALF_LIFE", "1.0"),
+    )
+    isfinite(half_life) && half_life > 0.0 ||
+        throw(ArgumentError(
+            "SURVIVORMODEL_SURVIVOR_RECENCY_HALF_LIFE must be finite and positive",
+        ))
+    return half_life
+end
+
 function _survivor_live_game_row(
     forecast::AbstractDataFrame,
     current_pick::AbstractDataFrame,
@@ -251,12 +263,14 @@ function _survivor_live_prior(
     schedule::AbstractDataFrame,
     drives::AbstractDataFrame,
     max_seasons::Int,
+    recency_half_life::Real,
 )
     regular_drives = SurvivorModel._regular_season_drives(drives, schedule)
     historical = regular_drives[regular_drives.season .< Int(season), :]
     return fit_empirical_bayes_prior(
         historical;
         max_seasons=max_seasons,
+        recency_half_life=recency_half_life,
         current_season=season,
     )
 end
@@ -269,6 +283,7 @@ function _survivor_live_backtest_season(
     initial_strikes_values,
     weekly_survival_probability::Real,
     max_seasons::Int,
+    recency_half_life::Real,
 )
     scenarios = [
         SurvivorLiveScenario(
@@ -288,6 +303,7 @@ function _survivor_live_backtest_season(
         schedule,
         drives,
         max_seasons,
+        recency_half_life,
     )
 
     for week in 1:last_week
@@ -417,6 +433,7 @@ end
     schedule = load_schedule()
     seasons = _survivor_live_requested_seasons(schedule)
     weekly_survival_probability = _survivor_live_weekly_probability()
+    recency_half_life = _survivor_live_recency_half_life()
     max_seasons = parse(
         Int,
         get(ENV, "SURVIVORMODEL_SURVIVOR_MAX_SEASONS", "3"),
@@ -435,6 +452,7 @@ end
             initial_strikes_values,
             weekly_survival_probability,
             max_seasons,
+            recency_half_life,
         ) for season in seasons
     ]
     summary = vcat([report.summary for report in reports]...)

@@ -278,6 +278,107 @@ using Test
         @test moments.var_S >= 0
     end
 
+    @testset "matchup log-hazard theta" begin
+        drives = vcat(_make_drives(), _make_drives(), _make_drives())
+        model = fit_hazard_model(drives; time_edges=[0, 120, 240, Inf])
+        theta = hazard_theta(model, "HOME", "AWAY")
+
+        @test length(theta.log_mean) == 12
+        @test size(theta.covariance) == (12, 12)
+        @test theta.labels[1:3] == [:home_td_1, :home_td_2, :home_td_3]
+        @test theta.labels[4:6] == [
+            :away_defensive_1, :away_defensive_2, :away_defensive_3,
+        ]
+        @test theta.labels[7:9] == [:away_td_1, :away_td_2, :away_td_3]
+        @test theta.labels[10:12] == [
+            :home_defensive_1, :home_defensive_2, :home_defensive_3,
+        ]
+
+        posterior = hazard_posterior(model, :td, "HOME", 1; home=true)
+        @test theta.log_mean[1] ≈
+            SurvivorModel.SpecialFunctions.digamma(posterior.shape) -
+            log(posterior.rate)
+        @test theta.covariance[1, 1] ≈
+            SurvivorModel.SpecialFunctions.trigamma(posterior.shape)
+        @test all(
+            theta.covariance[i, i] > 0
+            for i in axes(theta.covariance, 1)
+        )
+        @test all(
+            theta.covariance[i, j] == 0
+            for i in axes(theta.covariance, 1), j in axes(theta.covariance, 2)
+            if i != j
+        )
+    end
+
+    @testset "uncertainty-aware game metrics" begin
+        drives = vcat(_make_drives(), _make_drives(), _make_drives())
+        model = fit_hazard_model(drives; time_edges=[0, 120, 240, Inf])
+        marks = fit_score_marks(drives)
+        metrics = expected_game_metrics(
+            model,
+            marks,
+            "HOME",
+            "AWAY";
+            horizon=60.0,
+        )
+
+        @test metrics isa ExpectedGameMetrics
+        @test isfinite(metrics.expected_spread)
+        @test 0 < metrics.expected_win_probability < 1
+        @test metrics.predictive_spread_variance > 0
+
+        empty_model = fit_hazard_model(
+            drives[1:0, :];
+            time_edges=[0, Inf],
+        )
+        symmetric = expected_game_metrics(
+            empty_model,
+            ScoreMarks(7.0, 0.0, 0.0, 0.0),
+            "HOME",
+            "AWAY";
+            horizon=60.0,
+        )
+        @test symmetric.expected_spread ≈ 0.0 atol=1e-10
+        @test symmetric.expected_win_probability ≈ 0.5 atol=1e-10
+    end
+
+    @testset "second-order metrics versus posterior simulation" begin
+        drives = vcat([_make_drives() for _ in 1:30]...)
+        model = fit_hazard_model(drives; time_edges=[0, Inf])
+        marks = fit_score_marks(drives)
+        metrics = expected_game_metrics(
+            model,
+            marks,
+            "HOME",
+            "AWAY";
+            horizon=60.0,
+        )
+        posteriors, _, _ =
+            SurvivorModel._matchup_theta_posteriors(model, "HOME", "AWAY")
+        n_samples = 4000
+        samples = [
+            rand(Gamma(posterior.shape, 1 / posterior.rate), n_samples)
+            for posterior in posteriors
+        ]
+        spread_samples = zeros(n_samples)
+        win_samples = zeros(n_samples)
+        for i in 1:n_samples
+            theta_sample = [log(samples[j][i]) for j in eachindex(samples)]
+            sample_metrics = SurvivorModel._game_metrics_from_theta(
+                theta_sample,
+                model.time_edges,
+                marks;
+                horizon=60.0,
+            )
+            spread_samples[i] = sample_metrics.mean_spread
+            win_samples[i] = sample_metrics.win_probability
+        end
+
+        @test mean(spread_samples) ≈ metrics.expected_spread atol=0.05
+        @test mean(win_samples) ≈ metrics.expected_win_probability atol=0.03
+    end
+
     @testset "two-outcome synthetic race" begin
         Random.seed!(1234)
         lambda_td, lambda_defensive = 0.01, 0.015

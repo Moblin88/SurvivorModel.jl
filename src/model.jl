@@ -955,6 +955,96 @@ function hazard_rate(
     return posterior.shape / posterior.rate
 end
 
+"""
+    HazardTheta
+
+Posterior moments of a matchup's log-hazard parameter vector. The vector is
+ordered by time-bin blocks:
+
+1. home team's offensive touchdown hazards;
+2. away team's defensive-event hazards;
+3. away team's offensive touchdown hazards;
+4. home team's defensive-event hazards.
+
+Each block contains one value per elapsed-time bin. `log_mean` and
+`covariance` describe the posterior mean and covariance of the log hazards.
+The covariance is conditional on the fitted empirical-Bayes prior and home
+multipliers.
+"""
+struct HazardTheta
+    log_mean::Vector{Float64}
+    covariance::Matrix{Float64}
+    labels::Vector{Symbol}
+
+    function HazardTheta(
+        log_mean::AbstractVector{<:Real},
+        covariance::AbstractMatrix{<:Real},
+        labels::AbstractVector{<:Symbol},
+    )
+        n = length(log_mean)
+        size(covariance) == (n, n) ||
+            throw(ArgumentError("theta covariance must be square and match theta length"))
+        length(labels) == n ||
+            throw(ArgumentError("theta labels must match theta length"))
+        all(isfinite, log_mean) ||
+            throw(ArgumentError("theta log means must be finite"))
+        all(isfinite, covariance) ||
+            throw(ArgumentError("theta covariance must be finite"))
+        return new(Float64.(log_mean), Float64.(covariance), Symbol.(labels))
+    end
+end
+
+function _matchup_theta_posteriors(model::HazardModel, home_team, away_team)
+    n_bins = length(model.time_edges) - 1
+    requests = (
+        (:td, home_team, true, "home_td"),
+        (:defensive, away_team, false, "away_defensive"),
+        (:td, away_team, false, "away_td"),
+        (:defensive, home_team, true, "home_defensive"),
+    )
+    posteriors = GammaParams[]
+    posterior_keys = Tuple{Symbol,String,Int}[]
+    labels = Symbol[]
+
+    for (kind, team, home, label_prefix) in requests
+        for time_bin in 1:n_bins
+            push!(
+                posteriors,
+                hazard_posterior(model, kind, team, time_bin; home=home),
+            )
+            push!(posterior_keys, (kind, string(team), time_bin))
+            push!(labels, Symbol(label_prefix, "_", time_bin))
+        end
+    end
+
+    return posteriors, posterior_keys, labels
+end
+
+"""
+    hazard_theta(model, home_team, away_team) -> HazardTheta
+
+Return the ordered posterior mean and covariance of the matchup log-hazard
+vector. The four blocks correspond to home offense, away defense, away
+offense, and home defense, respectively, with one entry per model time bin.
+The Gamma posteriors are transformed exactly to log-hazard moments:
+`E[log(lambda)] = digamma(shape) - log(rate)` and
+`Var(log(lambda)) = trigamma(shape)`.
+"""
+function hazard_theta(model::HazardModel, home_team, away_team)
+    posteriors, posterior_keys, labels =
+        _matchup_theta_posteriors(model, home_team, away_team)
+    log_mean = [
+        SpecialFunctions.digamma(posterior.shape) - log(posterior.rate)
+        for posterior in posteriors
+    ]
+    covariance = zeros(Float64, length(posteriors), length(posteriors))
+    for i in eachindex(posteriors), j in eachindex(posteriors)
+        posterior_keys[i] == posterior_keys[j] || continue
+        covariance[i, j] = SpecialFunctions.trigamma(posteriors[i].shape)
+    end
+    return HazardTheta(log_mean, covariance, labels)
+end
+
 # ----------------------------------------------------------------------
 # 4. Conditional score marks
 # ----------------------------------------------------------------------
@@ -1016,53 +1106,36 @@ end
 Moments of one drive's duration and possessing-team score under the
 two-hazard race.
 """
-struct DriveMoments
-    p_td::Float64
-    p_defensive::Float64
-    mean_T::Float64
-    var_T::Float64
-    mean_S::Float64
-    var_S::Float64
-    cov_TS::Float64
+struct DriveMoments{T<:Real}
+    p_td::T
+    p_defensive::T
+    mean_T::T
+    var_T::T
+    mean_S::T
+    var_S::T
+    cov_TS::T
 end
 
 _bin_widths(edges::AbstractVector{<:Real}) = diff(edges)
 
-"""
-    drive_moments(model, marks, posteam, defteam; posteam_home=false) -> DriveMoments
-
-Compute closed-form duration, score, and time/score covariance moments for a
-drive with the given offensive and defensive teams. `posteam_home` selects the
-home-adjusted offensive hazard; the defensive team is assigned the
-complementary away/home status.
-"""
-function drive_moments(
-    model::HazardModel,
+function _drive_moments_from_hazards(
+    edges::AbstractVector{<:Real},
     marks::ScoreMarks,
-    posteam,
-    defteam,
-    ;
-    posteam_home::Bool=false,
+    lambda_td::AbstractVector{<:Real},
+    lambda_defensive::AbstractVector{<:Real},
 )
-    edges = model.time_edges
     widths = _bin_widths(edges)
     n = length(widths)
+    length(lambda_td) == n && length(lambda_defensive) == n ||
+        throw(ArgumentError("hazard vectors must contain one value per time bin"))
+    T = promote_type(eltype(lambda_td), eltype(lambda_defensive), Float64)
 
-    lambda_td = [
-        hazard_rate(model, :td, posteam, k; home=posteam_home)
-        for k in 1:n
-    ]
-    lambda_defensive = [
-        hazard_rate(model, :defensive, defteam, k; home=!posteam_home)
-        for k in 1:n
-    ]
     lambda = lambda_td .+ lambda_defensive
-
-    S_prev = 1.0
-    p_event = zeros(n)
-    e_time = zeros(n)
-    contrib_ET = zeros(n)
-    contrib_ET2 = zeros(n)
+    S_prev = one(T)
+    p_event = zeros(T, n)
+    e_time = zeros(T, n)
+    contrib_ET = zeros(T, n)
+    contrib_ET2 = zeros(T, n)
 
     for k in 1:n
         lo, width, total_rate = edges[k], widths[k], lambda[k]
@@ -1096,7 +1169,9 @@ function drive_moments(
     p_defensive = sum(defensive_weights)
 
     conditional_mean_time = (weights, probability) ->
-        probability > 0 ? sum(weights[k] * e_time[k] for k in 1:n) / probability : 0.0
+        probability > 0 ?
+            sum(weights[k] * e_time[k] for k in 1:n) / probability :
+            zero(T)
     mean_T_td = conditional_mean_time(td_weights, p_td)
     mean_T_defensive = conditional_mean_time(defensive_weights, p_defensive)
 
@@ -1123,6 +1198,37 @@ function drive_moments(
     )
 end
 
+"""
+    drive_moments(model, marks, posteam, defteam; posteam_home=false) -> DriveMoments
+
+Compute closed-form duration, score, and time/score covariance moments for a
+drive with the given offensive and defensive teams. `posteam_home` selects the
+home-adjusted offensive hazard; the defensive team is assigned the
+complementary away/home status.
+"""
+function drive_moments(
+    model::HazardModel,
+    marks::ScoreMarks,
+    posteam,
+    defteam,
+    ;
+    posteam_home::Bool=false,
+)
+    edges = model.time_edges
+    widths = _bin_widths(edges)
+    n = length(widths)
+
+    lambda_td = [
+        hazard_rate(model, :td, posteam, k; home=posteam_home)
+        for k in 1:n
+    ]
+    lambda_defensive = [
+        hazard_rate(model, :defensive, defteam, k; home=!posteam_home)
+        for k in 1:n
+    ]
+    return _drive_moments_from_hazards(edges, marks, lambda_td, lambda_defensive)
+end
+
 drive_moments(
     model::HazardModel,
     marks::ScoreMarks,
@@ -1142,14 +1248,7 @@ Total regulation game clock, in seconds.
 """
 const GAME_CLOCK_SECONDS = 3600.0
 
-"""
-    game_spread_distribution(home_moments, away_moments; horizon=GAME_CLOCK_SECONDS)
-        -> Distributions.Normal
-
-Approximate the final home-minus-away score spread using the renewal-reward
-central limit theorem.
-"""
-function game_spread_distribution(
+function _game_metrics_from_moments(
     home_moments::DriveMoments,
     away_moments::DriveMoments;
     horizon::Real=GAME_CLOCK_SECONDS,
@@ -1163,7 +1262,188 @@ function game_spread_distribution(
     rate = mean_Rc / mean_Tc
     mean_spread = horizon * rate
     var_rate = (var_Rc - 2 * rate * cov_TcRc + rate^2 * var_Tc) / mean_Tc
-    var_spread = horizon * var_rate
+    spread_variance = horizon * var_rate
+    win_probability = (
+        1 + SpecialFunctions.erf(mean_spread / sqrt(2 * spread_variance))
+    ) / 2
 
-    return Normal(mean_spread, sqrt(var_spread))
+    return (;
+        mean_spread,
+        spread_variance,
+        win_probability,
+    )
+end
+
+function _game_metrics_from_theta(
+    theta::AbstractVector{<:Real},
+    edges::AbstractVector{<:Real},
+    marks::ScoreMarks;
+    horizon::Real=GAME_CLOCK_SECONDS,
+)
+    n_bins = length(edges) - 1
+    expected_length = 4 * n_bins
+    length(theta) == expected_length ||
+        throw(ArgumentError("theta must contain four hazard blocks per time bin"))
+
+    home_td = exp.(theta[1:n_bins])
+    away_defensive = exp.(theta[(n_bins + 1):(2 * n_bins)])
+    away_td = exp.(theta[(2 * n_bins + 1):(3 * n_bins)])
+    home_defensive = exp.(theta[(3 * n_bins + 1):(4 * n_bins)])
+
+    home_moments = _drive_moments_from_hazards(
+        edges,
+        marks,
+        home_td,
+        away_defensive,
+    )
+    away_moments = _drive_moments_from_hazards(
+        edges,
+        marks,
+        away_td,
+        home_defensive,
+    )
+    return _game_metrics_from_moments(home_moments, away_moments; horizon=horizon)
+end
+
+"""
+    game_spread_distribution(home_moments, away_moments; horizon=GAME_CLOCK_SECONDS)
+        -> Distributions.Normal
+
+Approximate the final home-minus-away score spread using the renewal-reward
+central limit theorem.
+"""
+function game_spread_distribution(
+    home_moments::DriveMoments,
+    away_moments::DriveMoments;
+    horizon::Real=GAME_CLOCK_SECONDS,
+)
+    metrics = _game_metrics_from_moments(
+        home_moments,
+        away_moments;
+        horizon=horizon,
+    )
+    return Normal(metrics.mean_spread, sqrt(metrics.spread_variance))
+end
+
+"""
+    ExpectedGameMetrics
+
+Posterior expected game metrics after propagating matchup hazard uncertainty.
+`predictive_spread_variance` includes both conditional game variance and
+between-hazard-posterior variance in the conditional spread mean.
+"""
+struct ExpectedGameMetrics
+    expected_spread::Float64
+    expected_win_probability::Float64
+    predictive_spread_variance::Float64
+end
+
+function _trace_product(
+    left::AbstractMatrix{<:Real},
+    right::AbstractMatrix{<:Real},
+)
+    size(left) == size(right) ||
+        throw(ArgumentError("matrix dimensions must match"))
+    return sum(
+        left[i, j] * right[j, i]
+        for i in axes(left, 1), j in axes(left, 2)
+    )
+end
+
+function _quadratic_form(
+    gradient::AbstractVector{<:Real},
+    covariance::AbstractMatrix{<:Real},
+)
+    size(covariance) == (length(gradient), length(gradient)) ||
+        throw(ArgumentError("covariance dimensions must match gradient length"))
+    return sum(
+        gradient[i] * covariance[i, j] * gradient[j]
+        for i in eachindex(gradient), j in eachindex(gradient)
+    )
+end
+
+function _second_order_expectation(
+    function_value,
+    theta_mean::Vector{Float64},
+    covariance::Matrix{Float64},
+)
+    hessian = ForwardDiff.hessian(function_value, theta_mean)
+    return function_value(theta_mean) + 0.5 * _trace_product(hessian, covariance)
+end
+
+"""
+    expected_game_metrics(
+        model,
+        marks,
+        home_team,
+        away_team;
+        horizon=GAME_CLOCK_SECONDS,
+    ) -> ExpectedGameMetrics
+
+Approximate posterior expected spread and home win probability using a
+second-order delta method over the matchup's log-hazard posterior. The
+posterior-predictive spread variance uses the law of total variance, with a
+second-order approximation for expected conditional variance and a
+first-order approximation for the variance of the conditional spread mean.
+Score marks, empirical-Bayes hyperparameters, and fitted home multipliers are
+treated as fixed.
+"""
+function expected_game_metrics(
+    model::HazardModel,
+    marks::ScoreMarks,
+    home_team,
+    away_team;
+    horizon::Real=GAME_CLOCK_SECONDS,
+)
+    theta = hazard_theta(model, home_team, away_team)
+    spread_function = theta_vector ->
+        _game_metrics_from_theta(
+            theta_vector,
+            model.time_edges,
+            marks;
+            horizon=horizon,
+        ).mean_spread
+    variance_function = theta_vector ->
+        _game_metrics_from_theta(
+            theta_vector,
+            model.time_edges,
+            marks;
+            horizon=horizon,
+        ).spread_variance
+    win_function = theta_vector ->
+        _game_metrics_from_theta(
+            theta_vector,
+            model.time_edges,
+            marks;
+            horizon=horizon,
+        ).win_probability
+
+    expected_spread = _second_order_expectation(
+        spread_function,
+        theta.log_mean,
+        theta.covariance,
+    )
+    expected_win_probability = _second_order_expectation(
+        win_function,
+        theta.log_mean,
+        theta.covariance,
+    )
+    expected_conditional_variance = _second_order_expectation(
+        variance_function,
+        theta.log_mean,
+        theta.covariance,
+    )
+    spread_gradient = ForwardDiff.gradient(spread_function, theta.log_mean)
+    parameter_spread_variance = _quadratic_form(
+        spread_gradient,
+        theta.covariance,
+    )
+    predictive_spread_variance =
+        expected_conditional_variance + parameter_spread_variance
+
+    return ExpectedGameMetrics(
+        expected_spread,
+        expected_win_probability,
+        predictive_spread_variance,
+    )
 end

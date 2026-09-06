@@ -59,3 +59,25 @@ Pass `posteam_home=true` to `drive_moments` when the possessing team is at
 home; the defensive team is assigned the complementary away/home status.
 `fit_score_marks`, `drive_moments`, and `game_spread_distribution` provide the
 downstream score and game-level approximations.
+
+To propagate conditional hazard-posterior uncertainty through those nonlinear
+game calculations, use the log-hazard theta summary and the
+second-order metric approximation:
+
+```julia
+marks = fit_score_marks(current)
+theta = hazard_theta(model, "KC", "SF")
+metrics = expected_game_metrics(model, marks, "KC", "SF")
+
+metrics.expected_spread
+metrics.expected_win_probability
+metrics.predictive_spread_variance
+```
+
+`hazard_theta` orders the log hazards as home offense, away defense, away
+offense, and home defense, with one block per elapsed-time bin. The expected
+spread and win probability use a second-order delta-method correction based on
+the Gamma posterior moments. The predictive spread variance also includes
+between-hazard-posterior variation in the conditional spread mean. This
+calculation treats the empirical-Bayes hyperparameters, fitted home
+multipliers, and `ScoreMarks` as fixed.

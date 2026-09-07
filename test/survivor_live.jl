@@ -1,10 +1,12 @@
 using DataFrames
+using Statistics
 using Test
 using SurvivorModel
 
 const SURVIVOR_LIVE_REGULAR_SEASON_LENGTHS = (17, 18)
 
 mutable struct SurvivorLiveScenario
+    strategy::Symbol
     initial_strikes::Int
     picks_made::Dict{Int,String}
     strikes_remaining::Int
@@ -18,6 +20,7 @@ end
 function _survivor_live_records()
     return DataFrame(
         season=Int[],
+        strategy=String[],
         initial_strikes=Int[],
         week=Int[],
         game_id=String[],
@@ -36,6 +39,24 @@ function _survivor_live_records()
         strikes_after=Int[],
         alive_after=Bool[],
     )
+end
+
+function _survivor_live_greedy_pick(
+    candidates::AbstractDataFrame,
+    week::Integer,
+)
+    current = candidates[
+        (candidates.week .== week) .&
+        .!ismissing.(candidates.market_spread),
+        :,
+    ]
+    isempty(current) && return nothing
+
+    maximum_spread = maximum(Float64.(current.market_spread))
+    selected = current[current.market_spread .== maximum_spread, :]
+    selected = selected[1:1, :]
+    selected.discount = [1.0]
+    return selected
 end
 
 function _survivor_live_completed_seasons(schedule::AbstractDataFrame)
@@ -113,17 +134,6 @@ function _survivor_live_weekly_probability()
     return probability
 end
 
-function _survivor_live_recency_half_life()
-    key = "SURVIVORMODEL_SURVIVOR_RECENCY_HALF_LIFE"
-    haskey(ENV, key) || return DEFAULT_RECENCY_HALF_LIFE
-    half_life = parse(Float64, ENV[key])
-    isfinite(half_life) && half_life > 0.0 ||
-        throw(ArgumentError(
-            "SURVIVORMODEL_SURVIVOR_RECENCY_HALF_LIFE must be finite and positive",
-        ))
-    return half_life
-end
-
 function _survivor_live_game_row(
     forecast::AbstractDataFrame,
     current_pick::AbstractDataFrame,
@@ -177,6 +187,7 @@ function _survivor_live_record_pick!(
         scenario.records,
         (
             season=Int(season),
+            strategy=String(scenario.strategy),
             initial_strikes=scenario.initial_strikes,
             week=Int(week),
             game_id=String(current_pick.game_id[1]),
@@ -223,6 +234,7 @@ function _survivor_live_summary(
     losing_records = scenario.records[scenario.records.outcome .== "loss", :]
     return (
         season=Int(season),
+        strategy=String(scenario.strategy),
         regular_season_last_week=Int(last_week),
         initial_strikes=scenario.initial_strikes,
         weekly_survival_probability=Float64(weekly_survival_probability),
@@ -262,14 +274,12 @@ function _survivor_live_prior(
     schedule::AbstractDataFrame,
     drives::AbstractDataFrame,
     max_seasons::Int,
-    recency_half_life::Union{Nothing,Real},
 )
     regular_drives = SurvivorModel._regular_season_drives(drives, schedule)
     historical = regular_drives[regular_drives.season .< Int(season), :]
     return fit_empirical_bayes_prior(
         historical;
         max_seasons=max_seasons,
-        recency_half_life=recency_half_life,
         current_season=season,
     )
 end
@@ -282,10 +292,10 @@ function _survivor_live_backtest_season(
     initial_strikes_values,
     weekly_survival_probability::Real,
     max_seasons::Int,
-    recency_half_life::Union{Nothing,Real},
 )
     scenarios = [
         SurvivorLiveScenario(
+            strategy,
             Int(strikes),
             Dict{Int,String}(),
             Int(strikes),
@@ -294,7 +304,9 @@ function _survivor_live_backtest_season(
             "survived_season",
             "",
             _survivor_live_records(),
-        ) for strikes in initial_strikes_values
+        )
+        for strategy in (:model, :greedy)
+        for strikes in initial_strikes_values
     ]
     started_at = time()
     prior = _survivor_live_prior(
@@ -302,7 +314,6 @@ function _survivor_live_backtest_season(
         schedule,
         drives,
         max_seasons,
-        recency_half_life,
     )
 
     for week in 1:last_week
@@ -341,43 +352,62 @@ function _survivor_live_backtest_season(
                 include_completed=true,
                 picks_made=scenario.picks_made,
             )
+            current_pick = if scenario.strategy == :model
+                market_eligible = candidates[
+                    SurvivorModel._survivor_market_guard_mask(candidates, state),
+                    :,
+                ]
+                if !any(market_eligible.week .== week)
+                    scenario.elimination_week = week
+                    scenario.elimination_reason = "no_legal_pick"
+                    scenario.elimination_detail =
+                        "all current-week teams were reused or failed the " *
+                        "2-point market favorite guard"
+                    continue
+                end
 
-            if !any(candidates.week .== week)
-                scenario.elimination_week = week
-                scenario.elimination_reason = "no_legal_pick"
-                scenario.elimination_detail =
-                    "all current-week teams had already been selected"
-                continue
+                missing_future_weeks = setdiff(
+                    collect(week:last_week),
+                    sort(unique(market_eligible.week)),
+                )
+                if !isempty(missing_future_weeks)
+                    scenario.elimination_week = week
+                    scenario.elimination_reason = "no_legal_full_plan"
+                    scenario.elimination_detail =
+                        "no eligible unused team was available in week(s) " *
+                        "$missing_future_weeks after the market favorite guard"
+                    continue
+                end
+
+                plan = optimize_survivor_pool(
+                    candidates,
+                    state;
+                    weekly_survival_probability=weekly_survival_probability,
+                    through_week=last_week,
+                )
+                plan.current_pick
+            else
+                greedy_pick = _survivor_live_greedy_pick(candidates, week)
+                isnothing(greedy_pick) && begin
+                    scenario.elimination_week = week
+                    scenario.elimination_reason = "no_legal_pick"
+                    scenario.elimination_detail =
+                        "no unused team had a published spread for the " *
+                        "greedy picker"
+                    continue
+                end
+                greedy_pick
             end
-
-            missing_future_weeks = setdiff(
-                collect(week:last_week),
-                sort(unique(candidates.week)),
-            )
-            if !isempty(missing_future_weeks)
-                scenario.elimination_week = week
-                scenario.elimination_reason = "no_legal_full_plan"
-                scenario.elimination_detail =
-                    "no unused team was available in week(s) $missing_future_weeks"
-                continue
-            end
-
-            plan = optimize_survivor_pool(
-                candidates,
-                state;
-                weekly_survival_probability=weekly_survival_probability,
-                through_week=last_week,
-            )
-            game_row = _survivor_live_game_row(forecast, plan.current_pick)
+            game_row = _survivor_live_game_row(forecast, current_pick)
             actual_result = _survivor_live_actual_result(
                 forecast,
-                plan.current_pick,
+                current_pick,
             )
             _survivor_live_record_pick!(
                 scenario,
                 season,
                 week,
-                plan.current_pick,
+                current_pick,
                 actual_result,
                 :spread_line in propertynames(game_row) ?
                     game_row.spread_line :
@@ -433,7 +463,6 @@ end
     schedule = load_schedule()
     seasons = _survivor_live_requested_seasons(schedule)
     weekly_survival_probability = _survivor_live_weekly_probability()
-    recency_half_life = _survivor_live_recency_half_life()
     max_seasons = parse(
         Int,
         get(ENV, "SURVIVORMODEL_SURVIVOR_MAX_SEASONS", "3"),
@@ -452,19 +481,30 @@ end
             initial_strikes_values,
             weekly_survival_probability,
             max_seasons,
-            recency_half_life,
         ) for season in seasons
     ]
     summary = vcat([report.summary for report in reports]...)
     history = vcat([report.history for report in reports]...; cols=:union)
 
-    @test nrow(summary) == length(seasons) * length(initial_strikes_values)
+    @test nrow(summary) ==
+        length(seasons) * length(initial_strikes_values) * 2
+    @test Set(summary.strategy) == Set(["model", "greedy"])
     @test all(summary.last_survived_week .>= 0)
     @test all(value -> value in initial_strikes_values, summary.initial_strikes)
     @test all(x -> x in ("win", "loss"), history.outcome)
 
     println("Survivor backtest summary:")
     show(stdout, summary; allrows=true, allcols=true)
+    println()
+    comparison = combine(
+        groupby(summary, [:strategy, :initial_strikes]),
+        :last_survived_week => mean => :mean_last_survived_week,
+        :survived_season => sum => :survived_seasons,
+        :wins => mean => :mean_wins,
+        :losses => mean => :mean_losses,
+    )
+    println("Strategy comparison:")
+    show(stdout, comparison; allrows=true, allcols=true)
     println()
     println("Survivor backtest picks:")
     show(stdout, history; allrows=true, allcols=true)

@@ -36,30 +36,69 @@ home_td_rate = hazard_rate(model, :td, "KC", 2; home=true)
 home_defensive_rate = hazard_rate(model, :defensive, "SF", 2; home=true)
 ```
 
-`fit_empirical_bayes_prior` estimates separate Gamma-Poisson hyperparameters
-for each outcome and elapsed-time bin, plus one global offensive touchdown
-multiplier and one global defensive-event multiplier. The multipliers are
-positive, may be above or below 1.0, and are fitted from historical data
-alongside the league hyperparameters. The default `fit_strategy=:moments`
-uses exposure-weighted Negative Binomial moments; pass `fit_strategy=:mle`
-to use the slower iterative likelihood fit. Inspect the multipliers with
-`home_multiplier(prior, :td)` and `home_multiplier(prior, :defensive)`.
-They remain fixed when current-season data are added. The prior uses the
-most recent three seasons to form team-specific priors, measuring recency from
-`current_season`. The default recency half-life is `1.0`, and the effective
-historical window is capped at three seasons even when a larger `max_seasons`
-value is supplied. Passing `recency_half_life=nothing` opts into the moment
-estimator, which measures year-to-year persistence from correlations between
-shrunk team-season hazard moments. Inspect the resulting historical weights
-with `recency_weights(prior)`. The legacy `half_life_candidates` keyword is
-still accepted, but automatic recency estimation no longer searches those
-candidate values. New drives can be incorporated without refitting the
-historical prior.
+`fit_empirical_bayes_prior` estimates separate stationary Gamma parameters for
+each outcome and elapsed-time bin. It also estimates one global home
+multiplier and one season-to-season persistence probability for each outcome.
+The persistence probability is shared across the bins of that outcome's hazard
+curve.
+
+Historical hyperparameters are fit with the event-process marginal likelihood,
+not with exposure-normalized factorial moments. For each observed risk
+interval, the likelihood retains the competing-risk contribution
+`λᴛ^Nᴛ λᴅ^Nᴅ exp[-(λᴛ + λᴅ)E]`. Home exposure is scaled by the fitted
+outcome-specific multiplier, and home events contribute the corresponding
+multiplier factor. The latent team/bin rate is integrated through the
+season-to-season reset transition, so a historical fit uses the full finite
+Gamma-mixture model rather than treating seasons as independent Gamma draws.
+
+With the default three-season historical window, the likelihood for each
+team/bin is evaluated as four reset paths: all three seasons redraw
+independently, seasons 1-2 persist and season 3 redraws, season 1 redraws and
+seasons 2-3 persist, or all three seasons persist. Their weights are
+`(1-rho)^2`, `rho(1-rho)`, `(1-rho)rho`, and `rho^2`. Each path is evaluated
+from aggregated counts and effective exposures, so the historical fit does not
+revisit individual drive rows during optimization.
+
+The historical fit uses an EM/ECME decomposition rather than one simultaneous
+high-dimensional search. The E-step computes posterior responsibilities for
+the four reset paths and posterior moments of their shared Gamma rates. The
+conditional Gamma updates then solve each time bin independently given the
+shared `rho` and home multiplier, while the shared parameters are updated in a
+two-dimensional conditional likelihood step. This keeps the expensive
+subproblems small while retaining the exact aggregated likelihood.
+
+The likelihood is evaluated separately for touchdowns and defensive events
+because it factorizes conditional on the observed risk intervals. This still
+accounts for competing-process exposure: short defensive risk windows and
+longer offensive risk windows enter the joint likelihood through their
+observed integrated hazards. The fit stops with an error if the historical
+data contain no usable risk intervals or if the EM/conditional optimization
+fails; it does not silently substitute the weak default prior. Inspect
+`likelihood_fit_diagnostics(prior, :td)` or
+`likelihood_fit_diagnostics(prior, :defensive)` for the maximized likelihood,
+fit status, iteration counts, conditional objective evaluations, and boundary
+flags.
+
+The team-specific season-opening prior is a finite Gamma mixture produced by a
+probabilistic reset filter. Each component represents a possible last reset
+season; with the default three-season historical window, the target-season
+prior contains four components. The exact mixture is available from
+`hazard_posterior`, while `hazard_rate` returns its posterior mean. Inspect the
+home multipliers with `home_multiplier(prior, :td)` and
+`home_multiplier(prior, :defensive)`, and inspect persistence with
+`hazard_persistence(prior, :td)` or `hazard_persistence(prior, :defensive)`.
+The league parameters and home multipliers remain fixed when current-season
+drives are added.
 
 ```julia
 update_hazard_model!(model, newly_available_drives)
 posterior = hazard_posterior(model, :td, "KC", 2)
 ```
+
+`posterior.weights`, `posterior.components`, and `posterior.source_seasons`
+describe the exact finite Gamma mixture. New drives update every component
+with the same Gamma-Poisson conjugate rule and reweight the components by their
+predictive likelihood.
 
 ## Regular-season forecasts
 
@@ -94,7 +133,7 @@ results = regular_season_results(2024; from_week=10)
 
 When generating several weekly snapshots for the same target season, fit the
 historical prior once and pass it to each call as `prior=...`. This avoids
-repeating the empirical-Bayes hyperparameter and recency fits while retaining
+repeating the empirical-Bayes moment fit while retaining
 the week-specific current-season update:
 
 ```julia
@@ -117,7 +156,8 @@ the underlying schedule separately. At the matchup level,
 `expected_game_win_probability` and `expected_game_spread_metrics` provide the
 same split without constructing the full `ExpectedGameMetrics` result.
 
-The posterior rate returned by `hazard_rate` is the Gamma posterior mean.
+The posterior rate returned by `hazard_rate` is the finite-mixture posterior
+mean.
 Pass `posteam_home=true` to `drive_moments` when the possessing team is at
 home; the defensive team is assigned the complementary away/home status.
 `fit_score_marks`, `drive_moments`, and `game_spread_distribution` provide the
@@ -140,7 +180,7 @@ metrics.predictive_spread_variance
 `hazard_theta` orders the log hazards as home offense, away defense, away
 offense, and home defense, with one block per elapsed-time bin. The expected
 spread and win probability use a second-order delta-method correction based on
-the Gamma posterior moments. The predictive spread variance also includes
+the exact finite-mixture log-rate moments. The predictive spread variance also includes
 between-hazard-posterior variation in the conditional spread mean. This
 calculation treats the empirical-Bayes hyperparameters, fitted home
 multipliers, and `ScoreMarks` as fixed.
@@ -219,14 +259,19 @@ away-team candidate, excludes teams in `picks_made`, and solves one binary
 assignment model with JuMP and HiGHS. It selects exactly one team for every
 week in the requested horizon and allows each team to be selected at most
 once. `plan.selections` includes each selected team's win probability, reach
-discount, and discounted objective contribution; `plan.current_pick` is the
-row to use for the current week.
+discount, selected-team market spread, and discounted objective contribution;
+`plan.current_pick` is the row to use for the current week.
 
 The objective is expected future wins weighted by your personal probability of
 still being alive before each week. It does not estimate the probability that
-the entire pool survives and does not use sportsbook lines. With fixed weekly
-survival probability `q`, no remaining strikes uses `d[k] = q^k`, where `k`
-is the number of prior planned weeks. With `s` remaining strikes, the
+the entire pool survives and does not use sportsbook lines in its objective.
+As a near-term safety guard, the optimizer disallows candidates in the current
+week and the following week unless the selected team is favored by at least
+`2.0` points according to `spread_line`. Positive `market_spread` values mean
+the selected team is favored. Missing lines remain eligible, and weeks after
+the two-week protected window are not filtered by this guard. With fixed
+weekly survival probability `q`, no remaining strikes uses `d[k] = q^k`, where
+`k` is the number of prior planned weeks. With `s` remaining strikes, the
 discount is the probability of having at most `s` losses in those prior weeks:
 `d[k] = sum(binomial(k, losses) * (1-q)^losses * q^(k-losses))` for
 `losses = 0:min(s, k)`. For example, with `q = 0.65` and one unused strike,
@@ -252,7 +297,12 @@ one and two initial strikes and `weekly_survival_probability = 0.65`. It
 refits the forecast context before each week using only drives before that
 week, reuses the same weekly forecast for both strike scenarios, applies
 historical wins and losses (ties count as losses), and prints a summary with
-the last week survived, elimination week/reason, wins, losses, and picks.
+the last week survived, elimination week/reason, wins, losses, and picks. It
+also compares the MILP strategy with a greedy baseline that selects the
+largest available selected-team published spread each week while avoiding
+previously picked teams. The greedy baseline does not plan around future team
+reuse or use model win probabilities; games without a published spread are
+not eligible for its pick.
 Override the inputs with environment variables such as:
 
 ```sh
@@ -264,9 +314,7 @@ julia --project=. test/survivor_live.jl
 
 Use `SURVIVORMODEL_SURVIVOR_RECENT_SEASONS` when selecting the latest completed
 seasons, and `SURVIVORMODEL_SURVIVOR_MAX_SEASONS` to change the historical
-training window. The harness uses a fixed recency half-life of `1.0` by
-default; set `SURVIVORMODEL_SURVIVOR_RECENCY_HALF_LIFE` to a positive, finite
-value to override it. The harness is opt-in because it downloads live
+training window. The harness is opt-in because it downloads live
 schedules and play-by-play data and reruns one pre-week forecast per
 regular-season week (17 weeks for seasons through 2020 and 18 weeks from
 2021 onward).

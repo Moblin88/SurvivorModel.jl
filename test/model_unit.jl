@@ -97,180 +97,390 @@ using Test
         model = fit_hazard_model(drives; time_edges=[0, 120, 240, Inf])
 
         td_posterior = hazard_posterior(model, :td, "HOME", 1)
-        @test td_posterior.shape > 1.0
-        @test td_posterior.rate > 100.0
+        @test length(td_posterior.components) == 1
+        @test td_posterior.components[1].shape > 1.0
+        @test td_posterior.components[1].rate > 100.0
         @test hazard_rate(model, :td, "HOME", 1) ==
-            td_posterior.shape / td_posterior.rate
+            td_posterior.components[1].shape / td_posterior.components[1].rate
 
-        previous_shape = td_posterior.shape
-        previous_rate = td_posterior.rate
+        previous_shape = td_posterior.components[1].shape
+        previous_rate = td_posterior.components[1].rate
         update_hazard_model!(model, drives[1:1, :])
         updated = hazard_posterior(model, :td, "HOME", 1)
-        @test updated.shape == previous_shape + 1.0
-        @test updated.rate == previous_rate + 120.0
+        @test updated.components[1].shape == previous_shape + 1.0
+        @test updated.components[1].rate == previous_rate + 120.0
     end
 
-    @testset "empirical-Bayes prior and recency calibration" begin
-        historical = vcat(
-            DataFrame(
-                game_id=["2018_1", "2019_1", "2020_1"],
-                fixed_drive=ones(Int, 3),
-                posteam=fill("A", 3),
-                defteam=fill("B", 3),
-                drive_result=fill("Punt", 3),
-                time_of_possession=Second.([60, 60, 60]),
-                posteam_home=fill(true, 3),
-                defteam_home=fill(false, 3),
-                home_spread_change=zeros(3),
-            ),
-            DataFrame(
-                game_id=["2021_1", "2021_2", "2022_1", "2022_2", "2023_1", "2023_2"],
-                fixed_drive=ones(Int, 6),
-                posteam=fill("A", 6),
-                defteam=fill("B", 6),
-                drive_result=["Touchdown", "Punt", "Touchdown", "Punt", "Touchdown", "Punt"],
-                time_of_possession=Second.([60, 120, 60, 120, 60, 120]),
-                posteam_home=fill(true, 6),
-                defteam_home=fill(false, 6),
-                home_spread_change=[7.0, 0.0, 7.0, 0.0, 7.0, 0.0],
-            ),
-            DataFrame(
-                game_id=["2021_3", "2022_3", "2023_3"],
-                fixed_drive=ones(Int, 3),
-                posteam=fill("C", 3),
-                defteam=fill("D", 3),
-                drive_result=fill("Punt", 3),
-                time_of_possession=Second.([180, 180, 180]),
-                posteam_home=fill(true, 3),
-                defteam_home=fill(false, 3),
-                home_spread_change=zeros(3),
-            ),
+    @testset "Gamma mixture primitives" begin
+        mixture = GammaMixture(
+            [1.0, 3.0],
+            [GammaParams(2.0, 4.0), GammaParams(6.0, 9.0)];
+            source_seasons=[2022, 2023],
         )
-        prior = fit_empirical_bayes_prior(
-            historical;
-            time_edges=[0, 120, 240, Inf],
-            max_seasons=99,
-            half_life_candidates=[0.5, 1.0, Inf],
-            current_season=2024,
-        )
-        @test prior.historical_seasons == [2021, 2022, 2023]
-        @test prior.recency_half_life == DEFAULT_RECENCY_HALF_LIFE
-        @test SurvivorModel.MIN_RECENCY_HALF_LIFE <= prior.recency_half_life <=
-            SurvivorModel.MAX_RECENCY_HALF_LIFE
-        @test all(p -> p.shape > 0 && p.rate > 0, prior.td_hyperparameters)
-        @test haskey(prior.td_team_priors, "A")
-        @test haskey(prior.defensive_team_priors, "B")
-        weights = recency_weights(prior)
-        @test weights[2024] == 1.0
-        @test weights[2023] ≈ exp(-1 / prior.recency_half_life)
-        @test weights[2022] ≈ exp(-2 / prior.recency_half_life)
-        @test weights[2021] ≈ exp(-3 / prior.recency_half_life)
+        @test mixture.weights ≈ [0.25, 0.75]
+        @test SurvivorModel._gamma_mixture_mean(mixture) ≈
+            0.25 * (2.0 / 4.0) + 0.75 * (6.0 / 9.0)
+        @test SurvivorModel._gamma_mixture_variance(mixture) > 0.0
+        log_mean, log_variance =
+            SurvivorModel._gamma_mixture_log_moments(mixture)
+        @test isfinite(log_mean)
+        @test log_variance > 0.0
 
-        current = historical[4:4, :]
-        model = fit_hazard_model(
-            current;
-            prior=prior,
-            time_edges=[0, 120, 240, Inf],
-        )
-        @test hazard_posterior(model, :td, "A", 1).shape >
-            prior.td_team_priors["A"][1].shape
-
-        short_prior = fit_empirical_bayes_prior(
-            historical[1:2, :];
-            time_edges=[0, 120, 240, Inf],
-            current_season=2023,
-        )
-        @test short_prior.recency_half_life == DEFAULT_RECENCY_HALF_LIFE
-        @test_throws ArgumentError fit_empirical_bayes_prior(
-            historical;
-            time_edges=[0, 120, 240, Inf],
-            max_seasons=0,
-        )
-        automatic_prior = fit_empirical_bayes_prior(
-            historical;
-            time_edges=[0, Inf],
-            max_seasons=99,
-            recency_half_life=nothing,
-            current_season=2024,
-        )
-        @test SurvivorModel.MIN_RECENCY_HALF_LIFE <=
-            automatic_prior.recency_half_life <=
-            SurvivorModel.MAX_RECENCY_HALF_LIFE
-        mle_prior = fit_empirical_bayes_prior(
-            historical;
-            time_edges=[0, Inf],
-            max_seasons=99,
-            recency_half_life=Inf,
-            fit_strategy=:mle,
-            current_season=2024,
-        )
-        @test all(p -> p.shape > 0 && p.rate > 0, mle_prior.td_hyperparameters)
-        @test all(p -> p.shape > 0 && p.rate > 0, mle_prior.defensive_hyperparameters)
-        @test_throws ArgumentError fit_empirical_bayes_prior(
-            historical;
-            fit_strategy=:invalid,
+        home = SurvivorModel._gamma_mixture_home_adjusted(mixture, 2.0)
+        @test home.source_seasons == mixture.source_seasons
+        @test all(
+            home_component.rate == mixture_component.rate / 2.0
+            for (home_component, mixture_component) in
+                zip(home.components, mixture.components)
         )
 
-        function _moment_drives(results_by_season)
-            rows = DataFrame(
-                game_id=String[],
-                fixed_drive=Int[],
-                posteam=String[],
-                defteam=String[],
-                drive_result=String[],
-                time_of_possession=Second[],
-                posteam_home=Bool[],
-                defteam_home=Bool[],
+        updated = SurvivorModel._update_gamma_mixture(mixture, 2, 10.0)
+        @test all(
+            updated_component.shape == mixture_component.shape + 2.0 &&
+            updated_component.rate == mixture_component.rate + 10.0
+            for (updated_component, mixture_component) in
+                zip(updated.components, mixture.components)
+        )
+        @test sum(updated.weights) ≈ 1.0
+        transitioned = SurvivorModel._transition_gamma_mixture(
+            updated,
+            0.7,
+            GammaParams(4.0, 8.0),
+            2024,
+        )
+        @test length(transitioned.components) == 3
+        @test transitioned.source_seasons == [2022, 2023, 2024]
+        @test sum(transitioned.weights) ≈ 1.0
+
+        @test_throws ArgumentError GammaMixture(
+            [0.0, 0.0],
+            [GammaParams(1.0, 1.0), GammaParams(1.0, 1.0)],
+        )
+        @test_throws ArgumentError SurvivorModel._update_gamma_mixture(
+            mixture,
+            0.5,
+            10.0,
+        )
+        @test_throws ArgumentError SurvivorModel._transition_gamma_mixture(
+            mixture,
+            1.1,
+            GammaParams(1.0, 1.0),
+            2024,
+        )
+    end
+
+    @testset "event-process Gamma marginal likelihood" begin
+        component = GammaParams(2.0, 4.0)
+        expected = 2.0 * log(4.0) + log(2.0) - 3.0 * log(7.0)
+        @test SurvivorModel._log_gamma_event_marginal(
+            component,
+            1,
+            3.0,
+        ) ≈ expected
+        @test SurvivorModel._log_gamma_event_marginal(
+            component,
+            0,
+            0.0,
+        ) == 0.0
+
+        cell = (
+            time_bin=1,
+            counts=(1.0, 0.0, 2.0),
+            home_counts=(0.0, 0.0, 0.0),
+            away_exposures=(3.0, 4.0, 5.0),
+            home_exposures=(0.0, 0.0, 0.0),
+        )
+        rho = 0.25
+        m1 = SurvivorModel._log_gamma_event_marginal(component, 1, 3.0)
+        m2 = SurvivorModel._log_gamma_event_marginal(component, 0, 4.0)
+        m3 = SurvivorModel._log_gamma_event_marginal(component, 2, 5.0)
+        m12 = SurvivorModel._log_gamma_event_marginal(component, 1, 7.0)
+        m23 = SurvivorModel._log_gamma_event_marginal(component, 2, 9.0)
+        m123 = SurvivorModel._log_gamma_event_marginal(component, 3, 12.0)
+        expected_four_path = SurvivorModel._logsumexp((
+            2.0 * log1p(-rho) + m1 + m2 + m3,
+            log(rho) + log1p(-rho) + m12 + m3,
+            log1p(-rho) + log(rho) + m1 + m23,
+            2.0 * log(rho) + m123,
+        ))
+        @test SurvivorModel._log_reset_partition_marginal(
+            cell,
+            component,
+            1.0,
+            rho,
+        ) ≈ expected_four_path
+    end
+
+    @testset "pooled reset moment identity" begin
+        moments = (
+            away_mean=1.0,
+            home_mean=2.0,
+            away_factorial=1.25,
+            home_factorial=5.0,
+            same_season_product=2.5,
+            sequential_away_away=1.1,
+            sequential_away_home=2.2,
+            sequential_home_away=2.2,
+            sequential_home_home=4.4,
+            n_away_mean=1,
+            n_home_mean=1,
+            n_away_factorial=1,
+            n_home_factorial=1,
+            n_same_season_product=1,
+            n_sequential_away_away=1,
+            n_sequential_away_home=1,
+            n_sequential_home_away=1,
+            n_sequential_home_home=1,
+        )
+        means, variances, fitted_home_multiplier, fitted_persistence =
+            SurvivorModel._reset_moment_parameters(
+                [(time_bin=1, moments=moments)],
             )
-            teams = ["A", "B", "C", "D"]
-            for (season, results) in zip(2021:2023, results_by_season)
-                for (index, result) in enumerate(results)
+
+        @test means ≈ [1.0]
+        @test variances ≈ [0.25]
+        @test fitted_home_multiplier ≈ 2.0
+        @test fitted_persistence ≈ 0.4
+
+        @test SurvivorModel._shared_moment_count((10, 10, 40)) == 10.0
+    end
+
+    @testset "season-centered cross moments" begin
+        base_moments = (
+            away_mean=1.5,
+            home_mean=1.5,
+            away_factorial=2.5,
+            home_factorial=2.5,
+            same_season_product=2.5,
+            sequential_away_away=2.1,
+            sequential_away_home=2.1,
+            sequential_home_away=2.1,
+            sequential_home_home=2.1,
+            n_away_mean=1,
+            n_home_mean=1,
+            n_away_factorial=1,
+            n_home_factorial=1,
+            n_same_season_product=1,
+            n_sequential_away_away=1,
+            n_sequential_away_home=1,
+            n_sequential_home_away=1,
+            n_sequential_home_home=1,
+        )
+        season_moments = [
+            (
+                season=2021,
+                moments=merge(
+                    base_moments,
+                    (away_mean=1.0, home_mean=1.0),
+                ),
+            ),
+            (
+                season=2022,
+                moments=merge(
+                    base_moments,
+                    (away_mean=2.0, home_mean=2.0),
+                ),
+            ),
+        ]
+        transition_moments = [
+            (
+                previous_season=2021,
+                current_season=2022,
+                moments=base_moments,
+            ),
+        ]
+        _, _, _, fitted_persistence = SurvivorModel._reset_moment_parameters(
+            [(
+                time_bin=1,
+                moments=base_moments,
+                season_moments=season_moments,
+                transition_moments=transition_moments,
+            )],
+        )
+
+        @test fitted_persistence ≈ 0.4
+
+        finite_sample_moments = merge(
+            base_moments,
+            (
+                sequential_away_away=2.09,
+                sequential_away_home=2.09,
+                sequential_home_away=2.09,
+                sequential_home_home=2.09,
+                n_sequential_away_away=10,
+                n_sequential_away_home=10,
+                n_sequential_home_away=10,
+                n_sequential_home_home=10,
+            ),
+        )
+        _, _, _, corrected_persistence =
+            SurvivorModel._reset_moment_parameters(
+                [(
+                    time_bin=1,
+                    moments=base_moments,
+                    season_moments=season_moments,
+                    transition_moments=[(
+                        previous_season=2021,
+                        current_season=2022,
+                        moments=finite_sample_moments,
+                    )],
+                )],
+            )
+        @test corrected_persistence ≈ 0.4
+    end
+
+    @testset "synthetic reset moment recovery" begin
+        Random.seed!(29)
+        seasons = 2021:2023
+        teams = ["T$(index)" for index in 1:120]
+        byseason = Dict{Int,SurvivorModel.HazardSufficientStats}()
+        mean_rate = 0.01
+        shape = 4.0
+        rate = shape / mean_rate
+        persistence = 0.7
+        home_multiplier = 1.5
+        previous_rates = Dict{String,Float64}()
+
+        for season in seasons
+            stats = SurvivorModel.HazardSufficientStats()
+            for team in teams
+                latent_rate = if haskey(previous_rates, team) &&
+                    rand() < persistence
+                    previous_rates[team]
+                else
+                    rand(Gamma(shape, 1 / rate))
+                end
+                previous_rates[team] = latent_rate
+
+                key = (team, 1)
+                exposure = 10_000.0
+                away_count = rand(Poisson(latent_rate * exposure))
+                home_count = rand(
+                    Poisson(latent_rate * home_multiplier * exposure),
+                )
+                stats.td.away_exposure[key] = exposure
+                stats.td.home_exposure[key] = exposure
+                stats.td.away_counts[key] = away_count
+                stats.td.home_counts[key] = home_count
+                stats.td.exposure[key] = 2 * exposure
+                stats.td.counts[key] = away_count + home_count
+            end
+            byseason[season] = stats
+        end
+
+        fitted, fitted_home_multiplier, fitted_persistence =
+            SurvivorModel._fit_reset_outcome_parameters(
+                byseason,
+                collect(seasons),
+                [0.0, Inf],
+                :td,
+            )
+        fitted_mean = fitted[1].shape / fitted[1].rate
+        @test fitted_mean ≈ mean_rate rtol=0.2
+        @test fitted[1].shape ≈ shape rtol=0.3
+        @test fitted_home_multiplier ≈ home_multiplier rtol=0.15
+        @test fitted_persistence ≈ persistence rtol=0.2
+    end
+
+    @testset "probabilistic reset prior and moments" begin
+        Random.seed!(17)
+        historical = DataFrame(
+            game_id=String[],
+            fixed_drive=Int[],
+            posteam=String[],
+            defteam=String[],
+            drive_result=String[],
+            time_of_possession=Second[],
+            posteam_home=Bool[],
+            defteam_home=Bool[],
+        )
+        for season in 2021:2023
+            for team in ["A", "B", "C", "D"]
+                for index in 1:120
+                    posteam_home = iseven(index + season)
+                    base_probability = Dict(
+                        "A" => 0.18,
+                        "B" => 0.12,
+                        "C" => 0.08,
+                        "D" => 0.05,
+                    )[team]
+                    probability = posteam_home ?
+                        1.6 * base_probability : base_probability
                     push!(
-                        rows,
+                        historical,
                         (
-                            "$(season)_$(index)",
+                            "$(season)_$(team)_$(index)",
                             1,
-                            teams[index],
+                            team,
                             "DEFENSE",
-                            result,
+                            rand() < probability ? "Touchdown" : "Punt",
                             Second(60),
-                            true,
-                            false,
+                            posteam_home,
+                            !posteam_home,
                         ),
                     )
                 end
             end
-            return rows
         end
 
-        positive_data, positive_edges = build_exposure_data(
-            _moment_drives([
-                ["Touchdown", "Touchdown", "Punt", "Punt"],
-                ["Touchdown", "Touchdown", "Punt", "Punt"],
-                ["Touchdown", "Touchdown", "Punt", "Punt"],
-            ]);
+        prior = fit_empirical_bayes_prior(
+            historical;
+            time_edges=[0, Inf],
+            current_season=2024,
+        )
+        @test prior.historical_seasons == [2021, 2022, 2023]
+        @test likelihood_fit_diagnostics(prior, :td).converged
+        @test likelihood_fit_diagnostics(prior, :defensive).converged
+        @test likelihood_fit_diagnostics(prior, :td).iterations > 0
+        @test likelihood_fit_diagnostics(prior, :defensive).iterations > 0
+        @test likelihood_fit_diagnostics(prior, :td).function_evaluations > 0
+        @test likelihood_fit_diagnostics(prior, :defensive).function_evaluations > 0
+        @test isfinite(likelihood_fit_diagnostics(prior, :td).log_likelihood)
+        @test isfinite(
+            likelihood_fit_diagnostics(prior, :defensive).log_likelihood,
+        )
+        @test all(p -> p.shape > 0 && p.rate > 0, prior.td_hyperparameters)
+        @test all(p -> p.shape > 0 && p.rate > 0, prior.defensive_hyperparameters)
+        @test haskey(prior.td_team_mixtures, "A")
+        @test haskey(prior.defensive_team_mixtures, "B")
+        td_mixture = prior.td_team_mixtures["A"][1]
+        @test length(td_mixture.components) == 4
+        @test td_mixture.source_seasons == [2021, 2022, 2023, 2024]
+        @test sum(td_mixture.weights) ≈ 1.0
+        @test 0.0 <= hazard_persistence(prior, :td) <= 1.0
+        @test 0.0 <= hazard_persistence(prior, :defensive) <= 1.0
+        @test prior.td_home_multiplier > 0.0
+        @test prior.defensive_home_multiplier > 0.0
+
+        @test_throws ArgumentError fit_empirical_bayes_prior(
+            historical;
+            time_edges=[0, Inf],
+            max_seasons=0,
+        )
+        @test_throws ArgumentError fit_empirical_bayes_prior(
+            historical[1:0, :];
             time_edges=[0, Inf],
         )
-        negative_data, negative_edges = build_exposure_data(
-            _moment_drives([
-                ["Touchdown", "Touchdown", "Punt", "Punt"],
-                ["Punt", "Punt", "Touchdown", "Touchdown"],
-                ["Touchdown", "Touchdown", "Punt", "Punt"],
-            ]);
+
+        empty_model = fit_hazard_model(
+            historical[1:0, :];
+            prior=prior,
             time_edges=[0, Inf],
         )
-        positive_half_life = SurvivorModel._calibrate_recency_half_life(
-            SurvivorModel._season_stats(positive_data),
-            [2021, 2022, 2023],
-            positive_edges,
+        posterior = hazard_posterior(empty_model, :td, "A", 1)
+        @test posterior.weights ≈ td_mixture.weights
+        @test posterior.source_seasons == td_mixture.source_seasons
+
+        current = historical[1:1, :]
+        before = hazard_posterior(empty_model, :td, "A", 1)
+        update_hazard_model!(empty_model, current)
+        after = hazard_posterior(empty_model, :td, "A", 1)
+        expected_count = current.drive_result[1] == "Touchdown" ? 1.0 : 0.0
+        @test all(
+            after.components[index].shape ==
+                before.components[index].shape + expected_count
+            for index in eachindex(before.components)
         )
-        negative_half_life = SurvivorModel._calibrate_recency_half_life(
-            SurvivorModel._season_stats(negative_data),
-            [2021, 2022, 2023],
-            negative_edges,
-        )
-        @test positive_half_life ≈ SurvivorModel.MAX_RECENCY_HALF_LIFE
-        @test negative_half_life ≈ SurvivorModel.MIN_RECENCY_HALF_LIFE
     end
 
     @testset "empirical-Bayes home multipliers" begin
@@ -315,7 +525,6 @@ using Test
         prior = fit_empirical_bayes_prior(
             rows;
             time_edges=[0, Inf],
-            recency_half_life=Inf,
             current_season=2024,
         )
         @test prior.td_home_multiplier ≈ 2.0 rtol=0.4
@@ -405,11 +614,11 @@ using Test
         ]
 
         posterior = hazard_posterior(model, :td, "HOME", 1; home=true)
+        posterior_log_mean, posterior_log_variance =
+            SurvivorModel._gamma_mixture_log_moments(posterior)
         @test theta.log_mean[1] ≈
-            SurvivorModel.SpecialFunctions.digamma(posterior.shape) -
-            log(posterior.rate)
-        @test theta.covariance[1, 1] ≈
-            SurvivorModel.SpecialFunctions.trigamma(posterior.shape)
+            posterior_log_mean
+        @test theta.covariance[1, 1] ≈ posterior_log_variance
         @test all(
             theta.covariance[i, i] > 0
             for i in axes(theta.covariance, 1)
@@ -468,7 +677,15 @@ using Test
             SurvivorModel._matchup_theta_posteriors(model, "HOME", "AWAY")
         n_samples = 4000
         samples = [
-            rand(Gamma(posterior.shape, 1 / posterior.rate), n_samples)
+            [
+                begin
+                    component = posterior.components[
+                        rand(Categorical(posterior.weights))
+                    ]
+                    rand(Gamma(component.shape, 1 / component.rate))
+                end
+                for _ in 1:n_samples
+            ]
             for posterior in posteriors
         ]
         spread_samples = zeros(n_samples)

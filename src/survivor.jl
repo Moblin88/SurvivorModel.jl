@@ -1,4 +1,5 @@
 const DEFAULT_SURVIVOR_WEEKLY_SURVIVAL_PROBABILITY = 0.65
+const DEFAULT_SURVIVOR_MIN_FAVORITE_SPREAD = 2.0
 
 """
     SurvivorPoolState
@@ -95,6 +96,39 @@ function _validate_survivor_probability(probability::Real)
     isfinite(value) && 0.0 <= value <= 1.0 ||
         throw(ArgumentError("weekly_survival_probability must be finite and in [0, 1]"))
     return value
+end
+
+function _survivor_market_spread(value)
+    ismissing(value) && return missing
+    parsed = value isa Real ? Float64(value) : tryparse(Float64, string(value))
+    parsed === nothing ||
+        (isfinite(parsed) && return parsed)
+    throw(ArgumentError("market spread must be finite or missing"))
+end
+
+function _survivor_market_eligible(
+    week::Integer,
+    market_spread,
+    state::SurvivorPoolState,
+)
+    protected_week = week == state.current_week ||
+        week == state.current_week + 1
+    return !protected_week ||
+        ismissing(market_spread) ||
+        market_spread >= DEFAULT_SURVIVOR_MIN_FAVORITE_SPREAD
+end
+
+function _survivor_market_guard_mask(
+    candidates::AbstractDataFrame,
+    state::SurvivorPoolState,
+)
+    return [
+        _survivor_market_eligible(week, market_spread, state)
+        for (week, market_spread) in zip(
+            candidates.week,
+            candidates.market_spread,
+        )
+    ]
 end
 
 """
@@ -199,6 +233,7 @@ function build_survivor_candidates(
     columns = propertynames(forecast)
     normalized_picks = _normalize_survivor_picks(picks_made)
     used_teams = Set(values(normalized_picks))
+    has_spread_line = :spread_line in columns
     candidates = DataFrame(
         game_id=String[],
         week=Int[],
@@ -206,6 +241,7 @@ function build_survivor_candidates(
         opponent=String[],
         is_home=Bool[],
         win_probability=Float64[],
+        market_spread=Union{Missing,Float64}[],
     )
     seen_games = Set{String}()
     seen_team_weeks = Set{Tuple{Int,String}}()
@@ -223,6 +259,9 @@ function build_survivor_candidates(
         home_team = _schedule_string(row.home_team, :home_team)
         away_team != home_team ||
             throw(ArgumentError("a game cannot have the same home and away team"))
+        spread_line = has_spread_line ?
+            _survivor_market_spread(row.spread_line) :
+            missing
 
         for team in (away_team, home_team)
             key = (week, team)
@@ -246,6 +285,7 @@ function build_survivor_candidates(
                 opponent=home_team,
                 is_home=false,
                 win_probability=away_probability,
+                market_spread=ismissing(spread_line) ? missing : -spread_line,
             ),
         )
         home_team in used_teams || push!(
@@ -257,6 +297,7 @@ function build_survivor_candidates(
                 opponent=away_team,
                 is_home=true,
                 win_probability=home_probability,
+                market_spread=spread_line,
             ),
         )
     end
@@ -312,6 +353,13 @@ function _normalize_survivor_candidates(
     data.win_probability = [
         _validate_win_probability(value) for value in data.win_probability
     ]
+    if :market_spread in propertynames(data)
+        data.market_spread = [
+            _survivor_market_spread(value) for value in data.market_spread
+        ]
+    else
+        data.market_spread = Union{Missing,Float64}[missing for _ in 1:nrow(data)]
+    end
 
     used_teams = Set(values(state.picks_made))
     keep = [
@@ -393,6 +441,10 @@ function optimize_survivor_pool(
     for team in unique(data.team)
         indices = findall(==(team), data.team)
         @constraint(model, sum(selected[index] for index in indices) <= 1)
+    end
+    market_eligible = _survivor_market_guard_mask(data, state)
+    for index in candidate_indices
+        market_eligible[index] || @constraint(model, selected[index] == 0)
     end
     @objective(
         model,
@@ -477,8 +529,6 @@ function optimize_survivor_pool(
     current_drives::Union{Nothing,AbstractDataFrame}=nothing,
     max_seasons::Int=3,
     time_edges=DEFAULT_TIME_EDGES,
-    recency_half_life::Union{Nothing,Real}=DEFAULT_RECENCY_HALF_LIFE,
-    fit_strategy::Symbol=:moments,
     include_completed::Bool=false,
     horizon::Real=GAME_CLOCK_SECONDS,
     optimizer=HiGHS.Optimizer,
@@ -497,8 +547,6 @@ function optimize_survivor_pool(
         current_drives=current_drives,
         max_seasons=max_seasons,
         time_edges=time_edges,
-        recency_half_life=recency_half_life,
-        fit_strategy=fit_strategy,
     )
     return optimize_survivor_pool(
         context,

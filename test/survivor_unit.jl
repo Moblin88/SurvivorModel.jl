@@ -52,6 +52,22 @@ function _survivor_context_fixture()
     return schedule, historical, current
 end
 
+function _market_guard_candidates()
+    return DataFrame(
+        game_id=[
+            "week1_guard", "week1_guard",
+            "week2_guard", "week2_guard",
+            "week3_guard", "week3_guard",
+        ],
+        week=[1, 1, 2, 2, 3, 3],
+        team=["A", "B", "C", "D", "E", "F"],
+        opponent=["X", "Y", "Z", "W", "V", "U"],
+        is_home=[false, true, false, true, false, true],
+        win_probability=[0.99, 0.8, 0.98, 0.7, 0.97, 0.6],
+        market_spread=[1.0, 2.0, 1.5, 3.0, -10.0, -3.0],
+    )
+end
+
 @testset "survivor pool optimization" begin
     @testset "reach discounts" begin
         @test survivor_reach_discounts(
@@ -111,6 +127,22 @@ end
             cols=:union,
         )
         @test_throws ArgumentError build_survivor_candidates(malformed)
+
+        forecast_with_spreads = _survivor_forecast_fixture()
+        forecast_with_spreads.spread_line = [2.5, -3.0, 4.0, -1.5]
+        spread_candidates = build_survivor_candidates(forecast_with_spreads)
+        @test spread_candidates.market_spread[
+            (spread_candidates.week .== 1) .&
+            (spread_candidates.team .== "B")
+        ][1] == 2.5
+        @test spread_candidates.market_spread[
+            (spread_candidates.week .== 1) .&
+            (spread_candidates.team .== "A")
+        ][1] == -2.5
+        @test spread_candidates.market_spread[
+            (spread_candidates.week .== 1) .&
+            (spread_candidates.team .== "C")
+        ][1] == 3.0
     end
 
     @testset "binary assignment and current pick" begin
@@ -128,6 +160,50 @@ end
         @test plan.discounts.discount ≈ [1.0, 0.65]
         @test plan.objective_value ≈ 0.8 + 0.95 * 0.65
         @test plan.objective_value ≈ sum(plan.selections.objective_contribution)
+    end
+
+    @testset "near-term market favorite guard" begin
+        state = SurvivorPoolState(2025, 1; strikes_remaining=0)
+        plan = optimize_survivor_pool(
+            _market_guard_candidates(),
+            state;
+            through_week=3,
+            weekly_survival_probability=0.65,
+        )
+        @test plan.selections.team == ["B", "D", "E"]
+        @test plan.selections.market_spread == [2.0, 3.0, -10.0]
+        @test plan.current_pick.team == ["B"]
+        @test DEFAULT_SURVIVOR_MIN_FAVORITE_SPREAD == 2.0
+
+        missing_line = DataFrame(
+            game_id=["missing_line", "missing_line"],
+            week=[1, 1],
+            team=["A", "B"],
+            opponent=["C", "D"],
+            is_home=[true, false],
+            win_probability=[0.95, 0.8],
+            market_spread=Union{Missing,Float64}[missing, 1.0],
+        )
+        missing_line_plan = optimize_survivor_pool(
+            missing_line,
+            SurvivorPoolState(2025, 1; strikes_remaining=0);
+            through_week=1,
+        )
+        @test missing_line_plan.current_pick.team == ["A"]
+
+        @test_throws ArgumentError optimize_survivor_pool(
+            DataFrame(
+                game_id=["infeasible", "infeasible"],
+                week=[1, 1],
+                team=["A", "B"],
+                opponent=["C", "D"],
+                is_home=[true, false],
+                win_probability=[0.95, 0.8],
+                market_spread=[1.0, 1.5],
+            ),
+            SurvivorPoolState(2025, 1; strikes_remaining=0);
+            through_week=1,
+        )
     end
 
     @testset "state validation and infeasible inputs" begin

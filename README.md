@@ -311,6 +311,46 @@ once. `plan.selections` includes each selected team's win probability, reach
 discount, selected-team market spread, and discounted objective contribution;
 `plan.current_pick` is the row to use for the current week.
 
+### Survivor command-line app
+
+Julia 1.12 can run the package directly through its `@main` entry point:
+
+```sh
+julia --project=. -m SurvivorModel --season 2026 <<'EOF'
+KC
+SF
+EOF
+```
+
+The package also declares a named `survivor` app in `Project.toml`. Install the
+local checkout into Julia's app environment with:
+
+```sh
+julia -e 'using Pkg; Pkg.Apps.develop(path="/path/to/SurvivorModel")'
+```
+
+Then run it from any directory:
+
+```sh
+survivor --season 2026 < picks.txt
+```
+
+The app reads one team abbreviation per nonblank line, starting with week 1.
+It infers the next week from the number of picks, loads the season schedule to
+count completed losses (ties count as losses), and defaults to two initial
+strikes. Use `--strikes N` to choose a different initial loss allowance. The
+default output is only the selected team's abbreviation and a newline.
+
+Historical empirical-Bayes priors are stored in the package's Scratch.jl
+space and keyed by season, historical-window length, time-bin configuration,
+and fit method. Current-season drives and the survivor optimization are
+refreshed on each invocation. To remove the cached historical fits:
+
+```julia
+using SurvivorModel
+clear_historical_prior_cache!()
+```
+
 The objective is expected future wins weighted by your personal probability of
 still being alive before each week. It does not estimate the probability that
 the entire pool survives and does not use sportsbook lines in its objective.

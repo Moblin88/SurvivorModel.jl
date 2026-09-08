@@ -11,6 +11,8 @@ using SpecialFunctions
 using Statistics
 using JuMP
 using Optim
+using Scratch
+using Serialization
 
 export load_drive_pbp, summarize_drives
 export DEFAULT_TIME_EDGES, GAME_CLOCK_SECONDS
@@ -22,6 +24,7 @@ export MomentFit, MomentLBFGSFit, HybridFit, BlockNewtonFit, SchurNewtonFit
 export prior_fit_method_name
 export HazardTheta, ExpectedGameMetrics, ExpectedGameSpreadMetrics
 export build_exposure_data, fit_empirical_bayes_prior, fit_hazard_model
+export clear_historical_prior_cache!
 export update_hazard_model!, hazard_posterior, hazard_rate, home_multiplier
 export hazard_persistence
 export likelihood_fit_diagnostics
@@ -45,8 +48,10 @@ export evaluate_calibration
 include("drives.jl")
 include("renewal_model.jl")
 include("prior_fitting.jl")
+include("historical_cache.jl")
 include("game_forecast.jl")
 include("survivor.jl")
 include("calibration.jl")
+include("cli.jl")
 
 end

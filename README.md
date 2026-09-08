@@ -344,7 +344,10 @@ default output is only the selected team's abbreviation and a newline.
 Historical empirical-Bayes priors are stored in the package's Scratch.jl
 space and keyed by season, historical-window length, time-bin configuration,
 and fit method. Current-season drives and the survivor optimization are
-refreshed on each invocation. To remove the cached historical fits:
+refreshed on each invocation. An opening-week forecast can run before
+NFLData publishes target-season PBP and uses historical drives only. Once
+prior picks imply week 2 or later, target-season PBP must be available so the
+current-season update is not omitted. To remove the cached historical fits:
 
 ```julia
 using SurvivorModel

@@ -210,6 +210,8 @@ function _run_survivor_cli(
         max_seasons,
         historical_drives,
         current_drives,
+        ;
+        allow_missing_current=state.current_week == 1,
     )
     historical = _survivor_cli_historical_drives(
         normalized_schedule,

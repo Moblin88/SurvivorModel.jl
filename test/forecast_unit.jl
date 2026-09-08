@@ -264,6 +264,26 @@ end
             without_current.away_win_probability
     end
 
+    @testset "future opening week without current PBP" begin
+        future_season = typemax(Int)
+        loaded_historical, empty_current = SurvivorModel._load_forecast_drives(
+            future_season,
+            3,
+            historical,
+            nothing;
+            allow_missing_current=true,
+        )
+        @test loaded_historical == historical
+        @test nrow(empty_current) == 0
+        @test propertynames(empty_current) == propertynames(historical)
+        @test_throws ArgumentError SurvivorModel._load_forecast_drives(
+            future_season,
+            3,
+            historical,
+            nothing,
+        )
+    end
+
     @testset "input validation" begin
         @test_throws ArgumentError forecast_regular_season(
             2023;

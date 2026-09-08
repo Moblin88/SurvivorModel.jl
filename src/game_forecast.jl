@@ -125,21 +125,45 @@ function _load_forecast_drives(
     max_seasons::Int,
     historical_drives,
     current_drives,
+    ;
+    allow_missing_current::Bool=false,
 )
     max_seasons > 0 || throw(ArgumentError("max_seasons must be positive"))
     effective_max_seasons = min(max_seasons, MAX_HISTORICAL_SEASONS)
-    current = current_drives === nothing ? load_drive_pbp(season) : current_drives
 
-    if historical_drives !== nothing
-        return historical_drives, current
+    historical = if historical_drives !== nothing
+        historical_drives
+    elseif season <= 1999
+        nothing
+    else
+        first_season = max(1999, Int(season) - effective_max_seasons)
+        load_drive_pbp(first_season:(Int(season) - 1))
     end
 
+    current = if current_drives !== nothing
+        current_drives
+    elseif allow_missing_current && season > NFLData.most_recent_season()
+        historical === nothing &&
+            throw(ArgumentError(
+                "historical drive data is required when current-season PBP " *
+                "is unavailable",
+            ))
+        _empty_drive_data(historical)
+    elseif season > NFLData.most_recent_season()
+        throw(ArgumentError(
+            "NFL PBP data for season $season is not available yet; " *
+            "provide current_drives or wait for the season data release",
+        ))
+    else
+        load_drive_pbp(season)
+    end
+
+    if historical_drives !== nothing
+        return historical, current
+    end
     if season <= 1999
         return _empty_drive_data(current), current
     end
-
-    first_season = max(1999, Int(season) - effective_max_seasons)
-    historical = load_drive_pbp(first_season:(Int(season) - 1))
     return historical, current
 end
 
@@ -227,6 +251,8 @@ function fit_regular_season_forecast(
         max_seasons,
         historical_drives,
         current_drives,
+        ;
+        allow_missing_current=as_of_week == 1,
     )
     historical, cutoff, training = _forecast_training_data(
         normalized_schedule,

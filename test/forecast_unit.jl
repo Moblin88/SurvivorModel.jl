@@ -130,6 +130,19 @@ end
             current_drives=current,
             time_edges=[0, Inf],
         )
+        typed_context = fit_regular_season_forecast(
+            2023;
+            as_of_week=2,
+            schedule=schedule,
+            historical_drives=historical,
+            current_drives=current,
+            time_edges=[0, Inf],
+            method=DirectLBFGSFit(),
+        )
+        @test likelihood_fit_diagnostics(
+            typed_context.model.prior,
+            :td,
+        ).converged
         probabilities = forecast_win_probabilities(context)
         spreads = forecast_spreads(context)
         full = forecast_regular_season(context)

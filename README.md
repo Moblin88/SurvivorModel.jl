@@ -67,6 +67,55 @@ shared `rho` and home multiplier, while the shared parameters are updated in a
 two-dimensional conditional likelihood step. This keeps the expensive
 subproblems small while retaining the exact aggregated likelihood.
 
+The fitting method is selected with a typed value when comparing optimization
+strategies:
+
+```julia
+prior = fit_empirical_bayes_prior(
+    historical;
+    current_season=2024,
+    method=DirectLBFGSFit(),
+)
+```
+
+The default `method=HybridFit()` uses the iterated pooled moment/EM path followed by
+joint gradient polishing. `MomentFit()` stops after the pooled moment fit and
+returns those estimates without optimizing the exact likelihood; its
+diagnostics therefore use `status=:moment`, and its likelihood is only the
+exact likelihood evaluated at the moment estimates. The moment fit estimates
+the bin means and Gamma variances, the shared home multiplier, and persistence
+by repeatedly recomputing covariance-dependent weights. In particular, the
+team-cluster weights for mean rates and the pair-product weights depend on the
+current persistence estimate, so the procedure updates its weights and
+parameters until the damped fixed-point iteration converges. Use
+`MomentFit()` for a fast standalone estimator or `MomentLBFGSFit()` to use the
+same estimates as an initial point for exact likelihood optimization.
+
+`EMECMEFit()` retains the bounded derivative-free conditional baseline, while
+`EMLBFGSFit()` keeps the EM decomposition but uses the analytic likelihood
+gradient for the conditional steps. `DirectLBFGSFit()` and `DirectBFGSFit()`
+optimize all bin and shared parameters jointly with the exact gradient.
+`BlockNewtonFit()` starts from the iterated moment estimate, alternates damped 2×2
+Newton steps for the shared `(logit(rho), log(h))` block and each per-bin
+`(log(mean), log(shape))` block, then applies an exact Schur-complement
+correction. Its Cholesky solves avoid explicit inverses, and the Schur
+complement is assembled with small low-rank Cholesky downdates.
+`SchurNewtonFit()` starts from the same moment estimate and uses the analytic observed-likelihood
+Hessian, a block Schur-complement Newton step, bound-aware backtracking, and an
+explicit L-BFGS fallback. Both Newton variants are available for benchmarking
+while `HybridFit()` remains the default. All methods use the same event-process
+likelihood, bounds, reset mixture, and explicit failure behavior. The
+standalone comparison harness is
+`benchmark/reset_solver_comparison.jl`.
+
+The Gamma marginal derivative path caches the special-function values at each
+bin's base shape and uses the exact integer-count recurrences for
+`loggamma`, digamma, and trigamma for small aggregated counts. Zero-count
+groups therefore avoid a second special-function evaluation, while larger
+counts fall back to direct `SpecialFunctions` calls. No approximate special
+function backend is used by default, so the optimizer retains the exact
+likelihood and curvature semantics.
+
 The likelihood is evaluated separately for touchdowns and defensive events
 because it factorizes conditional on the observed risk intervals. This still
 accounts for competing-process exposure: short defensive risk windows and

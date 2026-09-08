@@ -209,6 +209,217 @@ using Test
             1.0,
             rho,
         ) ≈ expected_four_path
+
+        base_values = SurvivorModel._gamma_shape_special_values(2.5)
+        shifted_values = SurvivorModel._gamma_shape_shifted_special_values(
+            2.5,
+            8,
+            base_values,
+        )
+        @test shifted_values[1] ≈ SurvivorModel.SpecialFunctions.loggamma(10.5)
+        @test shifted_values[2] ≈ SurvivorModel.SpecialFunctions.digamma(10.5)
+        @test shifted_values[3] ≈ SurvivorModel.SpecialFunctions.trigamma(10.5)
+        differences = SurvivorModel._gamma_shape_difference_values(
+            2.5,
+            8,
+            base_values,
+        )
+        @test differences[1] ≈
+            SurvivorModel.SpecialFunctions.loggamma(10.5) -
+            SurvivorModel.SpecialFunctions.loggamma(2.5)
+        @test differences[2] ≈
+            SurvivorModel.SpecialFunctions.digamma(10.5) -
+            SurvivorModel.SpecialFunctions.digamma(2.5)
+        @test differences[3] ≈
+            SurvivorModel.SpecialFunctions.trigamma(10.5) -
+            SurvivorModel.SpecialFunctions.trigamma(2.5)
+        @test SurvivorModel._gamma_shape_shifted_special_values(
+            2.5,
+            0,
+            base_values,
+        ) === base_values
+    end
+
+    @testset "event-process likelihood gradient" begin
+        cell = (
+            time_bin=1,
+            counts=(1.0, 0.0, 2.0),
+            home_counts=(0.0, 1.0, 0.0),
+            away_exposures=(3.0, 4.0, 5.0),
+            home_exposures=(1.0, 2.0, 1.0),
+        )
+        values = [
+            log(0.35),
+            log(2.5),
+            log(0.4 / 0.6),
+            log(1.3),
+        ]
+        hyperparameters, home_multiplier, persistence =
+            SurvivorModel._unpack_reset_parameters(values, 1)
+        result = SurvivorModel._reset_event_log_likelihood_with_gradient(
+            [cell],
+            hyperparameters,
+            home_multiplier,
+            persistence,
+        )
+        for index in eachindex(values)
+            step = 1.0e-6
+            lower = copy(values)
+            upper = copy(values)
+            lower[index] -= step
+            upper[index] += step
+            lower_hyper, lower_home, lower_persistence =
+                SurvivorModel._unpack_reset_parameters(lower, 1)
+            upper_hyper, upper_home, upper_persistence =
+                SurvivorModel._unpack_reset_parameters(upper, 1)
+            finite_difference = (
+                SurvivorModel._reset_event_log_likelihood(
+                    [cell],
+                    upper_hyper,
+                    upper_home,
+                    upper_persistence,
+                ) -
+                SurvivorModel._reset_event_log_likelihood(
+                    [cell],
+                    lower_hyper,
+                    lower_home,
+                    lower_persistence,
+                )
+            ) / (2.0 * step)
+            @test result.gradient[index] ≈ finite_difference atol=2.0e-6
+        end
+    end
+
+    @testset "event-process likelihood Hessian" begin
+        gamma_values = [log(0.35), log(2.5), 1.7]
+        gamma_result = SurvivorModel._log_gamma_event_marginal_with_hessian(
+            SurvivorModel.GammaParams(
+                exp(gamma_values[2]),
+                exp(gamma_values[2] - gamma_values[1]),
+            ),
+            3,
+            gamma_values[3],
+        )
+        gamma_gradient = values -> begin
+            component = SurvivorModel.GammaParams(
+                exp(values[2]),
+                exp(values[2] - values[1]),
+            )
+            SurvivorModel._log_gamma_event_marginal_with_hessian(
+                component,
+                3,
+                values[3],
+            ).gradient
+        end
+        finite_gamma_hessian = zeros(3, 3)
+        for index in 1:3
+            step = 1.0e-5
+            lower = copy(gamma_values)
+            upper = copy(gamma_values)
+            lower[index] -= step
+            upper[index] += step
+            finite_gamma_hessian[:, index] =
+                (gamma_gradient(upper) - gamma_gradient(lower)) /
+                (2.0 * step)
+        end
+        @test gamma_result.hessian ≈ finite_gamma_hessian atol=2.0e-7
+        @test gamma_result.hessian ≈ transpose(gamma_result.hessian)
+
+        cell = (
+            time_bin=1,
+            counts=(1.0, 0.0, 2.0),
+            home_counts=(0.0, 1.0, 0.0),
+            away_exposures=(3.0, 4.0, 5.0),
+            home_exposures=(1.0, 2.0, 1.0),
+        )
+        values = [
+            log(0.35),
+            log(2.5),
+            log(0.4 / 0.6),
+            log(1.3),
+        ]
+        hyperparameters, home_multiplier, persistence =
+            SurvivorModel._unpack_reset_parameters(values, 1)
+        result = SurvivorModel._reset_event_log_likelihood_with_hessian(
+            [cell],
+            hyperparameters,
+            home_multiplier,
+            persistence,
+        )
+        gradient_function = values -> begin
+            parameters, home, reset_probability =
+                SurvivorModel._unpack_reset_parameters(values, 1)
+            SurvivorModel._reset_event_log_likelihood_with_gradient(
+                [cell],
+                parameters,
+                home,
+                reset_probability,
+            ).gradient
+        end
+        finite_hessian = zeros(4, 4)
+        for index in 1:4
+            step = 1.0e-5
+            lower = copy(values)
+            upper = copy(values)
+            lower[index] -= step
+            upper[index] += step
+            finite_hessian[:, index] =
+                (gradient_function(upper) - gradient_function(lower)) /
+                (2.0 * step)
+        end
+        @test result.hessian ≈ finite_hessian atol=2.0e-7
+        @test result.hessian ≈ transpose(result.hessian) atol=2.0e-12
+
+        one_season_cell = (
+            time_bin=1,
+            counts=(1.0,),
+            home_counts=(0.0,),
+            away_exposures=(3.0,),
+            home_exposures=(1.0,),
+        )
+        one_season = SurvivorModel._reset_cell_log_likelihood_with_hessian(
+            one_season_cell,
+            hyperparameters[1],
+            home_multiplier,
+            persistence,
+        )
+        @test one_season.gradient[3] ≈ 0.0 atol=1.0e-12
+        @test maximum(abs.(one_season.hessian[3, :])) <= 1.0e-12
+    end
+
+    @testset "Schur-complement Newton direction" begin
+        hessian = zeros(6, 6)
+        for index in 1:6
+            hessian[index, index] = -2.0
+        end
+        hessian[1, 5] = hessian[5, 1] = -0.1
+        hessian[2, 6] = hessian[6, 2] = -0.2
+        hessian[3, 5] = hessian[5, 3] = 0.15
+        gradient = [0.2, -0.1, 0.15, -0.2, 0.1, -0.05]
+        direction = SurvivorModel._reset_schur_newton_direction(
+            hessian,
+            gradient,
+            zeros(6),
+            fill(-10.0, 6),
+            fill(10.0, 6),
+            2,
+            true,
+            0.0,
+        )
+        @test direction !== nothing
+        @test maximum(abs.(hessian * direction.direction + gradient)) <=
+            1.0e-10
+        @test direction.directional_derivative > 0.0
+    end
+
+    @testset "low-rank Cholesky Schur updates" begin
+        base = [4.0 0.5; 0.5 3.0]
+        vectors = [0.2 0.0; 0.1 0.3]
+        factor = SurvivorModel._reset_positive_definite_factor(base)
+        updated = SurvivorModel._reset_lowrank_downdate(factor, vectors)
+        @test updated !== nothing
+        @test Matrix(updated) ≈
+            base - vectors * transpose(vectors) atol=1.0e-12
     end
 
     @testset "pooled reset moment identity" begin
@@ -368,6 +579,38 @@ using Test
             byseason[season] = stats
         end
 
+        moment_blocks = SurvivorModel._reset_moment_blocks(
+            byseason,
+            collect(seasons),
+            :td,
+            1,
+        )
+        moment_fit = SurvivorModel._reset_iterated_moment_parameters(
+            moment_blocks,
+        )
+        @test moment_fit.converged
+        @test moment_fit.iterations > 0
+        @test moment_fit.means[1] ≈ mean_rate rtol=0.35
+        @test moment_fit.home_multiplier ≈ home_multiplier rtol=0.25
+        @test 0.0 <= moment_fit.persistence <= 1.0
+        @test all(variance -> variance > 0.0, moment_fit.variances)
+
+        low_persistence_variance = SurvivorModel._reset_moment_pair_variance(
+            mean_rate,
+            moment_fit.variances[1],
+            0.0,
+            10_000.0,
+            10_000.0,
+        )
+        high_persistence_variance = SurvivorModel._reset_moment_pair_variance(
+            mean_rate,
+            moment_fit.variances[1],
+            1.0,
+            10_000.0,
+            10_000.0,
+        )
+        @test low_persistence_variance != high_persistence_variance
+
         fitted, fitted_home_multiplier, fitted_persistence =
             SurvivorModel._fit_reset_outcome_parameters(
                 byseason,
@@ -480,6 +723,115 @@ using Test
             after.components[index].shape ==
                 before.components[index].shape + expected_count
             for index in eachindex(before.components)
+        )
+    end
+
+    @testset "alternative historical likelihood solvers" begin
+        rows = DataFrame(
+            game_id=String[],
+            fixed_drive=Int[],
+            posteam=String[],
+            defteam=String[],
+            posteam_home=Bool[],
+            defteam_home=Bool[],
+            drive_result=String[],
+            time_of_possession=Second[],
+            home_spread_change=Float64[],
+        )
+        for season in 2021:2023
+            for team in ["A", "B"]
+                for index in 1:30
+                    posteam_home = iseven(index + season)
+                    touchdown = mod(index + season + length(team), 5) <= 1
+                    push!(
+                        rows,
+                        (
+                            "$(season)_$(team)_$(index)",
+                            1,
+                            team,
+                            "DEFENSE",
+                            posteam_home,
+                            !posteam_home,
+                            touchdown ? "Touchdown" : "Punt",
+                            Second(60),
+                            touchdown && posteam_home ? 7.0 : 0.0,
+                        ),
+                    )
+                end
+            end
+        end
+
+        baseline = fit_empirical_bayes_prior(
+            rows;
+            time_edges=[0, Inf],
+            current_season=2024,
+            method=EMECMEFit(),
+        )
+        baseline_likelihood = likelihood_fit_diagnostics(
+            baseline,
+            :td,
+        ).log_likelihood
+        for method in (
+            EMLBFGSFit(),
+            DirectLBFGSFit(),
+            DirectBFGSFit(),
+            MomentLBFGSFit(),
+            HybridFit(),
+            BlockNewtonFit(),
+            SchurNewtonFit(),
+        )
+            prior = fit_empirical_bayes_prior(
+                rows;
+                time_edges=[0, Inf],
+                current_season=2024,
+                method=method,
+            )
+            diagnostics = likelihood_fit_diagnostics(prior, :td)
+            @test diagnostics.converged
+            @test isfinite(diagnostics.log_likelihood)
+            @test diagnostics.log_likelihood >= baseline_likelihood - 1.0e-2
+        end
+        moment_prior = fit_empirical_bayes_prior(
+            rows;
+            time_edges=[0, Inf],
+            current_season=2024,
+            method=MomentFit(),
+        )
+        moment_diagnostics = likelihood_fit_diagnostics(moment_prior, :td)
+        @test moment_diagnostics.converged
+        @test moment_diagnostics.status === :moment
+        @test moment_diagnostics.iterations > 0
+        @test isfinite(moment_diagnostics.log_likelihood)
+        @test all(
+            parameter -> parameter.shape > 0 && parameter.rate > 0,
+            moment_prior.td_hyperparameters,
+        )
+        @test 0.0 <= hazard_persistence(moment_prior, :td) <= 1.0
+
+        instrumented = fit_empirical_bayes_prior(
+            rows;
+            time_edges=[0, Inf],
+            current_season=2024,
+            method=BlockNewtonFit(),
+            _return_solver_metrics=true,
+        )
+        @test instrumented.solver_metrics.td.solver === :block_newton
+        @test instrumented.solver_metrics.td.hessian_evaluations > 0
+        @test instrumented.solver_metrics.td.schur_corrections >= 0
+        @test_throws TypeError fit_empirical_bayes_prior(
+            rows;
+            time_edges=[0, Inf],
+            method=:unknown,
+        )
+
+        model = fit_hazard_model(
+            rows[1:0, :];
+            historical_drives=rows,
+            time_edges=[0, Inf],
+            method=DirectLBFGSFit(),
+        )
+        @test isfinite(
+            likelihood_fit_diagnostics(model.prior, :td).log_likelihood,
         )
     end
 

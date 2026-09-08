@@ -529,6 +529,7 @@ function optimize_survivor_pool(
     current_drives::Union{Nothing,AbstractDataFrame}=nothing,
     max_seasons::Int=3,
     time_edges=DEFAULT_TIME_EDGES,
+    method::PriorFitMethod=HybridFit(),
     include_completed::Bool=false,
     horizon::Real=GAME_CLOCK_SECONDS,
     optimizer=HiGHS.Optimizer,
@@ -547,6 +548,7 @@ function optimize_survivor_pool(
         current_drives=current_drives,
         max_seasons=max_seasons,
         time_edges=time_edges,
+        method=method,
     )
     return optimize_survivor_pool(
         context,

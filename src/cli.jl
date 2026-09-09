@@ -822,6 +822,7 @@ function _run_survivor_cli(
         context;
         picks_made=state.picks_made,
         strikes_remaining=state.strikes_remaining,
+        include_completed=true,
         through_week=through_week,
     )
     nrow(plan.current_pick) == 1 ||

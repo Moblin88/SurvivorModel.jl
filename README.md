@@ -386,7 +386,10 @@ The app reads one team abbreviation per nonblank line, starting with week 1.
 It infers the next week from the number of picks, loads the season schedule to
 count completed losses (ties count as losses), and defaults to two initial
 strikes. Use `--strikes N` to choose a different initial loss allowance. The
-default output is only the selected team's abbreviation and a newline.
+The effective week is one plus the number of supplied picks; games at or after
+that week are treated as future games even when the schedule already contains
+their results, which allows replaying an earlier week of a completed season.
+The default output is only the selected team's abbreviation and a newline.
 
 Historical empirical-Bayes priors are stored in the package's Scratch.jl
 space and keyed by season, historical-window length, time-bin configuration,

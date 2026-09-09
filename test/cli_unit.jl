@@ -305,5 +305,24 @@ using SurvivorModel
             @test exit_code == 0
             @test String(take!(output)) in ("C\n", "D\n")
         end
+
+        completed_schedule = copy(schedule)
+        completed_schedule.result = [7, 7, 3]
+        mktempdir() do cache_directory
+            output = IOBuffer()
+            exit_code = SurvivorModel._run_survivor_cli(
+                ["--season", "2023"];
+                input=IOBuffer(),
+                output=output,
+                schedule=completed_schedule,
+                historical_drives=historical,
+                current_drives=current,
+                cache_directory=cache_directory,
+                method=MomentFit(),
+                through_week=2,
+            )
+            @test exit_code == 0
+            @test !isempty(strip(String(take!(output))))
+        end
     end
 end

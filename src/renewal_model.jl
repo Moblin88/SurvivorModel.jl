@@ -6,9 +6,10 @@ defensive-event hazard. The hazards are independent conditional on their
 team-specific rates, piecewise constant in elapsed time since drive start,
 and do not depend on field position.
 
-Team-specific hazards use Gamma posteriors. A historical empirical-Bayes prior
-can be fitted from the previous three seasons and updated with current-season
-exposure and event counts as data arrive. Historical hyperparameters are fit
+Team-specific hazards use Gamma posteriors. An historical empirical-Bayes prior
+can be fitted from any positive number of supplied seasons and updated with
+current-season exposure and event counts as data arrive. Historical
+hyperparameters are fit
 with the event-process marginal likelihood, including the competing-risk
 exposure term and the season-to-season reset transition. The historical fit
 can also estimate global offensive and defensive home multipliers, which
@@ -25,7 +26,8 @@ remain fixed during current-season updates.
 Default elapsed-drive-time edges in seconds: 0-2, 2-4, 4-6, and 6+ minutes.
 """
 const DEFAULT_TIME_EDGES = (0.0, 120.0, 240.0, 360.0, Inf)
-const MAX_HISTORICAL_SEASONS = 3
+# Compatibility export; historical fitting itself accepts any positive window.
+const MAX_HISTORICAL_SEASONS = typemax(Int)
 const RESET_EM_MAX_ITERATIONS = 100
 const RESET_EM_ABSOLUTE_TOLERANCE = 1.0e-8
 const RESET_EM_RELATIVE_TOLERANCE = 1.0e-8
@@ -39,31 +41,6 @@ const RESET_BLOCK_NEWTON_MAX_SWEEPS = 40
 const RESET_MOMENT_MAX_ITERATIONS = 32
 const RESET_MOMENT_TOLERANCE = 1.0e-6
 const RESET_MOMENT_DAMPING = 0.75
-const RESET_PARTITION_PATHS_1 = (
-    (groups=((1, 1),), persistent_links=0),
-)
-const RESET_PARTITION_PATHS_2 = (
-    (groups=((1, 1), (2, 2)), persistent_links=0),
-    (groups=((1, 2),), persistent_links=1),
-)
-const RESET_PARTITION_PATHS_3 = (
-    (
-        groups=((1, 1), (2, 2), (3, 3)),
-        persistent_links=0,
-    ),
-    (
-        groups=((1, 2), (3, 3)),
-        persistent_links=1,
-    ),
-    (
-        groups=((1, 1), (2, 3)),
-        persistent_links=1,
-    ),
-    (
-        groups=((1, 3),),
-        persistent_links=2,
-    ),
-)
 
 """
     _validate_time_edges(edges) -> Vector{Float64}

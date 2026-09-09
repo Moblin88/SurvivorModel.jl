@@ -15,6 +15,9 @@ struct HybridFit <: PriorFitMethod end
 struct BlockNewtonFit <: PriorFitMethod end
 struct SchurNewtonFit <: PriorFitMethod end
 
+const DEFAULT_HISTORICAL_SEASONS = 5
+const DEFAULT_PRIOR_FIT_METHOD = EMLBFGSFit()
+
 prior_fit_method_name(::EMECMEFit) = :em_ecme
 prior_fit_method_name(::EMLBFGSFit) = :em_lbfgs
 prior_fit_method_name(::DirectLBFGSFit) = :direct_lbfgs
@@ -345,41 +348,8 @@ function _reset_likelihood_cells(
     kind::Symbol,
     n_bins::Int,
 )
-    n_seasons = length(seasons)
-    n_seasons == 1 &&
-        return _reset_likelihood_cells_typed(
-            byseason,
-            seasons,
-            kind,
-            n_bins,
-            Val(1),
-        )
-    n_seasons == 2 &&
-        return _reset_likelihood_cells_typed(
-            byseason,
-            seasons,
-            kind,
-            n_bins,
-            Val(2),
-        )
-    n_seasons == 3 &&
-        return _reset_likelihood_cells_typed(
-            byseason,
-            seasons,
-            kind,
-            n_bins,
-            Val(3),
-        )
-    throw(ArgumentError("reset likelihood supports one to three seasons"))
-end
-
-function _reset_likelihood_cells_typed(
-    byseason::AbstractDict,
-    seasons::AbstractVector{<:Integer},
-    kind::Symbol,
-    n_bins::Int,
-    ::Val{N},
-) where {N}
+    isempty(seasons) &&
+        throw(ArgumentError("reset likelihood requires at least one season"))
     teams = Set{String}()
     for season in seasons
         outcome = _outcome_stats(byseason[Int(season)], kind)
@@ -389,109 +359,46 @@ function _reset_likelihood_cells_typed(
         end
     end
 
-    cell_type = NamedTuple{
-        (
-            :time_bin,
-            :counts,
-            :home_counts,
-            :away_exposures,
-            :home_exposures,
-        ),
-        Tuple{
-            Int,
-            NTuple{N,Float64},
-            NTuple{N,Float64},
-            NTuple{N,Float64},
-            NTuple{N,Float64},
-        },
-    }
-    cells = cell_type[]
+    cells = NamedTuple[]
     for team in sort!(collect(teams))
         for time_bin in 1:n_bins
-            season_cells = ntuple(
-                season_index -> _team_season_cell(
+            season_cells = [
+                _team_season_cell(
                     byseason,
-                    seasons[season_index],
+                    season,
                     kind,
                     team,
                     time_bin,
-                ),
-                Val(N),
-            )
+                )
+                for season in seasons
+            ]
             push!(
                 cells,
-                cell_type((
+                (
                     time_bin=time_bin,
-                    counts=ntuple(
-                        season_index -> season_cells[season_index].count,
-                        Val(N),
-                    ),
-                    home_counts=ntuple(
-                        season_index ->
-                            season_cells[season_index].home_count,
-                        Val(N),
-                    ),
-                    away_exposures=ntuple(
-                        season_index ->
-                            season_cells[season_index].exposure,
-                        Val(N),
-                    ),
-                    home_exposures=ntuple(
-                        season_index ->
-                            season_cells[season_index].home_exposure,
-                        Val(N),
-                    ),
-                )),
+                    counts=[season_cell.count for season_cell in season_cells],
+                    home_counts=[
+                        season_cell.home_count for season_cell in season_cells
+                    ],
+                    away_exposures=[
+                        season_cell.exposure for season_cell in season_cells
+                    ],
+                    home_exposures=[
+                        season_cell.home_exposure
+                        for season_cell in season_cells
+                    ],
+                ),
             )
         end
     end
     return cells
 end
 
-function _reset_partition_paths(n_seasons::Int)
-    n_seasons == 1 && return RESET_PARTITION_PATHS_1
-    n_seasons == 2 && return RESET_PARTITION_PATHS_2
-    n_seasons == 3 && return RESET_PARTITION_PATHS_3
-    throw(ArgumentError("reset likelihood supports one to three seasons"))
-end
-
-function _reset_path_log_probability(
-    path,
-    n_seasons::Int,
-    persistence::Float64,
-)
-    return _reset_path_log_probability_from_logs(
-        path,
-        n_seasons,
-        persistence > 0.0 ? log(persistence) : -Inf,
-        persistence < 1.0 ? log1p(-persistence) : -Inf,
-    )
-end
-
-function _reset_path_log_probability_from_logs(
-    path,
-    n_seasons::Int,
-    log_persistence::Float64,
-    log_reset::Float64,
-)
-    reset_links = n_seasons - 1 - path.persistent_links
-    log_probability = 0.0
-    if path.persistent_links > 0
-        isfinite(log_persistence) || return -Inf
-        log_probability += path.persistent_links * log_persistence
-    end
-    if reset_links > 0
-        isfinite(log_reset) || return -Inf
-        log_probability += reset_links * log_reset
-    end
-    return log_probability
-end
-
 function _log_reset_group_marginal(
     component::GammaParams,
-    counts::Tuple,
-    away_exposures::Tuple,
-    home_exposures::Tuple,
+    counts,
+    away_exposures,
+    home_exposures,
     home_multiplier_value::Float64,
     first_season::Int,
     last_season::Int,
@@ -510,9 +417,9 @@ end
 
 function _log_reset_group_marginal(
     component::GammaParams,
-    counts::Tuple,
-    away_exposures::Tuple,
-    home_exposures::Tuple,
+    counts,
+    away_exposures,
+    home_exposures,
     home_multiplier_value::Float64,
     first_season::Int,
     last_season::Int,
@@ -533,59 +440,365 @@ function _log_reset_group_marginal(
     )
 end
 
-function _reset_partition_log_terms!(
-    log_terms::AbstractVector{Float64},
+function _reset_segment_transition(
+    first_season::Int,
+    last_season::Int,
+    n_seasons::Int,
+    persistence::Float64,
+    log_persistence::Float64,
+    log_reset::Float64,
+    include_reset::Bool=true,
+)
+    persistent_links = last_season - first_season
+    reset_links = include_reset && first_season > 1 ? 1 : 0
+    log_value = 0.0
+    if persistent_links > 0
+        isfinite(log_persistence) || return -Inf, 0.0, 0.0
+        log_value += persistent_links * log_persistence
+    end
+    if reset_links > 0
+        isfinite(log_reset) || return -Inf, 0.0, 0.0
+        log_value += log_reset
+    end
+    gradient = persistent_links * (1.0 - persistence) -
+        reset_links * persistence
+    hessian = -(
+        persistent_links + reset_links
+    ) * persistence * (1.0 - persistence)
+    return log_value, gradient, hessian
+end
+
+function _reset_segment_tables(
     cell,
     component::GammaParams,
     home_multiplier_value::Float64,
     persistence::Float64,
+    base_values::_GammaSpecialValues;
+    derivatives::Bool=false,
 )
-    return _reset_partition_log_terms!(
-        log_terms,
+    n_seasons = length(cell.counts)
+    n_seasons > 0 || throw(ArgumentError("reset likelihood requires seasons"))
+    log_segments = fill(-Inf, n_seasons, n_seasons)
+    segment_gradients = derivatives ?
+        zeros(Float64, n_seasons, n_seasons, 4) : nothing
+    segment_hessians = derivatives ?
+        zeros(Float64, n_seasons, n_seasons, 4, 4) : nothing
+    for first_season in 1:n_seasons
+        count = 0.0
+        exposure = 0.0
+        home_exposure = 0.0
+        for last_season in first_season:n_seasons
+            count += cell.counts[last_season]
+            home_exposure += cell.home_exposures[last_season]
+            exposure += cell.away_exposures[last_season] +
+                home_multiplier_value * cell.home_exposures[last_season]
+            marginal = derivatives ?
+                _log_gamma_event_marginal_derivative_values(
+                    component,
+                    count,
+                    exposure,
+                    base_values,
+                ) :
+                nothing
+            if derivatives
+                log_segments[first_season, last_season] = marginal.value
+                home_exposure_derivative =
+                    home_multiplier_value * home_exposure
+                segment_gradients[first_season, last_season, :] .= (
+                    marginal.d_log_mean,
+                    marginal.d_log_shape,
+                    0.0,
+                    marginal.d_exposure * home_exposure_derivative,
+                )
+                segment_hessians[
+                    first_season,
+                    last_season,
+                    1,
+                    1,
+                ] = marginal.h11
+                segment_hessians[
+                    first_season,
+                    last_season,
+                    1,
+                    2,
+                ] = marginal.h12
+                segment_hessians[
+                    first_season,
+                    last_season,
+                    2,
+                    1,
+                ] = marginal.h12
+                segment_hessians[
+                    first_season,
+                    last_season,
+                    2,
+                    2,
+                ] = marginal.h22
+                segment_hessians[
+                    first_season,
+                    last_season,
+                    1,
+                    4,
+                ] = marginal.h13 * home_exposure_derivative
+                segment_hessians[
+                    first_season,
+                    last_season,
+                    4,
+                    1,
+                ] = segment_hessians[
+                    first_season,
+                    last_season,
+                    1,
+                    4,
+                ]
+                segment_hessians[
+                    first_season,
+                    last_season,
+                    2,
+                    4,
+                ] = marginal.h23 * home_exposure_derivative
+                segment_hessians[
+                    first_season,
+                    last_season,
+                    4,
+                    2,
+                ] = segment_hessians[
+                    first_season,
+                    last_season,
+                    2,
+                    4,
+                ]
+                segment_hessians[
+                    first_season,
+                    last_season,
+                    4,
+                    4,
+                ] = marginal.h33 * home_exposure_derivative^2 +
+                    marginal.d_exposure * home_exposure_derivative
+            else
+                log_segments[first_season, last_season] =
+                    _log_gamma_event_marginal(
+                        component,
+                        count,
+                        exposure,
+                        base_values,
+                    )
+            end
+        end
+    end
+    return (
+        log_segments=log_segments,
+        segment_gradients=segment_gradients,
+        segment_hessians=segment_hessians,
+    )
+end
+
+function _reset_segment_dynamic_program(
+    cell,
+    component::GammaParams,
+    home_multiplier_value::Float64,
+    persistence::Float64,
+    base_values::_GammaSpecialValues;
+    derivatives::Bool=false,
+)
+    isfinite(home_multiplier_value) && home_multiplier_value > 0.0 ||
+        throw(ArgumentError("home multiplier must be finite and positive"))
+    isfinite(persistence) && 0.0 <= persistence <= 1.0 ||
+        throw(ArgumentError("persistence must be finite and in [0, 1]"))
+    n_seasons = length(cell.counts)
+    n_seasons > 0 || throw(ArgumentError("reset likelihood requires seasons"))
+
+    tables = _reset_segment_tables(
         cell,
         component,
         home_multiplier_value,
         persistence,
-        _gamma_shape_special_values(component.shape),
+        base_values;
+        derivatives=derivatives,
     )
+    log_segments = tables.log_segments
+    log_persistence = persistence > 0.0 ? log(persistence) : -Inf
+    log_reset = persistence < 1.0 ? log1p(-persistence) : -Inf
+
+    forward = fill(-Inf, n_seasons)
+    backward = fill(-Inf, n_seasons + 1)
+    forward_gradients = derivatives ? zeros(Float64, n_seasons, 4) : nothing
+    forward_raw_hessians = derivatives ?
+        zeros(Float64, n_seasons, 4, 4) : nothing
+    forward_gradient_seconds = derivatives ?
+        zeros(Float64, n_seasons, 4, 4) : nothing
+
+    for last_season in 1:n_seasons
+        candidate_logs = fill(-Inf, last_season)
+        candidate_gradients = derivatives ?
+            zeros(Float64, last_season, 4) : nothing
+        candidate_raw_hessians = derivatives ?
+            zeros(Float64, last_season, 4, 4) : nothing
+        candidate_gradient_seconds = derivatives ?
+            zeros(Float64, last_season, 4, 4) : nothing
+        for first_season in 1:last_season
+            transition_log, transition_gradient, transition_hessian =
+                _reset_segment_transition(
+                    first_season,
+                    last_season,
+                    n_seasons,
+                    persistence,
+                    log_persistence,
+                    log_reset,
+                )
+            candidate_logs[first_season] =
+                (first_season == 1 ? 0.0 : forward[first_season - 1]) +
+                transition_log +
+                log_segments[first_season, last_season]
+            derivatives || continue
+
+            local_gradient = copy(
+                tables.segment_gradients[first_season, last_season, :],
+            )
+            local_gradient[3] += transition_gradient
+            local_hessian = copy(
+                tables.segment_hessians[
+                    first_season,
+                    last_season,
+                    :,
+                    :,
+                ],
+            )
+            local_hessian[3, 3] += transition_hessian
+            if first_season == 1
+                candidate_gradients[first_season, :] = local_gradient
+                candidate_raw_hessians[first_season, :, :] = local_hessian
+                candidate_gradient_seconds[first_season, :, :] =
+                    local_gradient * local_gradient'
+            else
+                previous = first_season - 1
+                previous_gradient = forward_gradients[previous, :]
+                candidate_gradients[first_season, :] =
+                    previous_gradient + local_gradient
+                candidate_raw_hessians[first_season, :, :] =
+                    forward_raw_hessians[previous, :, :] + local_hessian
+                candidate_gradient_seconds[first_season, :, :] =
+                    forward_gradient_seconds[previous, :, :] +
+                    previous_gradient * local_gradient' +
+                    local_gradient * previous_gradient' +
+                    local_gradient * local_gradient'
+            end
+        end
+        normalizer = _logsumexp(candidate_logs)
+        forward[last_season] = normalizer
+        if derivatives
+            weights = exp.(candidate_logs .- normalizer)
+            forward_gradients[last_season, :] =
+                vec(sum(weights .* candidate_gradients; dims=1))
+            forward_raw_hessians[last_season, :, :] =
+                dropdims(
+                    sum(
+                        reshape(weights, :, 1, 1) .* candidate_raw_hessians;
+                        dims=1,
+                    ),
+                    dims=1,
+                )
+            forward_gradient_seconds[last_season, :, :] =
+                dropdims(
+                    sum(
+                        reshape(weights, :, 1, 1) .* candidate_gradient_seconds;
+                        dims=1,
+                    ),
+                    dims=1,
+                )
+        end
+    end
+
+    backward[n_seasons + 1] = 0.0
+    for first_season in n_seasons:-1:1
+        candidate_logs = Float64[]
+        for last_season in first_season:n_seasons
+            transition_log, _, _ = _reset_segment_transition(
+                first_season,
+                last_season,
+                n_seasons,
+                persistence,
+                log_persistence,
+                log_reset,
+                false,
+            )
+            suffix_log = last_season < n_seasons ?
+                log_reset + backward[last_season + 1] : 0.0
+            push!(
+                candidate_logs,
+                log_segments[first_season, last_season] +
+                transition_log +
+                suffix_log,
+            )
+        end
+        backward[first_season] = _logsumexp(candidate_logs)
+    end
+
+    log_normalizer = backward[1]
+    segment_posteriors = zeros(Float64, n_seasons, n_seasons)
+    for first_season in 1:n_seasons
+        prefix_log = first_season == 1 ? 0.0 : forward[first_season - 1]
+        for last_season in first_season:n_seasons
+            transition_log, _, _ = _reset_segment_transition(
+                first_season,
+                last_season,
+                n_seasons,
+                persistence,
+                log_persistence,
+                log_reset,
+            )
+            suffix_log = last_season < n_seasons ?
+                log_reset + backward[last_season + 1] : 0.0
+            term = prefix_log + transition_log +
+                log_segments[first_season, last_season] + suffix_log
+            segment_posteriors[first_season, last_season] =
+                isfinite(term) ? exp(term - log_normalizer) : 0.0
+        end
+    end
+
+    result = (
+        log_normalizer=log_normalizer,
+        segment_posteriors=segment_posteriors,
+    )
+    if derivatives
+        gradient = forward_gradients[n_seasons, :]
+        hessian = forward_raw_hessians[n_seasons, :, :] +
+            forward_gradient_seconds[n_seasons, :, :] -
+            gradient * gradient'
+        return merge(
+            result,
+            (
+                gradient=gradient,
+                hessian=hessian,
+            ),
+        )
+    end
+    return result
 end
 
-function _reset_partition_log_terms!(
-    log_terms::AbstractVector{Float64},
+function _reset_cell_log_likelihood_with_hessian(
     cell,
     component::GammaParams,
     home_multiplier_value::Float64,
     persistence::Float64,
-    base_values::_GammaSpecialValues,
 )
-    n_seasons = length(cell.counts)
-    paths = _reset_partition_paths(n_seasons)
-    n_paths = length(paths)
-    log_persistence = persistence > 0.0 ? log(persistence) : -Inf
-    log_reset = persistence < 1.0 ? log1p(-persistence) : -Inf
-    fill!(log_terms, 0.0)
-    for (path_index, path) in enumerate(paths)
-        log_term = _reset_path_log_probability_from_logs(
-            path,
-            n_seasons,
-            log_persistence,
-            log_reset,
-        )
-        for (first_season, last_season) in path.groups
-            log_term += _log_reset_group_marginal(
-                component,
-                cell.counts,
-                cell.away_exposures,
-                cell.home_exposures,
-                home_multiplier_value,
-                first_season,
-                last_season,
-                base_values,
-            )
-        end
-        log_terms[path_index] = log_term
-    end
-    return n_paths
+    result = _reset_segment_dynamic_program(
+        cell,
+        component,
+        home_multiplier_value,
+        persistence,
+        _gamma_shape_special_values(component.shape);
+        derivatives=true,
+    )
+    home_events = sum(cell.home_counts)
+    gradient = copy(result.gradient)
+    gradient[4] += home_events
+    return (
+        log_likelihood=result.log_normalizer +
+            home_events * log(home_multiplier_value),
+        gradient=gradient,
+        hessian=result.hessian,
+    )
 end
 
 function _log_reset_partition_marginal!(
@@ -613,20 +826,15 @@ function _log_reset_partition_marginal!(
     persistence::Float64,
     base_values::_GammaSpecialValues,
 )
-    n_seasons = length(cell.counts)
-    1 <= n_seasons <= 3 ||
-        throw(ArgumentError("reset likelihood supports one to three seasons"))
-
-    log_home_events = sum(cell.home_counts) * log(home_multiplier_value)
-    n_paths = _reset_partition_log_terms!(
-        log_terms,
+    result = _reset_segment_dynamic_program(
         cell,
         component,
         home_multiplier_value,
         persistence,
         base_values,
     )
-    return log_home_events + _logsumexp_prefix(log_terms, n_paths)
+    log_home_events = sum(cell.home_counts) * log(home_multiplier_value)
+    return log_home_events + result.log_normalizer
 end
 
 function _log_reset_partition_marginal(
@@ -635,9 +843,8 @@ function _log_reset_partition_marginal(
     home_multiplier_value::Float64,
     persistence::Float64,
 )
-    log_terms = zeros(Float64, 4)
     return _log_reset_partition_marginal!(
-        log_terms,
+        Float64[],
         cell,
         component,
         home_multiplier_value,
@@ -652,9 +859,8 @@ function _log_reset_partition_marginal(
     persistence::Float64,
     base_values::_GammaSpecialValues,
 )
-    log_terms = zeros(Float64, 4)
     return _log_reset_partition_marginal!(
-        log_terms,
+        Float64[],
         cell,
         component,
         home_multiplier_value,
@@ -678,14 +884,13 @@ function _reset_event_log_likelihood(
         return -Inf
 
     log_likelihood = 0.0
-    log_terms = zeros(Float64, 4)
     shape_special_values = [
         _gamma_shape_special_values(component.shape)
         for component in hyperparameters
     ]
     for cell in cells
         log_likelihood += _log_reset_partition_marginal!(
-            log_terms,
+            Float64[],
             cell,
             hyperparameters[cell.time_bin],
             home_multiplier_float,
@@ -696,329 +901,6 @@ function _reset_event_log_likelihood(
     return log_likelihood
 end
 
-function _reset_path_log_probability_derivative(
-    path,
-    n_seasons::Int,
-    persistence::Float64,
-)
-    isfinite(persistence) && 0.0 <= persistence <= 1.0 ||
-        throw(ArgumentError(
-            "persistence must be finite and in [0, 1]",
-        ))
-    return _reset_path_log_probability_derivative_unchecked(
-        path,
-        n_seasons,
-        persistence,
-    )
-end
-
-@inline function _reset_path_log_probability_derivative_unchecked(
-    path,
-    n_seasons::Int,
-    persistence::Float64,
-)
-    reset_links = n_seasons - 1 - path.persistent_links
-    return path.persistent_links * (1.0 - persistence) -
-        reset_links * persistence
-end
-
-function _reset_cell_log_likelihood_gradient!(
-    log_terms::AbstractVector{Float64},
-    path_gradients::AbstractMatrix{Float64},
-    gradient::AbstractVector{Float64},
-    cell,
-    component::GammaParams,
-    home_multiplier_value::Float64,
-    persistence::Float64,
-)
-    return _reset_cell_log_likelihood_gradient!(
-        log_terms,
-        path_gradients,
-        gradient,
-        cell,
-        component,
-        home_multiplier_value,
-        persistence,
-        _gamma_shape_special_values(component.shape),
-    )
-end
-
-function _reset_cell_log_likelihood_gradient!(
-    log_terms::AbstractVector{Float64},
-    path_gradients::AbstractMatrix{Float64},
-    gradient::AbstractVector{Float64},
-    cell,
-    component::GammaParams,
-    home_multiplier_value::Float64,
-    persistence::Float64,
-    base_values::_GammaSpecialValues,
-)
-    isfinite(home_multiplier_value) && home_multiplier_value > 0.0 ||
-        throw(ArgumentError("home multiplier must be finite and positive"))
-    isfinite(persistence) && 0.0 <= persistence <= 1.0 ||
-        throw(ArgumentError("persistence must be finite and in [0, 1]"))
-    paths = _reset_partition_paths(length(cell.counts))
-    n_paths = length(paths)
-    n_seasons = length(cell.counts)
-    log_persistence = persistence > 0.0 ? log(persistence) : -Inf
-    log_reset = persistence < 1.0 ? log1p(-persistence) : -Inf
-    fill!(log_terms, 0.0)
-    fill!(path_gradients, 0.0)
-    fill!(gradient, 0.0)
-    home_event_count = sum(cell.home_counts)
-
-    for (path_index, path) in enumerate(paths)
-        log_term = _reset_path_log_probability_from_logs(
-            path,
-            n_seasons,
-            log_persistence,
-            log_reset,
-        )
-        for (first_season, last_season) in path.groups
-            count = 0.0
-            exposure = 0.0
-            home_exposure = 0.0
-            for season in first_season:last_season
-                count += cell.counts[season]
-                exposure += cell.away_exposures[season] +
-                    home_multiplier_value * cell.home_exposures[season]
-                home_exposure += cell.home_exposures[season]
-            end
-            marginal = _log_gamma_event_marginal_with_derivatives(
-                component,
-                count,
-                exposure,
-                base_values,
-            )
-            log_term += marginal.value
-            path_gradients[path_index, 1] += marginal.d_log_mean
-            path_gradients[path_index, 2] += marginal.d_log_shape
-            path_gradients[path_index, 4] +=
-                home_multiplier_value * home_exposure * marginal.d_exposure
-        end
-        path_gradients[path_index, 3] =
-            _reset_path_log_probability_derivative_unchecked(
-                path,
-                n_seasons,
-                persistence,
-            )
-        log_terms[path_index] = log_term
-    end
-
-    log_normalizer = _logsumexp_prefix(log_terms, n_paths)
-    for path_index in 1:n_paths
-        posterior_weight = exp(log_terms[path_index] - log_normalizer)
-        for coordinate in 1:4
-            gradient[coordinate] +=
-                posterior_weight * path_gradients[path_index, coordinate]
-        end
-    end
-    gradient[4] += home_event_count
-    return home_event_count * log(home_multiplier_value) + log_normalizer
-end
-
-function _reset_cell_log_likelihood_gradient(
-    cell,
-    component::GammaParams,
-    home_multiplier_value::Float64,
-    persistence::Float64,
-)
-    log_terms = zeros(Float64, 4)
-    path_gradients = zeros(Float64, 4, 4)
-    gradient = zeros(Float64, 4)
-    log_likelihood = _reset_cell_log_likelihood_gradient!(
-        log_terms,
-        path_gradients,
-        gradient,
-        cell,
-        component,
-        home_multiplier_value,
-        persistence,
-    )
-    return (log_likelihood=log_likelihood, gradient=gradient)
-end
-
-function _reset_cell_log_likelihood_with_hessian!(
-    log_terms::AbstractVector{Float64},
-    path_gradients::AbstractMatrix{Float64},
-    path_hessians::Array{Float64,3},
-    posterior_weights::AbstractVector{Float64},
-    gradient::AbstractVector{Float64},
-    hessian::AbstractMatrix{Float64},
-    cell,
-    component::GammaParams,
-    home_multiplier_value::Float64,
-    persistence::Float64,
-)
-    return _reset_cell_log_likelihood_with_hessian!(
-        log_terms,
-        path_gradients,
-        path_hessians,
-        posterior_weights,
-        gradient,
-        hessian,
-        cell,
-        component,
-        home_multiplier_value,
-        persistence,
-        _gamma_shape_special_values(component.shape),
-    )
-end
-
-function _reset_cell_log_likelihood_with_hessian!(
-    log_terms::AbstractVector{Float64},
-    path_gradients::AbstractMatrix{Float64},
-    path_hessians::Array{Float64,3},
-    posterior_weights::AbstractVector{Float64},
-    gradient::AbstractVector{Float64},
-    hessian::AbstractMatrix{Float64},
-    cell,
-    component::GammaParams,
-    home_multiplier_value::Float64,
-    persistence::Float64,
-    base_values::_GammaSpecialValues,
-)
-    isfinite(home_multiplier_value) && home_multiplier_value > 0.0 ||
-        throw(ArgumentError("home multiplier must be finite and positive"))
-    isfinite(persistence) && 0.0 <= persistence <= 1.0 ||
-        throw(ArgumentError("persistence must be finite and in [0, 1]"))
-    paths = _reset_partition_paths(length(cell.counts))
-    n_paths = length(paths)
-    home_event_count = sum(cell.home_counts)
-    n_seasons = length(cell.counts)
-    log_persistence = persistence > 0.0 ? log(persistence) : -Inf
-    log_reset = persistence < 1.0 ? log1p(-persistence) : -Inf
-    fill!(log_terms, 0.0)
-    fill!(path_gradients, 0.0)
-    fill!(path_hessians, 0.0)
-    fill!(posterior_weights, 0.0)
-    fill!(gradient, 0.0)
-    fill!(hessian, 0.0)
-
-    for (path_index, path) in enumerate(paths)
-        log_term = _reset_path_log_probability_from_logs(
-            path,
-            n_seasons,
-            log_persistence,
-            log_reset,
-        )
-        for (first_season, last_season) in path.groups
-            count = 0.0
-            exposure = 0.0
-            home_exposure = 0.0
-            for season in first_season:last_season
-                count += cell.counts[season]
-                exposure += cell.away_exposures[season] +
-                    home_multiplier_value * cell.home_exposures[season]
-                home_exposure += cell.home_exposures[season]
-            end
-            marginal = _log_gamma_event_marginal_derivative_values(
-                component,
-                count,
-                exposure,
-                base_values,
-            )
-            home_exposure_derivative =
-                home_multiplier_value * home_exposure
-            log_term += marginal.value
-            path_gradients[path_index, 1] += marginal.d_log_mean
-            path_gradients[path_index, 2] += marginal.d_log_shape
-            path_gradients[path_index, 4] +=
-                marginal.d_exposure * home_exposure_derivative
-
-            path_hessians[path_index, 1, 1] += marginal.h11
-            path_hessians[path_index, 1, 2] += marginal.h12
-            path_hessians[path_index, 2, 1] += marginal.h12
-            path_hessians[path_index, 2, 2] += marginal.h22
-            path_hessians[path_index, 1, 4] +=
-                marginal.h13 * home_exposure_derivative
-            path_hessians[path_index, 4, 1] =
-                path_hessians[path_index, 1, 4]
-            path_hessians[path_index, 2, 4] +=
-                marginal.h23 * home_exposure_derivative
-            path_hessians[path_index, 4, 2] =
-                path_hessians[path_index, 2, 4]
-            path_hessians[path_index, 4, 4] +=
-                marginal.h33 * home_exposure_derivative^2 +
-                marginal.d_exposure * home_exposure_derivative
-        end
-        path_gradients[path_index, 3] =
-            _reset_path_log_probability_derivative_unchecked(
-                path,
-                n_seasons,
-                persistence,
-            )
-        path_hessians[path_index, 3, 3] =
-            -(n_seasons - 1) * persistence * (1.0 - persistence)
-        log_terms[path_index] = log_term
-    end
-
-    log_normalizer = _logsumexp_prefix(log_terms, n_paths)
-    for path_index in 1:n_paths
-        posterior_weight = exp(log_terms[path_index] - log_normalizer)
-        posterior_weights[path_index] = posterior_weight
-        for coordinate in 1:4
-            gradient[coordinate] +=
-                posterior_weight * path_gradients[path_index, coordinate]
-            for second_coordinate in 1:4
-                hessian[coordinate, second_coordinate] +=
-                    posterior_weight *
-                    path_hessians[
-                        path_index,
-                        coordinate,
-                        second_coordinate,
-                    ]
-            end
-        end
-    end
-    for first_index in 1:4
-        for second_index in 1:4
-            covariance = 0.0
-            for path_index in 1:n_paths
-                posterior_weight = posterior_weights[path_index]
-                covariance += posterior_weight *
-                    path_gradients[path_index, first_index] *
-                    path_gradients[path_index, second_index]
-            end
-            hessian[first_index, second_index] += covariance -
-                gradient[first_index] * gradient[second_index]
-        end
-    end
-    gradient[4] += home_event_count
-    return home_event_count * log(home_multiplier_value) + log_normalizer
-end
-
-function _reset_cell_log_likelihood_with_hessian(
-    cell,
-    component::GammaParams,
-    home_multiplier_value::Float64,
-    persistence::Float64,
-)
-    log_terms = zeros(Float64, 4)
-    path_gradients = zeros(Float64, 4, 4)
-    path_hessians = zeros(Float64, 4, 4, 4)
-    posterior_weights = zeros(Float64, 4)
-    gradient = zeros(Float64, 4)
-    hessian = zeros(Float64, 4, 4)
-    log_likelihood = _reset_cell_log_likelihood_with_hessian!(
-        log_terms,
-        path_gradients,
-        path_hessians,
-        posterior_weights,
-        gradient,
-        hessian,
-        cell,
-        component,
-        home_multiplier_value,
-        persistence,
-    )
-    return (
-        log_likelihood=log_likelihood,
-        gradient=gradient,
-        hessian=hessian,
-    )
-end
-
 function _reset_event_log_likelihood_with_gradient(
     cells::AbstractVector,
     hyperparameters::AbstractVector{<:GammaParams},
@@ -1027,30 +909,27 @@ function _reset_event_log_likelihood_with_gradient(
 )
     n_bins = length(hyperparameters)
     gradient = zeros(Float64, 2 * n_bins + 2)
-    log_terms = zeros(Float64, 4)
-    path_gradients = zeros(Float64, 4, 4)
-    cell_gradient = zeros(Float64, 4)
     log_likelihood = 0.0
-    shape_special_values = Vector{_GammaSpecialValues}(undef, n_bins)
-    for time_bin in 1:n_bins
-        shape_special_values[time_bin] =
-            _gamma_shape_special_values(hyperparameters[time_bin].shape)
-    end
+    shape_special_values = [
+        _gamma_shape_special_values(component.shape)
+        for component in hyperparameters
+    ]
     for cell in cells
-        log_likelihood += _reset_cell_log_likelihood_gradient!(
-            log_terms,
-            path_gradients,
-            cell_gradient,
+        result = _reset_segment_dynamic_program(
             cell,
             hyperparameters[cell.time_bin],
             home_multiplier_value,
             persistence,
-            shape_special_values[cell.time_bin],
+            shape_special_values[cell.time_bin];
+            derivatives=true,
         )
-        gradient[cell.time_bin] += cell_gradient[1]
-        gradient[n_bins + cell.time_bin] += cell_gradient[2]
-        gradient[2 * n_bins + 1] += cell_gradient[3]
-        gradient[2 * n_bins + 2] += cell_gradient[4]
+        log_likelihood += result.log_normalizer +
+            sum(cell.home_counts) * log(home_multiplier_value)
+        gradient[cell.time_bin] += result.gradient[1]
+        gradient[n_bins + cell.time_bin] += result.gradient[2]
+        gradient[2 * n_bins + 1] += result.gradient[3]
+        gradient[2 * n_bins + 2] += result.gradient[4] +
+            sum(cell.home_counts)
     end
     return (log_likelihood=log_likelihood, gradient=gradient)
 end
@@ -1064,12 +943,6 @@ function _reset_event_log_likelihood_with_hessian(
     n_bins = length(hyperparameters)
     gradient = zeros(Float64, 2 * n_bins + 2)
     hessian = zeros(Float64, 2 * n_bins + 2, 2 * n_bins + 2)
-    log_terms = zeros(Float64, 4)
-    path_gradients = zeros(Float64, 4, 4)
-    path_hessians = zeros(Float64, 4, 4, 4)
-    posterior_weights = zeros(Float64, 4)
-    cell_gradient = zeros(Float64, 4)
-    cell_hessian = zeros(Float64, 4, 4)
     log_likelihood = 0.0
     shape_special_values = Vector{_GammaSpecialValues}(undef, n_bins)
     for time_bin in 1:n_bins
@@ -1077,33 +950,33 @@ function _reset_event_log_likelihood_with_hessian(
             _gamma_shape_special_values(hyperparameters[time_bin].shape)
     end
     for cell in cells
-        log_likelihood += _reset_cell_log_likelihood_with_hessian!(
-            log_terms,
-            path_gradients,
-            path_hessians,
-            posterior_weights,
-            cell_gradient,
-            cell_hessian,
+        result = _reset_segment_dynamic_program(
             cell,
             hyperparameters[cell.time_bin],
             home_multiplier_value,
             persistence,
-            shape_special_values[cell.time_bin],
+            shape_special_values[cell.time_bin];
+            derivatives=true,
         )
+        home_events = sum(cell.home_counts)
+        log_likelihood += result.log_normalizer +
+            home_events * log(home_multiplier_value)
         local_indices = (
             cell.time_bin,
             n_bins + cell.time_bin,
             2 * n_bins + 1,
             2 * n_bins + 2,
         )
+        local_gradient = copy(result.gradient)
+        local_gradient[4] += home_events
         for local_index in 1:4
             global_index = local_indices[local_index]
-            gradient[global_index] += cell_gradient[local_index]
+            gradient[global_index] += local_gradient[local_index]
             for second_local_index in 1:4
                 hessian[
                     global_index,
                     local_indices[second_local_index],
-                ] += cell_hessian[local_index, second_local_index]
+                ] += result.hessian[local_index, second_local_index]
             end
         end
     end
@@ -1116,9 +989,9 @@ end
 
 function _reset_group_posterior_moments(
     component::GammaParams,
-    counts::Tuple,
-    away_exposures::Tuple,
-    home_exposures::Tuple,
+    counts,
+    away_exposures,
+    home_exposures,
     home_multiplier_value::Float64,
     first_season::Int,
     last_season::Int,
@@ -1137,9 +1010,9 @@ end
 
 function _reset_group_posterior_moments(
     component::GammaParams,
-    counts::Tuple,
-    away_exposures::Tuple,
-    home_exposures::Tuple,
+    counts,
+    away_exposures,
+    home_exposures,
     home_multiplier_value::Float64,
     first_season::Int,
     last_season::Int,
@@ -1183,39 +1056,31 @@ function _reset_em_expectations(
     total_transitions = 0.0
     total_home_events = 0.0
     function_evaluations = 0
-    log_terms = zeros(Float64, 4)
-    shape_special_values = Vector{_GammaSpecialValues}(undef, n_bins)
-    for time_bin in 1:n_bins
-        shape_special_values[time_bin] =
-            _gamma_shape_special_values(hyperparameters[time_bin].shape)
-    end
+    shape_special_values = [
+        _gamma_shape_special_values(component.shape)
+        for component in hyperparameters
+    ]
 
     for cell in cells
-        n_seasons = length(cell.counts)
-        paths = _reset_partition_paths(n_seasons)
-        n_paths = _reset_partition_log_terms!(
-            log_terms,
+        result = _reset_segment_dynamic_program(
             cell,
             hyperparameters[cell.time_bin],
             home_multiplier_value,
             persistence,
             shape_special_values[cell.time_bin],
         )
-        log_normalizer = _logsumexp_prefix(log_terms, n_paths)
+        n_seasons = length(cell.counts)
         total_home_events += sum(cell.home_counts)
         total_transitions += n_seasons - 1
-        function_evaluations += n_paths
-
-        for path_index in 1:n_paths
-            path = paths[path_index]
-            log_term = log_terms[path_index]
-            posterior_weight = exp(log_term - log_normalizer)
-            posterior_weight > 0.0 || continue
-            expected_persistent_links +=
-                posterior_weight * path.persistent_links
-            expected_group_counts[cell.time_bin] +=
-                posterior_weight * length(path.groups)
-            for (first_season, last_season) in path.groups
+        function_evaluations += n_seasons * (n_seasons + 1) ÷ 2
+        for first_season in 1:n_seasons
+            for last_season in first_season:n_seasons
+                posterior_weight =
+                    result.segment_posteriors[first_season, last_season]
+                posterior_weight > 0.0 || continue
+                expected_group_counts[cell.time_bin] += posterior_weight
+                expected_persistent_links += posterior_weight *
+                    (last_season - first_season)
                 moments = _reset_group_posterior_moments(
                     hyperparameters[cell.time_bin],
                     cell.counts,
@@ -1342,12 +1207,11 @@ function _reset_bin_event_log_likelihood(
     persistence::Float64,
 )
     log_likelihood = 0.0
-    log_terms = zeros(Float64, 4)
     base_values = _gamma_shape_special_values(component.shape)
     for cell in cells
         cell.time_bin == time_bin || continue
         log_likelihood += _log_reset_partition_marginal!(
-            log_terms,
+            Float64[],
             cell,
             component,
             home_multiplier_value,
@@ -1367,24 +1231,21 @@ function _reset_bin_event_log_likelihood_with_gradient(
 )
     log_likelihood = 0.0
     gradient = zeros(Float64, 2)
-    log_terms = zeros(Float64, 4)
-    path_gradients = zeros(Float64, 4, 4)
-    cell_gradient = zeros(Float64, 4)
     base_values = _gamma_shape_special_values(component.shape)
     for cell in cells
         cell.time_bin == time_bin || continue
-        log_likelihood += _reset_cell_log_likelihood_gradient!(
-            log_terms,
-            path_gradients,
-            cell_gradient,
+        result = _reset_segment_dynamic_program(
             cell,
             component,
             home_multiplier_value,
             persistence,
             base_values,
+            derivatives=true,
         )
-        gradient[1] += cell_gradient[1]
-        gradient[2] += cell_gradient[2]
+        log_likelihood += result.log_normalizer +
+            sum(cell.home_counts) * log(home_multiplier_value)
+        gradient[1] += result.gradient[1]
+        gradient[2] += result.gradient[2]
     end
     return (log_likelihood=log_likelihood, gradient=gradient)
 end
@@ -2899,13 +2760,11 @@ function _fit_reset_outcome_parameters_with_diagnostics(
     time_edges::AbstractVector{<:Real},
     kind::Symbol,
     ;
-    method::PriorFitMethod=HybridFit(),
+    method::PriorFitMethod=DEFAULT_PRIOR_FIT_METHOD,
 )
     solver = _fit_method_symbol(method)
     _reset_validate_solver(solver)
     isempty(seasons) && throw(ArgumentError("historical likelihood requires seasons"))
-    length(seasons) <= MAX_HISTORICAL_SEASONS ||
-        throw(ArgumentError("historical likelihood supports at most three seasons"))
     n_bins = length(time_edges) - 1
     n_bins > 0 || throw(ArgumentError("historical likelihood requires time bins"))
     moment_fit = solver === :moment ?
@@ -4153,7 +4012,7 @@ function _fit_reset_outcome_parameters(
     time_edges::AbstractVector{<:Real},
     kind::Symbol,
     ;
-    method::PriorFitMethod=HybridFit(),
+    method::PriorFitMethod=DEFAULT_PRIOR_FIT_METHOD,
 )
     parameters, home_multiplier_value, persistence, _, _ =
         _fit_reset_outcome_parameters_with_diagnostics(
@@ -4265,14 +4124,16 @@ probabilities with the event-process marginal likelihood. The likelihood
 retains the competing-risk exposure term, uses the home multiplier in both
 event and integrated-hazard contributions, and integrates the latent
 team-season hazards through the probabilistic reset filter. Team-specific
-season-opening priors are finite mixtures of at most four Gamma components.
+season-opening priors are finite Gamma mixtures whose component count grows
+with the supplied history.
 
 The historical fit is performed separately for the touchdown and defensive
 processes because the joint competing-risk likelihood factorizes conditional
 on the observed risk intervals. The fitted home multiplier is shared across
 time bins within each outcome, and one persistence probability is shared
 across that outcome's hazard curve. Solver failure is reported rather than
-silently replaced with a default prior. The The typed `method` keyword selects `HybridFit()` by default, or one of
+silently replaced with a default prior. The typed `method` keyword selects
+`EMLBFGSFit()` by default, or one of
 `MomentFit()`, `EMECMEFit()`, `EMLBFGSFit()`, `DirectLBFGSFit()`,
 `DirectBFGSFit()`, `MomentLBFGSFit()`, `BlockNewtonFit()`, or
 `SchurNewtonFit()`.
@@ -4283,16 +4144,15 @@ moment estimate.
 function fit_empirical_bayes_prior(
     historical_drives::AbstractDataFrame;
     time_edges=DEFAULT_TIME_EDGES,
-    max_seasons::Int=3,
+    max_seasons::Int=DEFAULT_HISTORICAL_SEASONS,
     current_season::Union{Nothing,Integer}=nothing,
-    method::PriorFitMethod=HybridFit(),
+    method::PriorFitMethod=DEFAULT_PRIOR_FIT_METHOD,
     _return_solver_metrics::Bool=false,
 )
     data, edges = build_exposure_data(historical_drives; time_edges=time_edges)
     byseason = _season_stats(data)
     max_seasons > 0 || throw(ArgumentError("max_seasons must be positive"))
-    effective_max_seasons = min(max_seasons, MAX_HISTORICAL_SEASONS)
-    seasons = _historical_seasons(byseason, effective_max_seasons)
+    seasons = _historical_seasons(byseason, max_seasons)
     isempty(seasons) &&
         throw(ArgumentError("historical data contain no usable seasons"))
 
@@ -4386,9 +4246,9 @@ function fit_hazard_model(
     historical_drives::Union{Nothing,AbstractDataFrame}=nothing,
     prior::Union{Nothing,HazardPrior}=nothing,
     time_edges=DEFAULT_TIME_EDGES,
-    max_seasons::Int=3,
+    max_seasons::Int=DEFAULT_HISTORICAL_SEASONS,
     current_season::Union{Nothing,Integer}=nothing,
-    method::PriorFitMethod=HybridFit(),
+    method::PriorFitMethod=DEFAULT_PRIOR_FIT_METHOD,
 )
     edges = _validate_time_edges(time_edges)
     fitted_prior = if prior !== nothing

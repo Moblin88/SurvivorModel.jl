@@ -51,21 +51,26 @@ multiplier factor. The latent team/bin rate is integrated through the
 season-to-season reset transition, so a historical fit uses the full finite
 Gamma-mixture model rather than treating seasons as independent Gamma draws.
 
-With the default three-season historical window, the likelihood for each
-team/bin is evaluated as four reset paths: all three seasons redraw
-independently, seasons 1-2 persist and season 3 redraws, season 1 redraws and
-seasons 2-3 persist, or all three seasons persist. Their weights are
-`(1-rho)^2`, `rho(1-rho)`, `(1-rho)rho`, and `rho^2`. Each path is evaluated
-from aggregated counts and effective exposures, so the historical fit does not
-revisit individual drive rows during optimization.
+For a selected history of `N` seasons, the likelihood sums over every
+contiguous reset/persistence partition of those seasons. The implementation
+evaluates that sum with an exact forward dynamic program rather than
+enumerating the `2^(N-1)` paths. The three-season case is equivalent to the
+four familiar paths: all seasons redraw, either adjacent pair persists, or all
+three seasons persist. Each segment is evaluated from aggregated counts and
+effective exposures, so the historical fit does not revisit individual drive
+rows during optimization.
 
 The historical fit uses an EM/ECME decomposition rather than one simultaneous
-high-dimensional search. The E-step computes posterior responsibilities for
-the four reset paths and posterior moments of their shared Gamma rates. The
-conditional Gamma updates then solve each time bin independently given the
-shared `rho` and home multiplier, while the shared parameters are updated in a
-two-dimensional conditional likelihood step. This keeps the expensive
-subproblems small while retaining the exact aggregated likelihood.
+high-dimensional search. The E-step uses a forward/backward segment filter to
+compute posterior group probabilities, expected persistent links, and
+posterior moments of the shared Gamma rates. The conditional Gamma updates
+then solve each time bin independently given the shared `rho` and home
+multiplier, while the shared parameters are updated in a two-dimensional
+conditional likelihood step. The exact filter uses quadratic work and linear
+state per team/bin cell in the number of supplied seasons, so `max_seasons`
+can request longer histories without a package-imposed three-season cap.
+Public fitting and forecasting APIs use a five-season historical window by
+default; pass `max_seasons` explicitly to choose a different trailing window.
 
 The fitting method is selected with a typed value when comparing optimization
 strategies:
@@ -78,8 +83,8 @@ prior = fit_empirical_bayes_prior(
 )
 ```
 
-The default `method=HybridFit()` uses the iterated pooled moment/EM path followed by
-joint gradient polishing. `MomentFit()` stops after the pooled moment fit and
+The default `method=EMLBFGSFit()` uses the EM decomposition with analytic
+likelihood-gradient polishing. `MomentFit()` stops after the pooled moment fit and
 returns those estimates without optimizing the exact likelihood; its
 diagnostics therefore use `status=:moment`, and its likelihood is only the
 exact likelihood evaluated at the moment estimates. The moment fit estimates
@@ -103,7 +108,7 @@ complement is assembled with small low-rank Cholesky downdates.
 `SchurNewtonFit()` starts from the same moment estimate and uses the analytic observed-likelihood
 Hessian, a block Schur-complement Newton step, bound-aware backtracking, and an
 explicit L-BFGS fallback. Both Newton variants are available for benchmarking
-while `HybridFit()` remains the default. All methods use the same event-process
+while `EMLBFGSFit()` remains the default. All methods use the same event-process
 likelihood, bounds, reset mixture, and explicit failure behavior. The
 standalone comparison harness is
 `benchmark/reset_solver_comparison.jl`.
@@ -130,8 +135,8 @@ flags.
 
 The team-specific season-opening prior is a finite Gamma mixture produced by a
 probabilistic reset filter. Each component represents a possible last reset
-season; with the default three-season historical window, the target-season
-prior contains four components. The exact mixture is available from
+season; with `N` historical seasons, the target-season prior contains at most
+`N + 1` components. The exact mixture is available from
 `hazard_posterior`, while `hazard_rate` returns its posterior mean. Inspect the
 home multipliers with `home_multiplier(prior, :td)` and
 `home_multiplier(prior, :defensive)`, and inspect persistence with
@@ -148,6 +153,48 @@ posterior = hazard_posterior(model, :td, "KC", 2)
 describe the exact finite Gamma mixture. New drives update every component
 with the same Gamma-Poisson conjugate rule and reweight the components by their
 predictive likelihood.
+
+## Abstract schedule simulation
+
+`simulate_renewal_schedule` generates drive-level data from the fitted
+two-outcome renewal process over a hypothetical schedule:
+
+```julia
+using Random
+
+model = fit_hazard_model(current; prior=prior)
+simulation = simulate_renewal_schedule(
+    model,
+    hypothetical_schedule;
+    rng=MersenneTwister(42),
+)
+
+simulation.games.drive_count
+simulation.drives
+simulation.latent_rates
+```
+
+The schedule uses the same columns as `load_schedule`: `game_id`, `season`,
+`game_type`, `week`, `away_team`, `home_team`, and `result`. The result may be
+`missing` for an unplayed hypothetical schedule. Games are simulated in
+season/week order, with a random 50/50 opening possession and alternating
+possessions thereafter. Each drive samples a piecewise-exponential waiting
+time from the touchdown and defensive hazards until the 3,600-second game
+horizon is exhausted. Durations are returned as integer `Second` values, and
+the final censored interval is labeled `End of half`.
+
+The first simulated season samples one latent Gamma-mixture rate for every
+team, outcome, and time bin from the model's posterior and reuses those rates
+across that season's games. For each later season, every rate independently
+persists or redraws according to the fitted outcome-specific persistence and
+Gamma hyperparameters. This preserves schedule-level dependence from shared
+rate uncertainty. The returned `drives` table can be passed to
+`build_exposure_data` or `fit_hazard_model`; `games` reports endogenous drive
+counts, and `latent_rates` exposes the realized baseline rates.
+
+This simulator intentionally excludes score rewards, score marks, win
+probabilities, and detailed football possession rules. It is intended for
+renewal-process experiments and prior-fitting simulations.
 
 ## Regular-season forecasts
 
@@ -354,6 +401,15 @@ using SurvivorModel
 clear_historical_prior_cache!()
 ```
 
+The same cache can be cleared from the command line. This exits after clearing
+when used by itself, or clears the cache before the requested forecast or
+benchmark:
+
+```sh
+survivor --clear-cache
+survivor --clear-cache --season 2026 < picks.txt
+```
+
 The objective is expected future wins weighted by your personal probability of
 still being alive before each week. It does not estimate the probability that
 the entire pool survives and does not use sportsbook lines in its objective.
@@ -368,6 +424,65 @@ discount is the probability of having at most `s` losses in those prior weeks:
 `d[k] = sum(binomial(k, losses) * (1-q)^losses * q^(k-losses))` for
 `losses = 0:min(s, k)`. For example, with `q = 0.65` and one unused strike,
 the first discounts are `1.0, 1.0, 0.8775, 0.71825`.
+
+### Fitting benchmarks
+
+Run the fitting-method benchmark from the same app. The default uses a
+deterministic synthetic drive data set, warms each method once, times the
+requested repeats, and prints a comparison table with median runtime,
+convergence status, total log likelihood, the gap from the best likelihood,
+iteration counts, function evaluations, and boundary-parameter counts:
+
+```sh
+survivor --benchmark
+survivor --benchmark --repeats 5
+```
+
+The performance benchmark can be replaced with a correctly specified
+parameter-recovery simulation:
+
+```sh
+survivor --benchmark --scenario recovery --repeats 3
+survivor --benchmark --scenario recovery \
+  --recovery-seasons 5 --max-seasons 5 --repeats 3
+```
+
+The recovery scenario simulates a configurable number of seasons (three by
+default) for 32 teams from the same piecewise competing-risk model used by
+fitting. It creates a
+17-game-per-team hypothetical schedule, then uses the abstract renewal
+simulator to generate drive durations and outcomes endogenously. One Gamma
+rate per outcome and time bin is reused across each season's scheduled games;
+the rate is carried across seasons with the configured outcome-specific
+persistence probability or redrawn, and separate offensive and defensive home
+multipliers are applied. The output reports the generating truth,
+shared-parameter errors, and per-bin mean and variance errors for every fit
+method. The default event-rate means are calibrated to roughly 160-second
+drives and a 20% touchdown share; the simulator intentionally does not
+generate score rewards. Use `--recovery-seasons N` to change the simulated
+history, and pass the same `--max-seasons N` when the fit should use the full
+history. The generated truth and schedule are also available through
+`synthetic_fit_recovery_drives(seasons=...)`.
+
+Use real historical data by supplying a reference season. The benchmark loads
+the preceding `--max-seasons` seasons through `load_drive_pbp` (the default is five):
+
+```sh
+survivor --benchmark --data real --season 2024
+```
+
+The output also includes the fitted hazard parameters for each method,
+outcome, and time bin: the outcome-specific home hazard multiplier,
+season-to-season persistence, and the Gamma hazard mean and variance.
+The original synthetic performance scenario includes persistent latent team
+rates for both outcomes and prints its target home multiplier and persistence.
+Those are latent generation targets, so finite-sample estimates can differ;
+use the likelihood gap and convergence status alongside the parameter table.
+Real-data benchmarks do not have known parameter targets.
+
+Higher total log likelihood is better when comparing methods on the same data;
+`gap` is zero for the best successful fit. Synthetic and real benchmarks use
+the same event-process likelihood and typed fitting methods as the package API.
 
 After each week, refresh the forecast context with the new `as_of_week`,
 record the team picked in `picks_made`, update `strikes_remaining`, and call

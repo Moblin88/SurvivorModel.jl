@@ -129,14 +129,13 @@ function _load_forecast_drives(
     allow_missing_current::Bool=false,
 )
     max_seasons > 0 || throw(ArgumentError("max_seasons must be positive"))
-    effective_max_seasons = min(max_seasons, MAX_HISTORICAL_SEASONS)
 
     historical = if historical_drives !== nothing
         historical_drives
     elseif season <= 1999
         nothing
     else
-        first_season = max(1999, Int(season) - effective_max_seasons)
+        first_season = max(1999, Int(season) - max_seasons)
         load_drive_pbp(first_season:(Int(season) - 1))
     end
 
@@ -212,9 +211,9 @@ end
         schedule=nothing,
         historical_drives=nothing,
         current_drives=nothing,
-        max_seasons=3,
+        max_seasons=DEFAULT_HISTORICAL_SEASONS,
         time_edges=DEFAULT_TIME_EDGES,
-        method=HybridFit(),
+        method=DEFAULT_PRIOR_FIT_METHOD,
         prior=nothing,
     ) -> RegularSeasonForecastContext
 
@@ -232,9 +231,9 @@ function fit_regular_season_forecast(
     schedule::Union{Nothing,AbstractDataFrame}=nothing,
     historical_drives::Union{Nothing,AbstractDataFrame}=nothing,
     current_drives::Union{Nothing,AbstractDataFrame}=nothing,
-    max_seasons::Int=3,
+    max_seasons::Int=DEFAULT_HISTORICAL_SEASONS,
     time_edges=DEFAULT_TIME_EDGES,
-    method::PriorFitMethod=HybridFit(),
+    method::PriorFitMethod=DEFAULT_PRIOR_FIT_METHOD,
     prior::Union{Nothing,HazardPrior}=nothing,
 )
     1 <= as_of_week <= 18 ||
@@ -385,9 +384,9 @@ function forecast_win_probabilities(
     historical_drives::Union{Nothing,AbstractDataFrame}=nothing,
     current_drives::Union{Nothing,AbstractDataFrame}=nothing,
     include_completed::Bool=true,
-    max_seasons::Int=3,
+    max_seasons::Int=DEFAULT_HISTORICAL_SEASONS,
     time_edges=DEFAULT_TIME_EDGES,
-    method::PriorFitMethod=HybridFit(),
+    method::PriorFitMethod=DEFAULT_PRIOR_FIT_METHOD,
     horizon::Real=GAME_CLOCK_SECONDS,
     full_schedule::Bool=false,
 )
@@ -466,9 +465,9 @@ function forecast_spreads(
     historical_drives::Union{Nothing,AbstractDataFrame}=nothing,
     current_drives::Union{Nothing,AbstractDataFrame}=nothing,
     include_completed::Bool=true,
-    max_seasons::Int=3,
+    max_seasons::Int=DEFAULT_HISTORICAL_SEASONS,
     time_edges=DEFAULT_TIME_EDGES,
-    method::PriorFitMethod=HybridFit(),
+    method::PriorFitMethod=DEFAULT_PRIOR_FIT_METHOD,
     horizon::Real=GAME_CLOCK_SECONDS,
     full_schedule::Bool=false,
 )
@@ -537,7 +536,7 @@ end
         historical_drives=nothing,
         current_drives=nothing,
         include_completed=true,
-        max_seasons=3,
+        max_seasons=DEFAULT_HISTORICAL_SEASONS,
         time_edges=DEFAULT_TIME_EDGES,
         horizon=GAME_CLOCK_SECONDS,
     ) -> DataFrame
@@ -552,9 +551,9 @@ function forecast_regular_season(
     historical_drives::Union{Nothing,AbstractDataFrame}=nothing,
     current_drives::Union{Nothing,AbstractDataFrame}=nothing,
     include_completed::Bool=true,
-    max_seasons::Int=3,
+    max_seasons::Int=DEFAULT_HISTORICAL_SEASONS,
     time_edges=DEFAULT_TIME_EDGES,
-    method::PriorFitMethod=HybridFit(),
+    method::PriorFitMethod=DEFAULT_PRIOR_FIT_METHOD,
     horizon::Real=GAME_CLOCK_SECONDS,
 )
     context = fit_regular_season_forecast(

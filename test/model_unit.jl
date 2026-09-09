@@ -726,6 +726,60 @@ using Test
         )
     end
 
+    @testset "arbitrary historical season windows" begin
+        long_historical = DataFrame(
+            game_id=String[],
+            fixed_drive=Int[],
+            posteam=String[],
+            defteam=String[],
+            posteam_home=Bool[],
+            defteam_home=Bool[],
+            drive_result=String[],
+            time_of_possession=Second[],
+        )
+        teams = ["A", "B", "C", "D"]
+        for season in 2019:2023
+            for (team_index, team) in enumerate(teams)
+                for index in 1:40
+                    posteam_home = iseven(index + season + team_index)
+                    touchdown = mod(index + season + team_index, 5) == 0
+                    push!(
+                        long_historical,
+                        (
+                            "$(season)_$(team)_$(index)",
+                            1,
+                            team,
+                            "DEFENSE",
+                            posteam_home,
+                            !posteam_home,
+                            touchdown ? "Touchdown" : "Punt",
+                            Second(60),
+                        ),
+                    )
+                end
+            end
+        end
+
+        long_prior = fit_empirical_bayes_prior(
+            long_historical;
+            time_edges=[0, Inf],
+            max_seasons=5,
+            current_season=2024,
+        )
+        @test long_prior.historical_seasons == collect(2019:2023)
+        long_mixture = long_prior.td_team_mixtures["A"][1]
+        @test length(long_mixture.components) == 6
+        @test long_mixture.source_seasons == [2019, 2020, 2021, 2022, 2023, 2024]
+
+        recent_prior = fit_empirical_bayes_prior(
+            long_historical;
+            time_edges=[0, Inf],
+            max_seasons=2,
+            current_season=2024,
+        )
+        @test recent_prior.historical_seasons == [2022, 2023]
+    end
+
     @testset "alternative historical likelihood solvers" begin
         rows = DataFrame(
             game_id=String[],

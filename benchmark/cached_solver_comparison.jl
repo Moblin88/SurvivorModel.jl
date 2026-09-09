@@ -254,7 +254,7 @@ end
 function _cached_solver_comparison(
     historical_drives;
     time_edges=[0, 120, 240, Inf],
-    max_seasons::Int=3,
+    max_seasons::Int=SurvivorModel.DEFAULT_HISTORICAL_SEASONS,
     repeats::Int=3,
 )
     repeats > 0 || throw(ArgumentError("repeats must be positive"))

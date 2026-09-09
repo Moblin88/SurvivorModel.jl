@@ -500,7 +500,7 @@ end
         cutoff_weeks=DEFAULT_CALIBRATION_CUTOFF_WEEKS,
         schedule=nothing,
         drives=nothing,
-        max_seasons=3,
+        max_seasons=DEFAULT_HISTORICAL_SEASONS,
         recent_seasons=3,
         time_edges=DEFAULT_TIME_EDGES,
         probability_bins=DEFAULT_PROBABILITY_BINS,
@@ -520,7 +520,7 @@ function evaluate_calibration(
     cutoff_weeks=DEFAULT_CALIBRATION_CUTOFF_WEEKS,
     schedule::Union{Nothing,AbstractDataFrame}=nothing,
     drives::Union{Nothing,AbstractDataFrame}=nothing,
-    max_seasons::Int=3,
+    max_seasons::Int=DEFAULT_HISTORICAL_SEASONS,
     recent_seasons::Int=3,
     time_edges=DEFAULT_TIME_EDGES,
     probability_bins=DEFAULT_PROBABILITY_BINS,
@@ -544,8 +544,7 @@ function evaluate_calibration(
             recent_seasons,
         ) :
         _calibration_seasons(seasons)
-    effective_max_seasons = min(max_seasons, MAX_HISTORICAL_SEASONS)
-    first_data_season = max(1999, first(season_values) - effective_max_seasons)
+    first_data_season = max(1999, first(season_values) - max_seasons)
     last_data_season = last(season_values)
     all_drives = if drives === nothing
         load_drive_pbp(first_data_season:last_data_season)

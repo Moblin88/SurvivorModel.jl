@@ -105,8 +105,8 @@ function _cached_historical_prior(
     historical_drives::AbstractDataFrame;
     current_season::Integer,
     time_edges=DEFAULT_TIME_EDGES,
-    max_seasons::Int=3,
-    method::PriorFitMethod=HybridFit(),
+    max_seasons::Int=DEFAULT_HISTORICAL_SEASONS,
+    method::PriorFitMethod=DEFAULT_PRIOR_FIT_METHOD,
     cache_directory::Union{Nothing,AbstractString}=nothing,
 )
     max_seasons > 0 || throw(ArgumentError("max_seasons must be positive"))

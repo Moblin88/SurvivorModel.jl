@@ -386,10 +386,35 @@ The app reads one team abbreviation per nonblank line, starting with week 1.
 It infers the next week from the number of picks, loads the season schedule to
 count completed losses (ties count as losses), and defaults to two initial
 strikes. Use `--strikes N` to choose a different initial loss allowance. The
-The effective week is one plus the number of supplied picks; games at or after
+effective week is one plus the number of supplied picks; games at or after
 that week are treated as future games even when the schedule already contains
 their results, which allows replaying an earlier week of a completed season.
 The default output is only the selected team's abbreviation and a newline.
+For an opt-in phase breakdown, set `SURVIVORMODEL_TIMINGS=true`; timing
+diagnostics are written to stderr so stdout remains suitable for a picks file:
+
+```sh
+SURVIVORMODEL_TIMINGS=true survivor --season 2026 < picks.txt
+```
+
+Set `SURVIVORMODEL_REFRESH_DATA=true` for an explicit data refresh. This
+clears NFLData's raw-data cache and rebuilds the package's summarized
+historical-drive cache before running; normal invocations reuse summarized
+historical seasons while still loading the current season through the normal
+NFLData path.
+
+If Julia startup and package compilation dominate the weekly run, an optional
+PackageCompiler sysimage can be built outside the project environment:
+
+```sh
+julia -e 'using Pkg; Pkg.add("PackageCompiler")'
+julia tools/build_sysimage.jl
+julia --project=. --sysimage="$HOME/.cache/SurvivorModel/survivor.dylib" \
+  -m SurvivorModel --season 2026 < picks.txt
+```
+
+Set `SURVIVORMODEL_SYSIMAGE_PATH` to choose a different output path. The
+ordinary `survivor` command remains the portable fallback.
 
 Historical empirical-Bayes priors are stored in the package's Scratch.jl
 space and keyed by season, historical-window length, time-bin configuration,

@@ -581,6 +581,82 @@ function hazard_posterior(
     return home ? _gamma_mixture_home_adjusted(posterior, multiplier) : posterior
 end
 
+mutable struct _HazardLogMomentCache
+    model::HazardModel
+    posteriors::Dict{Tuple{Symbol,String,Int},GammaMixture}
+    log_moments::Dict{Tuple{Symbol,String,Int,Bool},Tuple{Float64,Float64}}
+    hits::Int
+    misses::Int
+end
+
+_HazardLogMomentCache(model::HazardModel) = _HazardLogMomentCache(
+    model,
+    Dict{Tuple{Symbol,String,Int},GammaMixture}(),
+    Dict{Tuple{Symbol,String,Int,Bool},Tuple{Float64,Float64}}(),
+    0,
+    0,
+)
+
+function _cached_hazard_posterior(
+    cache::_HazardLogMomentCache,
+    model::HazardModel,
+    kind::Symbol,
+    team,
+    time_bin::Integer,
+)
+    cache.model === model ||
+        throw(ArgumentError("hazard log-moment cache belongs to a different model"))
+    team_name = string(team)
+    key = (kind, team_name, Int(time_bin))
+    haskey(cache.posteriors, key) && return cache.posteriors[key]
+
+    posterior = hazard_posterior(model, kind, team_name, time_bin)
+    cache.posteriors[key] = posterior
+    return posterior
+end
+
+function _hazard_log_moments(
+    model::HazardModel,
+    kind::Symbol,
+    team,
+    time_bin::Integer;
+    home::Bool=false,
+    cache::Union{Nothing,_HazardLogMomentCache}=nothing,
+)
+    if isnothing(cache)
+        return _gamma_mixture_log_moments(
+            hazard_posterior(model, kind, team, time_bin; home=home),
+        )
+    end
+
+    cache.model === model ||
+        throw(ArgumentError("hazard log-moment cache belongs to a different model"))
+    team_name = string(team)
+    key = (kind, team_name, Int(time_bin), home)
+    if haskey(cache.log_moments, key)
+        cache.hits += 1
+        return cache.log_moments[key]
+    end
+
+    cache.misses += 1
+    posterior = _cached_hazard_posterior(
+        cache,
+        model,
+        kind,
+        team_name,
+        time_bin,
+    )
+    adjusted_posterior = home ?
+        _gamma_mixture_home_adjusted(
+            posterior,
+            home_multiplier(model.prior, kind),
+        ) :
+        posterior
+    moments = _gamma_mixture_log_moments(adjusted_posterior)
+    cache.log_moments[key] = moments
+    return moments
+end
+
 """
     hazard_rate(model, kind, team, time_bin; home=false) -> Float64
 
@@ -682,6 +758,52 @@ function hazard_theta(model::HazardModel, home_team, away_team)
     for i in eachindex(posteriors), j in eachindex(posteriors)
         posterior_keys[i] == posterior_keys[j] || continue
         covariance[i, j] = _gamma_mixture_log_moments(posteriors[i])[2]
+    end
+    return HazardTheta(log_mean, covariance, labels)
+end
+
+function _hazard_theta_with_cache(
+    model::HazardModel,
+    home_team,
+    away_team,
+    cache::_HazardLogMomentCache,
+)
+    cache.model === model ||
+        throw(ArgumentError("hazard log-moment cache belongs to a different model"))
+    n_bins = length(model.time_edges) - 1
+    requests = (
+        (:td, home_team, true, "home_td"),
+        (:defensive, away_team, false, "away_defensive"),
+        (:td, away_team, false, "away_td"),
+        (:defensive, home_team, true, "home_defensive"),
+    )
+    log_moments = Tuple{Float64,Float64}[]
+    posterior_keys = Tuple{Symbol,String,Int}[]
+    labels = Symbol[]
+
+    for (kind, team, home, label_prefix) in requests
+        for time_bin in 1:n_bins
+            push!(
+                log_moments,
+                _hazard_log_moments(
+                    model,
+                    kind,
+                    team,
+                    time_bin;
+                    home=home,
+                    cache=cache,
+                ),
+            )
+            push!(posterior_keys, (kind, string(team), time_bin))
+            push!(labels, Symbol(label_prefix, "_", time_bin))
+        end
+    end
+
+    log_mean = [moments[1] for moments in log_moments]
+    covariance = zeros(Float64, length(log_moments), length(log_moments))
+    for i in eachindex(log_moments), j in eachindex(log_moments)
+        posterior_keys[i] == posterior_keys[j] || continue
+        covariance[i, j] = log_moments[i][2]
     end
     return HazardTheta(log_mean, covariance, labels)
 end

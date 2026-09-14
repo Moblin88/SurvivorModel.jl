@@ -172,9 +172,15 @@ function _forecast_training_data(
     as_of_week::Integer,
     historical_drives::AbstractDataFrame,
     current_drives::AbstractDataFrame,
+    ;
+    _schedule_indexed_drives::Bool=false,
 )
-    historical = _regular_season_drives(historical_drives, schedule)
-    current = _regular_season_drives(current_drives, schedule)
+    historical = _schedule_indexed_drives ?
+        historical_drives :
+        _regular_season_drives(historical_drives, schedule)
+    current = _schedule_indexed_drives ?
+        current_drives :
+        _regular_season_drives(current_drives, schedule)
 
     historical = historical[historical.season .< Int(season), :]
     cutoff = current[
@@ -235,12 +241,20 @@ function fit_regular_season_forecast(
     time_edges=DEFAULT_TIME_EDGES,
     method::PriorFitMethod=DEFAULT_PRIOR_FIT_METHOD,
     prior::Union{Nothing,HazardPrior}=nothing,
+    _normalized_schedule::Bool=false,
+    _schedule_indexed_drives::Bool=false,
 )
     1 <= as_of_week <= 18 ||
         throw(ArgumentError("as_of_week must be between 1 and 18"))
     max_seasons > 0 || throw(ArgumentError("max_seasons must be positive"))
 
-    normalized_schedule = schedule === nothing ? load_schedule() : load_schedule(schedule)
+    normalized_schedule = if schedule === nothing
+        load_schedule()
+    elseif _normalized_schedule && schedule isa DataFrame
+        schedule
+    else
+        load_schedule(schedule)
+    end
     target_schedule = _regular_season_schedule(normalized_schedule, season)
     isempty(target_schedule) &&
         throw(ArgumentError("schedule has no regular-season games for season $season"))
@@ -259,6 +273,8 @@ function fit_regular_season_forecast(
         as_of_week,
         historical,
         current,
+        ;
+        _schedule_indexed_drives=_schedule_indexed_drives,
     )
 
     fitted_prior = prior === nothing ? fit_empirical_bayes_prior(
@@ -346,14 +362,16 @@ function forecast_win_probabilities(
     forecast = _forecast_output(games; full_schedule=full_schedule)
     home_probabilities = Float64[]
     away_probabilities = Float64[]
+    cache = _HazardLogMomentCache(context.model)
 
     for row in eachrow(games)
         home_probability = _validate_win_probability(
-            expected_game_win_probability(
+            _expected_game_win_probability_with_cache(
                 context.model,
                 context.marks,
                 row.home_team,
-                row.away_team;
+                row.away_team,
+                cache;
                 horizon=horizon,
             ),
         )
@@ -429,13 +447,15 @@ function forecast_spreads(
     forecast = _forecast_output(games; full_schedule=full_schedule)
     expected_spreads = Float64[]
     predictive_variances = Float64[]
+    cache = _HazardLogMomentCache(context.model)
 
     for row in eachrow(games)
-        metrics = expected_game_spread_metrics(
+        metrics = _expected_game_spread_metrics_with_cache(
             context.model,
             context.marks,
             row.home_team,
-            row.away_team;
+            row.away_team,
+            cache;
             horizon=horizon,
         )
         push!(expected_spreads, metrics.expected_spread)
@@ -594,12 +614,14 @@ function forecast_regular_season(
     away_probabilities = Float64[]
     expected_spreads = Float64[]
     predictive_variances = Float64[]
+    cache = _HazardLogMomentCache(context.model)
     for row in eachrow(games)
-        metrics = expected_game_metrics(
+        metrics = _expected_game_metrics_with_cache(
             context.model,
             context.marks,
             row.home_team,
-            row.away_team;
+            row.away_team,
+            cache;
             horizon=horizon,
         )
         home_probability = _validate_win_probability(metrics.expected_win_probability)
@@ -821,6 +843,84 @@ function _expected_game_spread_metrics(
     return ExpectedGameSpreadMetrics(
         expected_spread,
         predictive_spread_variance,
+    )
+end
+
+function _expected_game_win_probability_with_cache(
+    model::HazardModel,
+    marks::ScoreMarks,
+    home_team,
+    away_team,
+    cache::_HazardLogMomentCache;
+    horizon::Real=GAME_CLOCK_SECONDS,
+)
+    theta = _hazard_theta_with_cache(
+        model,
+        home_team,
+        away_team,
+        cache,
+    )
+    return _expected_game_win_probability(
+        theta,
+        model.time_edges,
+        marks;
+        horizon=horizon,
+    )
+end
+
+function _expected_game_spread_metrics_with_cache(
+    model::HazardModel,
+    marks::ScoreMarks,
+    home_team,
+    away_team,
+    cache::_HazardLogMomentCache;
+    horizon::Real=GAME_CLOCK_SECONDS,
+)
+    theta = _hazard_theta_with_cache(
+        model,
+        home_team,
+        away_team,
+        cache,
+    )
+    return _expected_game_spread_metrics(
+        theta,
+        model.time_edges,
+        marks;
+        horizon=horizon,
+    )
+end
+
+function _expected_game_metrics_with_cache(
+    model::HazardModel,
+    marks::ScoreMarks,
+    home_team,
+    away_team,
+    cache::_HazardLogMomentCache;
+    horizon::Real=GAME_CLOCK_SECONDS,
+)
+    theta = _hazard_theta_with_cache(
+        model,
+        home_team,
+        away_team,
+        cache,
+    )
+    expected_win_probability = _expected_game_win_probability(
+        theta,
+        model.time_edges,
+        marks;
+        horizon=horizon,
+    )
+    spread_metrics = _expected_game_spread_metrics(
+        theta,
+        model.time_edges,
+        marks;
+        horizon=horizon,
+    )
+
+    return ExpectedGameMetrics(
+        spread_metrics.expected_spread,
+        expected_win_probability,
+        spread_metrics.predictive_spread_variance,
     )
 end
 

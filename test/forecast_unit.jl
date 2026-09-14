@@ -190,6 +190,103 @@ end
             probabilities.home_win_probability
         @test reused_prior.away_win_probability ≈
             probabilities.away_win_probability
+
+        normalized_context = fit_regular_season_forecast(
+            2023;
+            as_of_week=2,
+            schedule=load_schedule(schedule),
+            historical_drives=historical,
+            current_drives=current,
+            prior=context.model.prior,
+            time_edges=[0, Inf],
+            _normalized_schedule=true,
+        )
+        normalized_probabilities = forecast_win_probabilities(normalized_context)
+        @test normalized_probabilities.home_win_probability ≈
+            probabilities.home_win_probability
+        @test normalized_probabilities.away_win_probability ≈
+            probabilities.away_win_probability
+
+        indexed_context = fit_regular_season_forecast(
+            2023;
+            as_of_week=2,
+            schedule=load_schedule(schedule),
+            historical_drives=SurvivorModel._regular_season_drives(
+                historical,
+                schedule,
+            ),
+            current_drives=SurvivorModel._regular_season_drives(
+                current,
+                schedule,
+            ),
+            prior=context.model.prior,
+            time_edges=[0, Inf],
+            _normalized_schedule=true,
+            _schedule_indexed_drives=true,
+        )
+        indexed_probabilities = forecast_win_probabilities(indexed_context)
+        @test indexed_probabilities.home_win_probability ≈
+            probabilities.home_win_probability
+        @test indexed_probabilities.away_win_probability ≈
+            probabilities.away_win_probability
+    end
+
+    @testset "forecast posterior log-moment cache" begin
+        context = fit_regular_season_forecast(
+            2023;
+            as_of_week=2,
+            schedule=schedule,
+            historical_drives=historical,
+            current_drives=current,
+            time_edges=[0, Inf],
+        )
+        first_game = first(eachrow(context.games))
+        cache = SurvivorModel._HazardLogMomentCache(context.model)
+
+        uncached_theta = hazard_theta(
+            context.model,
+            first_game.home_team,
+            first_game.away_team,
+        )
+        cached_theta = SurvivorModel._hazard_theta_with_cache(
+            context.model,
+            first_game.home_team,
+            first_game.away_team,
+            cache,
+        )
+        @test cached_theta.log_mean == uncached_theta.log_mean
+        @test cached_theta.covariance == uncached_theta.covariance
+        @test cache.misses == 4
+        @test cache.hits == 0
+
+        repeated_theta = SurvivorModel._hazard_theta_with_cache(
+            context.model,
+            first_game.home_team,
+            first_game.away_team,
+            cache,
+        )
+        @test repeated_theta.log_mean == cached_theta.log_mean
+        @test repeated_theta.covariance == cached_theta.covariance
+        @test cache.misses == 4
+        @test cache.hits == 4
+        @test length(cache.posteriors) == 4
+        @test length(cache.log_moments) == 4
+
+        forecast = forecast_regular_season(context)
+        for (index, row) in enumerate(eachrow(context.games))
+            direct_metrics = expected_game_metrics(
+                context.model,
+                context.marks,
+                row.home_team,
+                row.away_team,
+            )
+            @test forecast.home_win_probability[index] ≈
+                direct_metrics.expected_win_probability
+            @test forecast.expected_spread[index] ≈
+                direct_metrics.expected_spread
+            @test forecast.predictive_spread_variance[index] ≈
+                direct_metrics.predictive_spread_variance
+        end
     end
 
     @testset "schedule-only historical results" begin

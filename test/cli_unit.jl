@@ -287,6 +287,36 @@ using SurvivorModel
         end
     end
 
+    @testset "historical drive summary cache integration" begin
+        _, historical, _ = _survivor_context_fixture()
+        summarized = DataFrame(historical, copycols=true)
+        summarized.drive_start_yards_to_goal = fill(50, nrow(summarized))
+        summarized.yards_gained = zeros(nrow(summarized))
+        calls = Ref(0)
+        loader = _ -> begin
+            calls[] += 1
+            summarized
+        end
+        mktempdir() do cache_directory
+            first = SurvivorModel._survivor_cli_load_historical_drives(
+                2023,
+                1,
+                nothing,
+                cache_directory;
+                loader=loader,
+            )
+            second = SurvivorModel._survivor_cli_load_historical_drives(
+                2023,
+                1,
+                nothing,
+                cache_directory;
+                loader=loader,
+            )
+            @test calls[] == 1
+            @test first == second
+        end
+    end
+
     @testset "fixture-backed current pick" begin
         schedule, historical, current = _survivor_context_fixture()
         mktempdir() do cache_directory

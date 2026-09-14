@@ -1,5 +1,27 @@
 const SURVIVOR_CLI_APP_NAME = "survivor"
 
+function _survivor_cli_timings_enabled()
+    value = lowercase(strip(get(ENV, "SURVIVORMODEL_TIMINGS", "false")))
+    return value in ("1", "true", "yes", "on")
+end
+
+function _survivor_cli_refresh_data_enabled()
+    value = lowercase(strip(get(ENV, "SURVIVORMODEL_REFRESH_DATA", "false")))
+    return value in ("1", "true", "yes", "on")
+end
+
+function _print_survivor_cli_timings(
+    timings::AbstractVector{<:Pair};
+    output::IO=stderr,
+)
+    isempty(timings) && return nothing
+    println(output, "survivor timings (seconds):")
+    for (phase, duration) in timings
+        @printf(output, "  %-16s %.3f\n", phase, duration)
+    end
+    return nothing
+end
+
 function _survivor_cli_usage()
     return """
     Usage:
@@ -343,6 +365,31 @@ function _survivor_cli_historical_drives(
 )
     regular = _regular_season_drives(historical_drives, schedule)
     return regular[regular.season .< Int(season), :]
+end
+
+function _survivor_cli_load_historical_drives(
+    season::Integer,
+    max_seasons::Int,
+    historical_drives,
+    cache_directory::Union{Nothing,AbstractString},
+    ;
+    refresh::Bool=false,
+    loader::Function=load_drive_pbp,
+)
+    historical_drives !== nothing && return historical_drives
+    season <= 1999 && return nothing
+
+    first_season = max(1999, Int(season) - max_seasons)
+    last_season = Int(season) - 1
+    cached = DataFrame[
+        _cached_season_drives(
+            data_season;
+            cache_directory=cache_directory,
+            refresh=refresh,
+            loader=loader,
+        ).drives for data_season in first_season:last_season
+    ]
+    return vcat(cached...; cols=:union)
 end
 
 function _load_fit_benchmark_drives(options)
@@ -768,7 +815,19 @@ function _run_survivor_cli(
     max_seasons::Int=DEFAULT_HISTORICAL_SEASONS,
     through_week::Int=18,
 )
+    timings_enabled = _survivor_cli_timings_enabled()
+    timings = Pair{Symbol,Float64}[]
+    timing_started = time_ns()
+    record_timing = function(phase::Symbol)
+        timings_enabled || return nothing
+        now = time_ns()
+        push!(timings, phase => (now - timing_started) / 1.0e9)
+        timing_started = now
+        return nothing
+    end
+
     options = _parse_survivor_cli_args(args)
+    record_timing(:parse)
     if options.show_help
         print(output, _survivor_cli_usage())
         return 0
@@ -779,27 +838,40 @@ function _run_survivor_cli(
     options.benchmark &&
         return _run_fit_benchmark_cli(options; output=output)
 
+    refresh_data = _survivor_cli_refresh_data_enabled()
+    refresh_data && NFLData.clear_cache()
     picks = _read_survivor_cli_picks(input)
     normalized_schedule = schedule === nothing ? load_schedule() : load_schedule(schedule)
+    record_timing(:schedule)
     state = _survivor_cli_state(
         normalized_schedule,
         options.season,
         picks,
         options.initial_strikes,
     )
-    historical, current = _load_forecast_drives(
+    record_timing(:state)
+    historical_source = _survivor_cli_load_historical_drives(
         options.season,
         max_seasons,
         historical_drives,
+        cache_directory;
+        refresh=refresh_data,
+    )
+    historical, current = _load_forecast_drives(
+        options.season,
+        max_seasons,
+        historical_source,
         current_drives,
         ;
         allow_missing_current=state.current_week == 1,
     )
+    record_timing(:drive_data)
     historical = _survivor_cli_historical_drives(
         normalized_schedule,
         options.season,
         historical,
     )
+    current = _regular_season_drives(current, normalized_schedule)
     cached_prior = _cached_historical_prior(
         historical;
         current_season=options.season,
@@ -808,6 +880,7 @@ function _run_survivor_cli(
         method=method,
         cache_directory=cache_directory,
     )
+    record_timing(:prior)
     context = fit_regular_season_forecast(
         options.season;
         as_of_week=state.current_week,
@@ -817,7 +890,10 @@ function _run_survivor_cli(
         max_seasons=max_seasons,
         method=method,
         prior=cached_prior.prior,
+        _normalized_schedule=true,
+        _schedule_indexed_drives=true,
     )
+    record_timing(:fit)
     plan = optimize_survivor_pool(
         context;
         picks_made=state.picks_made,
@@ -825,9 +901,12 @@ function _run_survivor_cli(
         include_completed=true,
         through_week=through_week,
     )
+    record_timing(:optimize)
     nrow(plan.current_pick) == 1 ||
         throw(ArgumentError("survivor optimization did not produce one current pick"))
     print(output, String(plan.current_pick.team[1]), '\n')
+    record_timing(:output)
+    _print_survivor_cli_timings(timings)
     return 0
 end
 

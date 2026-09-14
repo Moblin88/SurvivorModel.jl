@@ -52,6 +52,7 @@ export synthetic_fit_benchmark_drives, synthetic_fit_recovery_drives
 export fit_benchmark, fit_recovery_benchmark
 
 include("drives.jl")
+include("drive_cache.jl")
 include("renewal_model.jl")
 include("prior_fitting.jl")
 include("historical_cache.jl")

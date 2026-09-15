@@ -1,5 +1,6 @@
 const DEFAULT_SURVIVOR_WEEKLY_SURVIVAL_PROBABILITY = 0.65
 const DEFAULT_SURVIVOR_MIN_FAVORITE_SPREAD = 2.0
+const DEFAULT_SURVIVOR_MIN_MODEL_WIN_PROBABILITY = 0.5
 const DEFAULT_SURVIVOR_OBJECTIVE = :milp
 const DEFAULT_SURVIVOR_REACH_DISCOUNT_POLICY = :binomial
 const DEFAULT_SURVIVOR_MARKET_GUARD_WEEKS = 2
@@ -346,8 +347,9 @@ end
     build_survivor_candidates(forecast; ...)
 
 Expand a forecast table into one candidate row for each team in each game.
-The input must contain game identifiers, weeks, home/away teams, and the
-corresponding home/away win probabilities.
+Only teams with at least a 0.5 model win probability are included. The input
+must contain game identifiers, weeks, home/away teams, and the corresponding
+home/away win probabilities.
 """
 function build_survivor_candidates(
     forecast::AbstractDataFrame;
@@ -405,7 +407,9 @@ function build_survivor_candidates(
 
         away_probability = _validate_win_probability(row.away_win_probability)
         home_probability = _validate_win_probability(row.home_win_probability)
-        away_team in used_teams || push!(
+        away_team in used_teams ||
+            away_probability < DEFAULT_SURVIVOR_MIN_MODEL_WIN_PROBABILITY ||
+            push!(
             candidates,
             (
                 game_id=game_id,
@@ -417,7 +421,9 @@ function build_survivor_candidates(
                 market_spread=ismissing(spread_line) ? missing : -spread_line,
             ),
         )
-        home_team in used_teams || push!(
+        home_team in used_teams ||
+            home_probability < DEFAULT_SURVIVOR_MIN_MODEL_WIN_PROBABILITY ||
+            push!(
             candidates,
             (
                 game_id=game_id,
@@ -482,6 +488,15 @@ function _normalize_survivor_candidates(
     data.win_probability = [
         _validate_win_probability(value) for value in data.win_probability
     ]
+    data = data[
+        data.win_probability .>= DEFAULT_SURVIVOR_MIN_MODEL_WIN_PROBABILITY,
+        :,
+    ]
+    isempty(data) &&
+        throw(ArgumentError(
+            "no survivor candidates meet the model-favorite threshold of " *
+            "$DEFAULT_SURVIVOR_MIN_MODEL_WIN_PROBABILITY",
+        ))
     if :market_spread in propertynames(data)
         data.market_spread = [
             _survivor_market_spread(value) for value in data.market_spread
@@ -704,6 +719,16 @@ function _add_logsumexp_epigraph!(
     return auxiliaries
 end
 
+function _optimize_survivor_micp!(model)
+    return Logging.with_logger(
+        Logging.SimpleLogger(stderr, Logging.Error),
+    ) do
+        redirect_stdout(devnull) do
+            optimize!(model)
+        end
+    end
+end
+
 function _survivor_selected_indices(model, selected, candidate_indices)
     return [
         index for index in candidate_indices if value(selected[index]) > 0.5
@@ -859,7 +884,7 @@ function _optimize_survivor_expected_weeks(
     @variable(model, log_cost)
     _add_logsumexp_epigraph!(model, log_cost, path_terms)
     @objective(model, Min, log_cost)
-    optimize!(model)
+    _optimize_survivor_micp!(model)
 
     JuMP.is_solved_and_feasible(model) ||
         throw(ArgumentError(

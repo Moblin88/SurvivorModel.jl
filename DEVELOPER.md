@@ -73,6 +73,8 @@ Clarabel for continuous conic subproblems. The model enumerates terminal
 elimination and end-survival paths rather than all win/loss histories; each
 path contributes one exponential-cone log-sum-exp term. Use strictly interior
 candidate win probabilities for this objective because it takes logarithms.
+Candidate rows below the model-favorite threshold of `0.5` are excluded before
+either survivor objective is solved.
 
 For a matchup-level diagnostic, use
 `SurvivorModel.expected_game_metrics`. Score-mark, drive-moment, hazard-theta,

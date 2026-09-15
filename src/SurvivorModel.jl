@@ -7,6 +7,7 @@ using Distributions
 using ForwardDiff
 using HiGHS
 using LinearAlgebra
+using Logging
 using NFLData
 using SpecialFunctions
 using Statistics
@@ -36,6 +37,7 @@ export forecast_win_probabilities
 export expected_game_win_probability
 export DEFAULT_SURVIVOR_WEEKLY_SURVIVAL_PROBABILITY
 export DEFAULT_SURVIVOR_MIN_FAVORITE_SPREAD
+export DEFAULT_SURVIVOR_MIN_MODEL_WIN_PROBABILITY
 export DEFAULT_SURVIVOR_OBJECTIVE, DEFAULT_SURVIVOR_REACH_DISCOUNT_POLICY
 export DEFAULT_SURVIVOR_MARKET_GUARD_WEEKS
 export DEFAULT_SURVIVOR_MISSING_MARKET_POLICY

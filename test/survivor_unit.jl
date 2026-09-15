@@ -125,8 +125,27 @@ end
     @testset "candidate expansion and filtering" begin
         forecast = _survivor_forecast_fixture()
         candidates = build_survivor_candidates(forecast)
-        @test nrow(candidates) == 8
-        @test Set(candidates.team) == Set(["A", "B", "C", "D", "E"])
+        @test nrow(candidates) == 6
+        @test Set(candidates.team) == Set(["A", "B", "C", "D"])
+        @test all(
+            candidates.win_probability .>=
+            DEFAULT_SURVIVOR_MIN_MODEL_WIN_PROBABILITY,
+        )
+        direct_candidates = DataFrame(
+            game_id=["direct", "direct"],
+            week=[1, 1],
+            team=["Underdog", "Favorite"],
+            opponent=["X", "Y"],
+            is_home=[false, true],
+            win_probability=[0.49, 0.51],
+        )
+        direct_plan = optimize_survivor_pool(
+            direct_candidates,
+            SurvivorPoolState(2025, 1; strikes_remaining=0);
+            selection_config=SurvivorSelectionConfig(through_week=1),
+        )
+        @test direct_plan.current_pick.team == ["Favorite"]
+
         @test candidates.win_probability[
             (candidates.week .== 1) .& (candidates.team .== "B")
         ][1] == 0.8
@@ -248,7 +267,7 @@ end
             team=["A", "B"],
             opponent=["C", "D"],
             is_home=[true, false],
-            win_probability=[0.0, 0.8],
+            win_probability=[1.0, 0.8],
         )
         @test_throws ArgumentError optimize_survivor_pool(
             endpoint_candidates,
@@ -276,6 +295,7 @@ end
         @test plan.selections.market_spread == [2.0, 3.0, -10.0]
         @test plan.current_pick.team == ["B"]
         @test DEFAULT_SURVIVOR_MIN_FAVORITE_SPREAD == 2.0
+        @test DEFAULT_SURVIVOR_MIN_MODEL_WIN_PROBABILITY == 0.5
 
         missing_line = DataFrame(
             game_id=["missing_line", "missing_line"],

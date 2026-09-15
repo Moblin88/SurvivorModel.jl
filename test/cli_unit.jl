@@ -51,6 +51,7 @@ end
             season=2023,
             initial_strikes=2,
             objective=:milp,
+            timings=false,
             refresh_data=false,
         )
         @test SurvivorModel._parse_survivor_cli_args(
@@ -62,6 +63,9 @@ end
         @test SurvivorModel._parse_survivor_cli_args(
             ["--season=2023", "--objective=micp"],
         ).objective == :micp
+        @test SurvivorModel._parse_survivor_cli_args(
+            ["--season=2023", "--timings"],
+        ).timings
         @test SurvivorModel._read_survivor_cli_picks(
             IOBuffer("KC\n\n sf \n"),
         ) == ["KC", "SF"]
@@ -69,11 +73,15 @@ end
         usage = SurvivorModel._survivor_cli_usage()
         @test !occursin("--benchmark", usage)
         @test !occursin("--clear-cache", usage)
+        @test occursin("--timings", usage)
         @test SurvivorModel._parse_survivor_cli_args(
             ["--season", "2023", "--refresh-data"],
         ).refresh_data
         @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
             ["--refresh-data", "--refresh-data"],
+        )
+        @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
+            ["--season", "2023", "--timings", "--timings"],
         )
         @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
             ["--strikes", "2"],
@@ -356,10 +364,12 @@ end
         schedule, historical, current = _survivor_context_fixture()
         mktempdir() do cache_directory
             output = IOBuffer()
+            timing_output = IOBuffer()
             exit_code = SurvivorModel._run_survivor_cli(
-                ["--season", "2023"];
+                ["--season", "2023", "--timings"];
                 input=IOBuffer("A\n"),
                 output=output,
+                timing_output=timing_output,
                 schedule=schedule,
                 historical_drives=historical,
                 current_drives=current,
@@ -369,6 +379,10 @@ end
             )
             @test exit_code == 0
             @test String(take!(output)) in ("C\n", "D\n")
+            timing_text = String(take!(timing_output))
+            @test occursin("survivor phase complete", timing_text)
+            @test occursin("optimize_start", timing_text)
+            @test occursin("optimize", timing_text)
         end
 
         completed_schedule = copy(schedule)

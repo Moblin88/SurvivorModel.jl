@@ -260,11 +260,11 @@ plan.selections
 plan.objective_value
 ```
 
-The default `:milp` optimizer expands each unplayed forecast game into a
-home-team and away-team candidate, excludes teams in `picks_made`, and solves
-one binary assignment model with JuMP and HiGHS. It selects exactly one team
-for every week in the requested horizon and allows each team to be selected at
-most once. Both options target a larger expected number of completed weeks
+The default `:milp` optimizer expands each unplayed forecast game into
+model-favorite candidates with win probability at least `0.5`, excludes teams
+in `picks_made`, and solves one binary assignment model with JuMP and HiGHS.
+It selects exactly one team for every week in the requested horizon and allows
+each team to be selected at most once. Both options target a larger expected number of completed weeks
 before elimination: `:milp` uses fixed reach discounts and a linear
 candidate-level approximation, while `:micp` evaluates selected-plan terminal
 paths with a mixed-integer conic model.
@@ -339,11 +339,11 @@ effective week is one plus the number of supplied picks; games at or after
 that week are treated as future games even when the schedule already contains
 their results, which allows replaying an earlier week of a completed season.
 The default output is only the selected team's abbreviation and a newline.
-For an opt-in phase breakdown, set `SURVIVORMODEL_TIMINGS=true`; timing
-diagnostics are written to stderr so stdout remains suitable for a picks file:
+For an opt-in phase breakdown, pass `--timings`; timing diagnostics are written
+to stderr so stdout remains suitable for a picks file:
 
 ```sh
-SURVIVORMODEL_TIMINGS=true survivor --season 2026 < picks.txt
+survivor --season 2026 --timings < picks.txt
 ```
 
 Use `--refresh-data` (or set `SURVIVORMODEL_REFRESH_DATA=true`) for an explicit

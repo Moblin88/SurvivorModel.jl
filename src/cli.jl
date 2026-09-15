@@ -1,32 +1,15 @@
 const SURVIVOR_CLI_APP_NAME = "survivor"
 
-function _survivor_cli_timings_enabled()
-    value = lowercase(strip(get(ENV, "SURVIVORMODEL_TIMINGS", "false")))
-    return value in ("1", "true", "yes", "on")
-end
-
 function _survivor_cli_refresh_data_enabled()
     value = lowercase(strip(get(ENV, "SURVIVORMODEL_REFRESH_DATA", "false")))
     return value in ("1", "true", "yes", "on")
 end
 
-function _print_survivor_cli_timings(
-    timings::AbstractVector{<:Pair};
-    output::IO=stderr,
-)
-    isempty(timings) && return nothing
-    println(output, "survivor timings (seconds):")
-    for (phase, duration) in timings
-        @printf(output, "  %-16s %.3f\n", phase, duration)
-    end
-    return nothing
-end
-
 function _survivor_cli_usage()
     return """
     Usage:
-      survivor --season YEAR [--strikes N] [--objective NAME] < picks.txt
-      julia --project=. -m SurvivorModel --season YEAR [--strikes N] [--objective NAME] < picks.txt
+      survivor --season YEAR [--strikes N] [--objective NAME] [--timings] < picks.txt
+      julia --project=. -m SurvivorModel --season YEAR [--strikes N] [--objective NAME] [--timings] < picks.txt
 
     Input:
       One team abbreviation per nonblank line, starting with week 1.
@@ -38,6 +21,7 @@ function _survivor_cli_usage()
       --objective NAME    Selection objective (default:
                           milp; use micp for the conic
                           expected-weeks strategy).
+      --timings           Print phase timings to stderr.
       --refresh-data      Clear NFLData's raw cache and refresh summarized
                           historical drive data before running.
       --help              Show this help.
@@ -62,6 +46,8 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
     strikes_specified = false
     objective = DEFAULT_SURVIVOR_OBJECTIVE
     objective_specified = false
+    timings = false
+    timings_specified = false
     refresh_data = false
     refresh_data_specified = false
     show_help = false
@@ -85,6 +71,14 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
                 throw(ArgumentError("--refresh-data may only be specified once"))
             refresh_data = true
             refresh_data_specified = true
+            index += 1
+            continue
+        end
+        if argument == "--timings"
+            timings_specified &&
+                throw(ArgumentError("--timings may only be specified once"))
+            timings = true
+            timings_specified = true
             index += 1
             continue
         end
@@ -138,6 +132,7 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
         season=0,
         initial_strikes=2,
         objective=DEFAULT_SURVIVOR_OBJECTIVE,
+        timings=false,
         refresh_data=false,
     )
     season === nothing && throw(ArgumentError("--season is required"))
@@ -149,6 +144,7 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
         season=Int(season),
         initial_strikes=Int(initial_strikes),
         objective=objective,
+        timings=timings,
         refresh_data=refresh_data,
     )
 end
@@ -283,19 +279,23 @@ function _run_survivor_cli(
     method::PriorFitMethod=DEFAULT_PRIOR_FIT_METHOD,
     max_seasons::Int=DEFAULT_HISTORICAL_SEASONS,
     through_week::Int=18,
+    timing_output::IO=stderr,
 )
-    timings_enabled = _survivor_cli_timings_enabled()
-    timings = Pair{Symbol,Float64}[]
     timing_started = time_ns()
+    timing_logger = Logging.SimpleLogger(timing_output, Logging.Info)
     record_timing = function(phase::Symbol)
         timings_enabled || return nothing
         now = time_ns()
-        push!(timings, phase => (now - timing_started) / 1.0e9)
+        duration = (now - timing_started) / 1.0e9
         timing_started = now
+        Logging.with_logger(timing_logger) do
+            @info "survivor phase complete" phase elapsed_seconds=duration
+        end
         return nothing
     end
 
     options = _parse_survivor_cli_args(args)
+    timings_enabled = options.timings
     record_timing(:parse)
     if options.show_help
         print(output, _survivor_cli_usage())
@@ -358,6 +358,7 @@ function _run_survivor_cli(
         _schedule_indexed_drives=true,
     )
     record_timing(:fit)
+    record_timing(:optimize_start)
     plan = optimize_survivor_pool(
         context;
         picks_made=state.picks_made,
@@ -373,7 +374,6 @@ function _run_survivor_cli(
         throw(ArgumentError("survivor optimization did not produce one current pick"))
     print(output, String(plan.current_pick.team[1]), '\n')
     record_timing(:output)
-    _print_survivor_cli_timings(timings)
     return 0
 end
 

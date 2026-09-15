@@ -91,18 +91,7 @@ function _drive_summary_validation_error(
     return nothing
 end
 
-function _validate_drive_summary(
-    drives,
-    season::Union{Nothing,Integer}=nothing,
-)
-    error_message = _drive_summary_validation_error(drives, season)
-    isnothing(error_message) || throw(ArgumentError(error_message))
-    return drives
-end
-
-function _drive_cache_fingerprint(drives::AbstractDataFrame)
-    _validate_drive_summary(drives)
-    data = DataFrame(drives)
+function _dataframe_fingerprint(data::AbstractDataFrame)
     io = IOBuffer()
     print(io, "rows=", nrow(data), '\0', "columns=", ncol(data), '\0')
     for name in names(data)
@@ -128,6 +117,20 @@ function _drive_cache_fingerprint(drives::AbstractDataFrame)
         state = (state ⊻ UInt64(byte)) * prime
     end
     return lowercase(string(state, base=16, pad=16))
+end
+
+function _validate_drive_summary(
+    drives,
+    season::Union{Nothing,Integer}=nothing,
+)
+    error_message = _drive_summary_validation_error(drives, season)
+    isnothing(error_message) || throw(ArgumentError(error_message))
+    return drives
+end
+
+function _drive_cache_fingerprint(drives::AbstractDataFrame)
+    _validate_drive_summary(drives)
+    return _dataframe_fingerprint(drives)
 end
 
 function _normalize_drive_cache_fingerprint(value, label::AbstractString)

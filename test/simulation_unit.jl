@@ -2,6 +2,7 @@ using DataFrames
 using Dates
 using Random
 using Test
+import SurvivorModel: simulate_renewal_schedule
 using SurvivorModel
 
 function _renewal_simulation_model_fixture(

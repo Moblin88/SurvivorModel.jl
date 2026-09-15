@@ -3,6 +3,7 @@ using DataFrames
 using Distributions
 using Statistics
 using Test
+import SurvivorModel: fit_score_marks, drive_moments, game_spread_distribution
 
 @testset "live drive model sanity" begin
     drives = load_drive_pbp(2023:2025)

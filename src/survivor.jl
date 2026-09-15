@@ -1,5 +1,13 @@
 const DEFAULT_SURVIVOR_WEEKLY_SURVIVAL_PROBABILITY = 0.65
 const DEFAULT_SURVIVOR_MIN_FAVORITE_SPREAD = 2.0
+const DEFAULT_SURVIVOR_OBJECTIVE = :discounted_expected_wins
+const DEFAULT_SURVIVOR_REACH_DISCOUNT_POLICY = :binomial
+const DEFAULT_SURVIVOR_MARKET_GUARD_WEEKS = 2
+const DEFAULT_SURVIVOR_MISSING_MARKET_POLICY = :allow
+
+const SURVIVOR_OBJECTIVES = (:discounted_expected_wins,)
+const SURVIVOR_REACH_DISCOUNT_POLICIES = (:binomial,)
+const SURVIVOR_MISSING_MARKET_POLICIES = (:allow, :exclude)
 
 """
     SurvivorPoolState
@@ -13,6 +21,74 @@ struct SurvivorPoolState
     current_week::Int
     picks_made::Dict{Int,String}
     strikes_remaining::Int
+end
+
+"""
+    SurvivorSelectionConfig(; kwargs...)
+
+Configuration for MILP survivor selection. The default values preserve the
+original discounted-expected-wins objective and two-week market guard.
+"""
+struct SurvivorSelectionConfig
+    objective::Symbol
+    weekly_survival_probability::Float64
+    reach_discount_policy::Symbol
+    minimum_favorite_spread::Union{Nothing,Float64}
+    missing_market_policy::Symbol
+    market_guard_weeks::Int
+    through_week::Int
+end
+
+function SurvivorSelectionConfig(
+    ;
+    objective::Symbol=DEFAULT_SURVIVOR_OBJECTIVE,
+    weekly_survival_probability::Real=DEFAULT_SURVIVOR_WEEKLY_SURVIVAL_PROBABILITY,
+    reach_discount_policy::Symbol=DEFAULT_SURVIVOR_REACH_DISCOUNT_POLICY,
+    minimum_favorite_spread=DEFAULT_SURVIVOR_MIN_FAVORITE_SPREAD,
+    missing_market_policy::Symbol=DEFAULT_SURVIVOR_MISSING_MARKET_POLICY,
+    market_guard_weeks::Integer=DEFAULT_SURVIVOR_MARKET_GUARD_WEEKS,
+    through_week::Integer=18,
+)
+    objective in SURVIVOR_OBJECTIVES ||
+        throw(ArgumentError(
+            "objective must be one of $(collect(SURVIVOR_OBJECTIVES)); got $objective",
+        ))
+    probability = _validate_survivor_probability(weekly_survival_probability)
+    reach_discount_policy in SURVIVOR_REACH_DISCOUNT_POLICIES ||
+        throw(ArgumentError(
+            "reach_discount_policy must be one of " *
+            "$(collect(SURVIVOR_REACH_DISCOUNT_POLICIES)); got " *
+            "$reach_discount_policy",
+        ))
+    normalized_spread = if minimum_favorite_spread === nothing
+        nothing
+    else
+        value = Float64(minimum_favorite_spread)
+        isfinite(value) && value >= 0.0 ||
+            throw(ArgumentError(
+                "minimum_favorite_spread must be nothing or a finite nonnegative value",
+            ))
+        value
+    end
+    missing_market_policy in SURVIVOR_MISSING_MARKET_POLICIES ||
+        throw(ArgumentError(
+            "missing_market_policy must be one of " *
+            "$(collect(SURVIVOR_MISSING_MARKET_POLICIES)); got " *
+            "$missing_market_policy",
+        ))
+    market_guard_weeks >= 0 ||
+        throw(ArgumentError("market_guard_weeks must be nonnegative"))
+    1 <= through_week <= 18 ||
+        throw(ArgumentError("through_week must be between 1 and 18"))
+    return SurvivorSelectionConfig(
+        objective,
+        probability,
+        reach_discount_policy,
+        normalized_spread,
+        missing_market_policy,
+        Int(market_guard_weeks),
+        Int(through_week),
+    )
 end
 
 function _normalize_survivor_picks(picks_made)
@@ -81,7 +157,8 @@ end
 The selected forward plan returned by `optimize_survivor_pool`. `selections`
 contains one row per planned week, `current_pick` contains the current week's
 single selected row, and `discounts` records the fixed personal reach
-discount used for each week.
+discount used for each week. `selection_config` records the effective MILP
+objective and eligibility policies.
 """
 struct SurvivorPoolPlan
     state::SurvivorPoolState
@@ -89,6 +166,7 @@ struct SurvivorPoolPlan
     current_pick::DataFrame
     discounts::DataFrame
     objective_value::Float64
+    selection_config::SurvivorSelectionConfig
 end
 
 function _validate_survivor_probability(probability::Real)
@@ -110,20 +188,24 @@ function _survivor_market_eligible(
     week::Integer,
     market_spread,
     state::SurvivorPoolState,
+    config::SurvivorSelectionConfig,
 )
-    protected_week = week == state.current_week ||
-        week == state.current_week + 1
-    return !protected_week ||
-        ismissing(market_spread) ||
-        market_spread >= DEFAULT_SURVIVOR_MIN_FAVORITE_SPREAD
+    config.minimum_favorite_spread === nothing && return true
+    protected_week = state.current_week <= week <
+        state.current_week + config.market_guard_weeks
+    !protected_week && return true
+    ismissing(market_spread) &&
+        return config.missing_market_policy === :allow
+    return market_spread >= config.minimum_favorite_spread
 end
 
 function _survivor_market_guard_mask(
     candidates::AbstractDataFrame,
     state::SurvivorPoolState,
+    config::SurvivorSelectionConfig,
 )
     return [
-        _survivor_market_eligible(week, market_spread, state)
+        _survivor_market_eligible(week, market_spread, state, config)
         for (week, market_spread) in zip(
             candidates.week,
             candidates.market_spread,
@@ -147,12 +229,19 @@ function survivor_reach_discounts(
     number_of_weeks::Integer;
     weekly_survival_probability::Real=DEFAULT_SURVIVOR_WEEKLY_SURVIVAL_PROBABILITY,
     strikes_remaining::Integer=0,
+    reach_discount_policy::Symbol=DEFAULT_SURVIVOR_REACH_DISCOUNT_POLICY,
 )
     number_of_weeks >= 0 ||
         throw(ArgumentError("number_of_weeks must be nonnegative"))
     strikes_remaining >= 0 ||
         throw(ArgumentError("strikes_remaining must be nonnegative"))
     probability = _validate_survivor_probability(weekly_survival_probability)
+    reach_discount_policy in SURVIVOR_REACH_DISCOUNT_POLICIES ||
+        throw(ArgumentError(
+            "reach_discount_policy must be one of " *
+            "$(collect(SURVIVOR_REACH_DISCOUNT_POLICIES)); got " *
+            "$reach_discount_policy",
+        ))
     number_of_weeks == 0 && return Float64[]
 
     discounts = Float64[]
@@ -185,6 +274,7 @@ function survivor_reach_discounts(
     through_week::Integer;
     weekly_survival_probability::Real=DEFAULT_SURVIVOR_WEEKLY_SURVIVAL_PROBABILITY,
     strikes_remaining::Integer=0,
+    reach_discount_policy::Symbol=DEFAULT_SURVIVOR_REACH_DISCOUNT_POLICY,
 )
     1 <= current_week <= through_week <= 18 ||
         throw(ArgumentError("week range must be within 1:18"))
@@ -192,6 +282,7 @@ function survivor_reach_discounts(
         through_week - current_week + 1;
         weekly_survival_probability=weekly_survival_probability,
         strikes_remaining=strikes_remaining,
+        reach_discount_policy=reach_discount_policy,
     )
 end
 
@@ -391,50 +482,79 @@ end
 
 function _survivor_discount_table(
     state::SurvivorPoolState,
-    through_week::Integer,
-    weekly_survival_probability::Real,
+    config::SurvivorSelectionConfig,
 )
     discounts = survivor_reach_discounts(
         state.current_week,
-        through_week;
-        weekly_survival_probability=weekly_survival_probability,
+        config.through_week;
+        weekly_survival_probability=config.weekly_survival_probability,
         strikes_remaining=state.strikes_remaining,
+        reach_discount_policy=config.reach_discount_policy,
     )
     return DataFrame(
-        week=collect(state.current_week:through_week),
+        week=collect(state.current_week:config.through_week),
         discount=discounts,
     )
+end
+
+function _survivor_objective_contribution(
+    probability::Real,
+    discount::Real,
+    objective::Symbol,
+)
+    objective === :discounted_expected_wins &&
+        return Float64(discount) * Float64(probability)
+    throw(ArgumentError("unsupported survivor objective: $objective"))
 end
 
 """
     optimize_survivor_pool(candidates, state; ...)
 
 Solve the survivor assignment problem from an injected team-level candidate
-table. The objective maximizes expected future wins using fixed personal reach
-discounts; it does not model the probability that the entire pool survives.
+table. `selection_config` controls the objective, reach discounts, market
+guard, missing-line policy, and planning horizon. The default objective
+maximizes expected future wins using fixed personal reach discounts; it does
+not model the probability that the entire pool survives.
 """
 function optimize_survivor_pool(
     candidates::AbstractDataFrame,
     state::SurvivorPoolState;
-    weekly_survival_probability::Real=DEFAULT_SURVIVOR_WEEKLY_SURVIVAL_PROBABILITY,
-    through_week::Integer=18,
+    selection_config::SurvivorSelectionConfig=SurvivorSelectionConfig(),
     optimizer=HiGHS.Optimizer,
 )
-    probability = _validate_survivor_probability(weekly_survival_probability)
-    data = _normalize_survivor_candidates(candidates, state, through_week)
-    discount_table = _survivor_discount_table(state, through_week, probability)
+    config = selection_config
+    state.current_week <= config.through_week ||
+        throw(ArgumentError(
+            "selection through_week must be at least the current week",
+        ))
+    data = _normalize_survivor_candidates(
+        candidates,
+        state,
+        config.through_week,
+    )
+    discount_table = _survivor_discount_table(state, config)
     discount_by_week = Dict(
         row.week => row.discount for row in eachrow(discount_table)
     )
     data.discount = [discount_by_week[week] for week in data.week]
-    data.objective_contribution = data.discount .* data.win_probability
+    data.objective_contribution = [
+        _survivor_objective_contribution(
+            probability,
+            discount,
+            config.objective,
+        )
+        for (probability, discount) in zip(
+            data.win_probability,
+            data.discount,
+        )
+    ]
 
     model = Model(optimizer)
     set_silent(model)
     candidate_indices = 1:nrow(data)
     @variable(model, selected[candidate_indices], Bin)
 
-    for week in state.current_week:through_week
+    for week in state.current_week:config.through_week
         indices = findall(==(week), data.week)
         @constraint(model, sum(selected[index] for index in indices) == 1)
     end
@@ -442,7 +562,7 @@ function optimize_survivor_pool(
         indices = findall(==(team), data.team)
         @constraint(model, sum(selected[index] for index in indices) <= 1)
     end
-    market_eligible = _survivor_market_guard_mask(data, state)
+    market_eligible = _survivor_market_guard_mask(data, state, config)
     for index in candidate_indices
         market_eligible[index] || @constraint(model, selected[index] == 0)
     end
@@ -472,6 +592,7 @@ function optimize_survivor_pool(
         current_pick,
         discount_table,
         Float64(objective_value(model)),
+        config,
     )
 end
 
@@ -484,8 +605,7 @@ assignment model using those probabilities.
 function optimize_survivor_pool(
     context::RegularSeasonForecastContext,
     state::SurvivorPoolState;
-    weekly_survival_probability::Real=DEFAULT_SURVIVOR_WEEKLY_SURVIVAL_PROBABILITY,
-    through_week::Integer=18,
+    selection_config::SurvivorSelectionConfig=SurvivorSelectionConfig(),
     include_completed::Bool=false,
     horizon::Real=GAME_CLOCK_SECONDS,
     optimizer=HiGHS.Optimizer,
@@ -496,7 +616,7 @@ function optimize_survivor_pool(
         throw(ArgumentError("survivor state current_week must match context as_of_week"))
     candidates = build_survivor_candidates(
         context;
-        through_week=through_week,
+        through_week=selection_config.through_week,
         include_completed=include_completed,
         picks_made=state.picks_made,
         horizon=horizon,
@@ -504,8 +624,7 @@ function optimize_survivor_pool(
     return optimize_survivor_pool(
         candidates,
         state;
-        weekly_survival_probability=weekly_survival_probability,
-        through_week=through_week,
+        selection_config=selection_config,
         optimizer=optimizer,
     )
 end
@@ -522,8 +641,7 @@ function optimize_survivor_pool(
     as_of_week::Integer,
     picks_made=Dict{Int,String}(),
     strikes_remaining::Integer=1,
-    weekly_survival_probability::Real=DEFAULT_SURVIVOR_WEEKLY_SURVIVAL_PROBABILITY,
-    through_week::Integer=18,
+    selection_config::SurvivorSelectionConfig=SurvivorSelectionConfig(),
     schedule::Union{Nothing,AbstractDataFrame}=nothing,
     historical_drives::Union{Nothing,AbstractDataFrame}=nothing,
     current_drives::Union{Nothing,AbstractDataFrame}=nothing,
@@ -553,8 +671,7 @@ function optimize_survivor_pool(
     return optimize_survivor_pool(
         context,
         state;
-        weekly_survival_probability=weekly_survival_probability,
-        through_week=through_week,
+        selection_config=selection_config,
         include_completed=include_completed,
         horizon=horizon,
         optimizer=optimizer,
@@ -565,8 +682,7 @@ function optimize_survivor_pool(
     context::RegularSeasonForecastContext;
     picks_made=Dict{Int,String}(),
     strikes_remaining::Integer=1,
-    weekly_survival_probability::Real=DEFAULT_SURVIVOR_WEEKLY_SURVIVAL_PROBABILITY,
-    through_week::Integer=18,
+    selection_config::SurvivorSelectionConfig=SurvivorSelectionConfig(),
     include_completed::Bool=false,
     horizon::Real=GAME_CLOCK_SECONDS,
     optimizer=HiGHS.Optimizer,
@@ -580,8 +696,7 @@ function optimize_survivor_pool(
     return optimize_survivor_pool(
         context,
         state;
-        weekly_survival_probability=weekly_survival_probability,
-        through_week=through_week,
+        selection_config=selection_config,
         include_completed=include_completed,
         horizon=horizon,
         optimizer=optimizer,

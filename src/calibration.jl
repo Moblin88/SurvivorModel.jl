@@ -7,11 +7,22 @@ const DEFAULT_SPREAD_TOLERANCE = 1.0e-9
 """
     CalibrationReport
 
-Per-game probability and score-difference calibration observations, summary
-metrics by season and cutoff week, fixed-bin reliability tables, and
-predictive-interval coverage tables.
+Per-game probability calibration observations, summary metrics by season and
+cutoff week, and fixed-bin reliability tables.
 """
 struct CalibrationReport
+    games::DataFrame
+    summary::DataFrame
+    reliability::DataFrame
+end
+
+"""
+    CalibrationResearchReport
+
+Probability calibration observations and score-difference diagnostics for
+research and developer analysis.
+"""
+struct CalibrationResearchReport
     games::DataFrame
     summary::DataFrame
     reliability::DataFrame
@@ -21,18 +32,20 @@ struct CalibrationReport
     spread_coverage::DataFrame
 end
 
-CalibrationReport(
-    games::DataFrame,
-    summary::DataFrame,
-    reliability::DataFrame,
-) = CalibrationReport(
-    games,
-    summary,
-    reliability,
-    DataFrame(),
-    DataFrame(),
-    DataFrame(),
-    DataFrame(),
+CalibrationResearchReport(
+    report::CalibrationReport,
+    spread_games::DataFrame,
+    spread_summary::DataFrame,
+    spread_reliability::DataFrame,
+    spread_coverage::DataFrame,
+) = CalibrationResearchReport(
+    report.games,
+    report.summary,
+    report.reliability,
+    spread_games,
+    spread_summary,
+    spread_reliability,
+    spread_coverage,
 )
 
 function _calibration_vectors(predicted, actual)
@@ -494,28 +507,7 @@ function _append_spread_coverage_metadata!(
     )
 end
 
-"""
-    evaluate_calibration(
-        seasons=nothing;
-        cutoff_weeks=DEFAULT_CALIBRATION_CUTOFF_WEEKS,
-        schedule=nothing,
-        drives=nothing,
-        max_seasons=DEFAULT_HISTORICAL_SEASONS,
-        recent_seasons=3,
-        time_edges=DEFAULT_TIME_EDGES,
-        probability_bins=DEFAULT_PROBABILITY_BINS,
-        spread_bins=DEFAULT_SPREAD_BINS,
-        interval_levels=DEFAULT_SPREAD_INTERVAL_LEVELS,
-        spread_tolerance=DEFAULT_SPREAD_TOLERANCE,
-    ) -> CalibrationReport
-
-Evaluate fixed pre-week win-probability and score-difference snapshots for
-completed games in the requested seasons. When `seasons` is omitted, the most
-recent `recent_seasons` completed regular seasons in the schedule are selected.
-Schedule and drive data can be injected to reuse data across multiple seasons
-and cutoffs without downloading it repeatedly.
-"""
-function evaluate_calibration(
+function _evaluate_calibration(
     seasons=nothing;
     cutoff_weeks=DEFAULT_CALIBRATION_CUTOFF_WEEKS,
     schedule::Union{Nothing,AbstractDataFrame}=nothing,
@@ -524,6 +516,7 @@ function evaluate_calibration(
     recent_seasons::Int=3,
     time_edges=DEFAULT_TIME_EDGES,
     probability_bins=DEFAULT_PROBABILITY_BINS,
+    include_spread::Bool=false,
     spread_bins=DEFAULT_SPREAD_BINS,
     interval_levels=DEFAULT_SPREAD_INTERVAL_LEVELS,
     spread_tolerance::Real=DEFAULT_SPREAD_TOLERANCE,
@@ -533,9 +526,13 @@ function evaluate_calibration(
     recent_seasons > 0 ||
         throw(ArgumentError("recent_seasons must be positive"))
     _validate_probability_bins(probability_bins)
-    _validate_spread_bins(spread_bins)
-    _validate_interval_levels(interval_levels)
-    spread_tolerance_value = _validate_spread_tolerance(spread_tolerance)
+    if include_spread
+        _validate_spread_bins(spread_bins)
+        _validate_interval_levels(interval_levels)
+    end
+    spread_tolerance_value = include_spread ?
+        _validate_spread_tolerance(spread_tolerance) :
+        DEFAULT_SPREAD_TOLERANCE
 
     normalized_schedule = schedule === nothing ? load_schedule() : load_schedule(schedule)
     season_values = isnothing(seasons) ?
@@ -653,138 +650,140 @@ function evaluate_calibration(
                 ),
             )
 
-            spreads = forecast_spreads(
-                context;
-                include_completed=true,
-                full_schedule=false,
-            )
-            nrow(spreads) == nrow(probabilities) ||
-                throw(ArgumentError(
-                    "probability and spread forecasts returned different game counts",
-                ))
-            all(spreads.game_id .== probabilities.game_id) ||
-                throw(ArgumentError(
-                    "probability and spread forecasts returned different games",
-                ))
-            scored_spreads = spreads[.!ismissing.(spreads.result), :]
-            expected_spreads = Float64.(scored_spreads.expected_spread)
-            predictive_variances = _predictive_variances(
-                scored_spreads.predictive_spread_variance,
-                length(expected_spreads),
-            )
-            actual_margins = Float64.(scored_spreads.result)
-            margin_errors = actual_margins .- expected_spreads
-            standardized_errors = margin_errors ./ sqrt.(predictive_variances)
+            if include_spread
+                spreads = forecast_spreads(
+                    context;
+                    include_completed=true,
+                    full_schedule=false,
+                )
+                nrow(spreads) == nrow(probabilities) ||
+                    throw(ArgumentError(
+                        "probability and spread forecasts returned different game counts",
+                    ))
+                all(spreads.game_id .== probabilities.game_id) ||
+                    throw(ArgumentError(
+                        "probability and spread forecasts returned different games",
+                    ))
+                scored_spreads = spreads[.!ismissing.(spreads.result), :]
+                expected_spreads = Float64.(scored_spreads.expected_spread)
+                predictive_variances = _predictive_variances(
+                    scored_spreads.predictive_spread_variance,
+                    length(expected_spreads),
+                )
+                actual_margins = Float64.(scored_spreads.result)
+                margin_errors = actual_margins .- expected_spreads
+                standardized_errors = margin_errors ./ sqrt.(predictive_variances)
 
-            for row_index in 1:nrow(scored_spreads)
-                row = scored_spreads[row_index, :]
-                error = margin_errors[row_index]
-                above = error > spread_tolerance_value
-                below = error < -spread_tolerance_value
-                push!(
-                    spread_game_rows,
+                for row_index in 1:nrow(scored_spreads)
+                    row = scored_spreads[row_index, :]
+                    error = margin_errors[row_index]
+                    above = error > spread_tolerance_value
+                    below = error < -spread_tolerance_value
+                    push!(
+                        spread_game_rows,
+                        (
+                            season=Int(season),
+                            as_of_week=Int(as_of_week),
+                            game_id=string(row.game_id),
+                            week=Int(row.week),
+                            away_team=string(row.away_team),
+                            home_team=string(row.home_team),
+                            expected_spread=expected_spreads[row_index],
+                            predictive_spread_variance=predictive_variances[row_index],
+                            actual_home_margin=actual_margins[row_index],
+                            spread_error=error,
+                            standardized_error=standardized_errors[row_index],
+                            home_above_forecast=above,
+                            away_above_forecast=below,
+                            model_line_push=!(above || below),
+                            result=row.result,
+                        ),
+                    )
+                end
+
+                scored_spread_games = length(expected_spreads)
+                spread_summary = if scored_spread_games == 0
                     (
                         season=Int(season),
                         as_of_week=Int(as_of_week),
-                        game_id=string(row.game_id),
-                        week=Int(row.week),
-                        away_team=string(row.away_team),
-                        home_team=string(row.home_team),
-                        expected_spread=expected_spreads[row_index],
-                        predictive_spread_variance=predictive_variances[row_index],
-                        actual_home_margin=actual_margins[row_index],
-                        spread_error=error,
-                        standardized_error=standardized_errors[row_index],
-                        home_above_forecast=above,
-                        away_above_forecast=below,
-                        model_line_push=!(above || below),
-                        result=row.result,
+                        forecasted_games=nrow(spreads),
+                        scored_games=0,
+                        mean_predicted_spread=missing,
+                        mean_actual_margin=missing,
+                        mean_error=missing,
+                        mean_absolute_error=missing,
+                        rmse=missing,
+                        mean_predictive_standard_deviation=missing,
+                        mean_standardized_error=missing,
+                        standardized_error_sd=missing,
+                        above_forecast_rate=missing,
+                        below_forecast_rate=missing,
+                        push_rate=missing,
+                    )
+                else
+                    metrics = score_difference_metrics(
+                        expected_spreads,
+                        actual_margins;
+                        tolerance=spread_tolerance_value,
+                    )
+                    (
+                        season=Int(season),
+                        as_of_week=Int(as_of_week),
+                        forecasted_games=nrow(spreads),
+                        scored_games=scored_spread_games,
+                        mean_predicted_spread=metrics.mean_predicted,
+                        mean_actual_margin=metrics.mean_actual,
+                        mean_error=metrics.mean_error,
+                        mean_absolute_error=metrics.mean_absolute_error,
+                        rmse=metrics.rmse,
+                        mean_predictive_standard_deviation=mean(
+                            sqrt.(predictive_variances)
+                        ),
+                        mean_standardized_error=mean(standardized_errors),
+                        standardized_error_sd=std(
+                            standardized_errors;
+                            corrected=false,
+                        ),
+                        above_forecast_rate=metrics.above_forecast_rate,
+                        below_forecast_rate=metrics.below_forecast_rate,
+                        push_rate=metrics.push_rate,
+                    )
+                end
+                push!(spread_summary_rows, spread_summary)
+
+                spread_reliability = scored_spread_games == 0 ?
+                    _empty_spread_reliability_bins(spread_bins) :
+                    spread_reliability_bins(
+                        expected_spreads,
+                        actual_margins;
+                        spread_bins=spread_bins,
+                    )
+                push!(
+                    spread_reliability_tables,
+                    _append_spread_reliability_metadata!(
+                        spread_reliability,
+                        season,
+                        as_of_week,
+                    ),
+                )
+
+                spread_coverage = scored_spread_games == 0 ?
+                    _empty_spread_coverage(interval_levels) :
+                    spread_interval_coverage(
+                        expected_spreads,
+                        predictive_variances,
+                        actual_margins;
+                        interval_levels=interval_levels,
+                    )
+                push!(
+                    spread_coverage_tables,
+                    _append_spread_coverage_metadata!(
+                        spread_coverage,
+                        season,
+                        as_of_week,
                     ),
                 )
             end
-
-            scored_spread_games = length(expected_spreads)
-            spread_summary = if scored_spread_games == 0
-                (
-                    season=Int(season),
-                    as_of_week=Int(as_of_week),
-                    forecasted_games=nrow(spreads),
-                    scored_games=0,
-                    mean_predicted_spread=missing,
-                    mean_actual_margin=missing,
-                    mean_error=missing,
-                    mean_absolute_error=missing,
-                    rmse=missing,
-                    mean_predictive_standard_deviation=missing,
-                    mean_standardized_error=missing,
-                    standardized_error_sd=missing,
-                    above_forecast_rate=missing,
-                    below_forecast_rate=missing,
-                    push_rate=missing,
-                )
-            else
-                metrics = score_difference_metrics(
-                    expected_spreads,
-                    actual_margins;
-                    tolerance=spread_tolerance_value,
-                )
-                (
-                    season=Int(season),
-                    as_of_week=Int(as_of_week),
-                    forecasted_games=nrow(spreads),
-                    scored_games=scored_spread_games,
-                    mean_predicted_spread=metrics.mean_predicted,
-                    mean_actual_margin=metrics.mean_actual,
-                    mean_error=metrics.mean_error,
-                    mean_absolute_error=metrics.mean_absolute_error,
-                    rmse=metrics.rmse,
-                    mean_predictive_standard_deviation=mean(
-                        sqrt.(predictive_variances)
-                    ),
-                    mean_standardized_error=mean(standardized_errors),
-                    standardized_error_sd=std(
-                        standardized_errors;
-                        corrected=false,
-                    ),
-                    above_forecast_rate=metrics.above_forecast_rate,
-                    below_forecast_rate=metrics.below_forecast_rate,
-                    push_rate=metrics.push_rate,
-                )
-            end
-            push!(spread_summary_rows, spread_summary)
-
-            spread_reliability = scored_spread_games == 0 ?
-                _empty_spread_reliability_bins(spread_bins) :
-                spread_reliability_bins(
-                    expected_spreads,
-                    actual_margins;
-                    spread_bins=spread_bins,
-                )
-            push!(
-                spread_reliability_tables,
-                _append_spread_reliability_metadata!(
-                    spread_reliability,
-                    season,
-                    as_of_week,
-                ),
-            )
-
-            spread_coverage = scored_spread_games == 0 ?
-                _empty_spread_coverage(interval_levels) :
-                spread_interval_coverage(
-                    expected_spreads,
-                    predictive_variances,
-                    actual_margins;
-                    interval_levels=interval_levels,
-                )
-            push!(
-                spread_coverage_tables,
-                _append_spread_coverage_metadata!(
-                    spread_coverage,
-                    season,
-                    as_of_week,
-                ),
-            )
         end
     end
 
@@ -798,13 +797,103 @@ function evaluate_calibration(
         DataFrame() : vcat(spread_reliability_tables...; cols=:union)
     spread_coverage = isempty(spread_coverage_tables) ?
         DataFrame() : vcat(spread_coverage_tables...; cols=:union)
-    return CalibrationReport(
-        games,
-        summary,
-        reliability,
+    report = CalibrationReport(games, summary, reliability)
+    include_spread || return report
+    return CalibrationResearchReport(
+        report,
         spread_games,
         spread_summary,
         spread_reliability,
         spread_coverage,
+    )
+end
+
+"""
+    evaluate_calibration(
+        seasons=nothing;
+        cutoff_weeks=DEFAULT_CALIBRATION_CUTOFF_WEEKS,
+        schedule=nothing,
+        drives=nothing,
+        max_seasons=DEFAULT_HISTORICAL_SEASONS,
+        recent_seasons=3,
+        time_edges=DEFAULT_TIME_EDGES,
+        probability_bins=DEFAULT_PROBABILITY_BINS,
+    ) -> CalibrationReport
+
+Evaluate fixed pre-week win-probability snapshots for completed games in the
+requested seasons. When `seasons` is omitted, the most recent
+`recent_seasons` completed regular seasons in the schedule are selected.
+Schedule and drive data can be injected to reuse data across multiple seasons
+and cutoffs without downloading it repeatedly.
+"""
+function evaluate_calibration(
+    seasons=nothing;
+    cutoff_weeks=DEFAULT_CALIBRATION_CUTOFF_WEEKS,
+    schedule::Union{Nothing,AbstractDataFrame}=nothing,
+    drives::Union{Nothing,AbstractDataFrame}=nothing,
+    max_seasons::Int=DEFAULT_HISTORICAL_SEASONS,
+    recent_seasons::Int=3,
+    time_edges=DEFAULT_TIME_EDGES,
+    probability_bins=DEFAULT_PROBABILITY_BINS,
+)
+    return _evaluate_calibration(
+        seasons;
+        cutoff_weeks=cutoff_weeks,
+        schedule=schedule,
+        drives=drives,
+        max_seasons=max_seasons,
+        recent_seasons=recent_seasons,
+        time_edges=time_edges,
+        probability_bins=probability_bins,
+        include_spread=false,
+    )
+end
+
+"""
+    evaluate_calibration_research(
+        seasons=nothing;
+        cutoff_weeks=DEFAULT_CALIBRATION_CUTOFF_WEEKS,
+        schedule=nothing,
+        drives=nothing,
+        max_seasons=DEFAULT_HISTORICAL_SEASONS,
+        recent_seasons=3,
+        time_edges=DEFAULT_TIME_EDGES,
+        probability_bins=DEFAULT_PROBABILITY_BINS,
+        spread_bins=DEFAULT_SPREAD_BINS,
+        interval_levels=DEFAULT_SPREAD_INTERVAL_LEVELS,
+        spread_tolerance=DEFAULT_SPREAD_TOLERANCE,
+    ) -> CalibrationResearchReport
+
+Evaluate probability and score-difference calibration snapshots for completed
+games in the requested seasons. The returned research report includes the
+probability-focused report fields plus spread-error, spread-reliability, and
+predictive-interval coverage diagnostics.
+"""
+function evaluate_calibration_research(
+    seasons=nothing;
+    cutoff_weeks=DEFAULT_CALIBRATION_CUTOFF_WEEKS,
+    schedule::Union{Nothing,AbstractDataFrame}=nothing,
+    drives::Union{Nothing,AbstractDataFrame}=nothing,
+    max_seasons::Int=DEFAULT_HISTORICAL_SEASONS,
+    recent_seasons::Int=3,
+    time_edges=DEFAULT_TIME_EDGES,
+    probability_bins=DEFAULT_PROBABILITY_BINS,
+    spread_bins=DEFAULT_SPREAD_BINS,
+    interval_levels=DEFAULT_SPREAD_INTERVAL_LEVELS,
+    spread_tolerance::Real=DEFAULT_SPREAD_TOLERANCE,
+)
+    return _evaluate_calibration(
+        seasons;
+        cutoff_weeks=cutoff_weeks,
+        schedule=schedule,
+        drives=drives,
+        max_seasons=max_seasons,
+        recent_seasons=recent_seasons,
+        time_edges=time_edges,
+        probability_bins=probability_bins,
+        include_spread=true,
+        spread_bins=spread_bins,
+        interval_levels=interval_levels,
+        spread_tolerance=spread_tolerance,
     )
 end

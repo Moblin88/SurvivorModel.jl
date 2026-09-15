@@ -5,6 +5,12 @@ using Distributions
 using Random
 using Statistics
 using Test
+import SurvivorModel: EMECMEFit, EMLBFGSFit, DirectLBFGSFit, DirectBFGSFit
+import SurvivorModel: MomentFit, MomentLBFGSFit, HybridFit, BlockNewtonFit
+import SurvivorModel: SchurNewtonFit, ScoreMarks, DriveMoments
+import SurvivorModel: ExpectedGameMetrics, fit_score_marks, drive_moments
+import SurvivorModel: hazard_theta, game_spread_distribution
+import SurvivorModel: expected_game_metrics
 
 @testset "model unit tests" begin
     @testset "_classify_event" begin

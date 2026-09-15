@@ -99,11 +99,22 @@ end
 
 @testset "calibration metrics" begin
     @testset "report compatibility" begin
-        legacy = CalibrationReport(DataFrame(), DataFrame(), DataFrame())
-        @test isempty(legacy.spread_games)
-        @test isempty(legacy.spread_summary)
-        @test isempty(legacy.spread_reliability)
-        @test isempty(legacy.spread_coverage)
+        report = CalibrationReport(DataFrame(), DataFrame(), DataFrame())
+        @test fieldnames(CalibrationReport) ==
+            (:games, :summary, :reliability)
+        @test !hasproperty(report, :spread_games)
+
+        research = SurvivorModel.CalibrationResearchReport(
+            report,
+            DataFrame(),
+            DataFrame(),
+            DataFrame(),
+            DataFrame(),
+        )
+        @test isempty(research.spread_games)
+        @test isempty(research.spread_summary)
+        @test isempty(research.spread_reliability)
+        @test isempty(research.spread_coverage)
     end
 
     @testset "scores and ties" begin
@@ -119,7 +130,7 @@ end
     @testset "score-difference metrics" begin
         predicted = [-2.0, 0.0, 3.0, 4.0]
         actual = [-1.0, 1.0, 1.0, 4.0]
-        metrics = score_difference_metrics(predicted, actual)
+        metrics = SurvivorModel.score_difference_metrics(predicted, actual)
 
         @test metrics.n_games == 4
         @test metrics.mean_predicted ≈ 1.25
@@ -131,7 +142,7 @@ end
         @test metrics.below_forecast_rate ≈ 0.25
         @test metrics.push_rate ≈ 0.25
 
-        reliability = spread_reliability_bins(
+        reliability = SurvivorModel.spread_reliability_bins(
             predicted,
             actual;
             spread_bins=[-Inf, 0.0, Inf],
@@ -141,7 +152,7 @@ end
         @test reliability.mean_actual_margin[1] ≈ -1.0
         @test reliability.mean_error[2] ≈ -1 / 3
 
-        coverage = spread_interval_coverage(
+        coverage = SurvivorModel.spread_interval_coverage(
             [0.0, 0.0],
             [1.0, 1.0],
             [0.0, 2.0];
@@ -150,7 +161,7 @@ end
         @test coverage.covered_games == [1, 1]
         @test coverage.coverage ≈ [0.5, 0.5]
         @test quantile(Normal(), 0.975) > 1.9
-        @test_throws ArgumentError spread_interval_coverage(
+        @test_throws ArgumentError SurvivorModel.spread_interval_coverage(
             [0.0],
             [-1.0],
             [0.0],
@@ -180,6 +191,13 @@ end
             drives=vcat(historical, current; cols=:union),
             time_edges=[0, Inf],
         )
+        research = SurvivorModel.evaluate_calibration_research(
+            2023;
+            cutoff_weeks=[1, 2],
+            schedule=schedule,
+            drives=vcat(historical, current; cols=:union),
+            time_edges=[0, Inf],
+        )
 
         @test report.summary.season == [2023, 2023]
         @test report.summary.as_of_week == [1, 2]
@@ -194,16 +212,22 @@ end
         @test all(isfinite, report.summary.mean_predicted)
         @test all(isfinite, report.summary.observed_rate)
         @test sum(report.reliability.n_games) == nrow(report.games)
-        @test nrow(report.spread_games) == 3
-        @test report.spread_summary.scored_games == [2, 1]
-        @test all(isfinite, report.spread_games.expected_spread)
-        @test all(isfinite, report.spread_games.standardized_error)
-        @test sum(report.spread_reliability.n_games) ==
-            nrow(report.spread_games)
-        @test all(0.0 .<= report.spread_coverage.coverage .<= 1.0)
+        @test !hasproperty(report, :spread_games)
+        @test report.games.home_win_probability ==
+            research.games.home_win_probability
+        @test report.summary.brier_score == research.summary.brier_score
+        @test report.summary.log_loss == research.summary.log_loss
+
+        @test nrow(research.spread_games) == 3
+        @test research.spread_summary.scored_games == [2, 1]
+        @test all(isfinite, research.spread_games.expected_spread)
+        @test all(isfinite, research.spread_games.standardized_error)
+        @test sum(research.spread_reliability.n_games) ==
+            nrow(research.spread_games)
+        @test all(0.0 .<= research.spread_coverage.coverage .<= 1.0)
         @test all(
-            report.spread_coverage.covered_games .<=
-            report.spread_coverage.n_games
+            research.spread_coverage.covered_games .<=
+            research.spread_coverage.n_games
         )
 
         without_future = evaluate_calibration(
@@ -213,12 +237,19 @@ end
             drives=vcat(historical, current[1:2, :]; cols=:union),
             time_edges=[0, Inf],
         )
+        without_future_research = SurvivorModel.evaluate_calibration_research(
+            2023;
+            cutoff_weeks=[1, 2],
+            schedule=schedule,
+            drives=vcat(historical, current[1:2, :]; cols=:union),
+            time_edges=[0, Inf],
+        )
         @test report.games.home_win_probability ≈
             without_future.games.home_win_probability
-        @test report.spread_games.expected_spread ≈
-            without_future.spread_games.expected_spread
-        @test report.spread_games.predictive_spread_variance ≈
-            without_future.spread_games.predictive_spread_variance
+        @test research.spread_games.expected_spread ≈
+            without_future_research.spread_games.expected_spread
+        @test research.spread_games.predictive_spread_variance ≈
+            without_future_research.spread_games.predictive_spread_variance
 
         no_scored_games = evaluate_calibration(
             2023;
@@ -227,12 +258,19 @@ end
             drives=vcat(historical, current; cols=:union),
             time_edges=[0, Inf],
         )
+        no_scored_research = SurvivorModel.evaluate_calibration_research(
+            2023;
+            cutoff_weeks=[18],
+            schedule=schedule,
+            drives=vcat(historical, current; cols=:union),
+            time_edges=[0, Inf],
+        )
         @test no_scored_games.summary.scored_games == [0]
         @test all(iszero, no_scored_games.reliability.n_games)
-        @test no_scored_games.spread_summary.scored_games == [0]
-        @test all(iszero, no_scored_games.spread_reliability.n_games)
-        @test all(iszero, no_scored_games.spread_coverage.n_games)
-        @test all(iszero, no_scored_games.spread_coverage.covered_games)
+        @test no_scored_research.spread_summary.scored_games == [0]
+        @test all(iszero, no_scored_research.spread_reliability.n_games)
+        @test all(iszero, no_scored_research.spread_coverage.n_games)
+        @test all(iszero, no_scored_research.spread_coverage.covered_games)
     end
 
     @testset "recent completed season selection" begin

@@ -2,6 +2,8 @@ using SurvivorModel
 using DataFrames
 using Dates
 using Test
+import SurvivorModel: DirectLBFGSFit, forecast_spreads, forecast_regular_season
+import SurvivorModel: hazard_theta, expected_game_metrics
 
 function _forecast_fixture()
     schedule = DataFrame(

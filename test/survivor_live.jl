@@ -354,7 +354,14 @@ function _survivor_live_backtest_season(
             )
             current_pick = if scenario.strategy == :model
                 market_eligible = candidates[
-                    SurvivorModel._survivor_market_guard_mask(candidates, state),
+                    SurvivorModel._survivor_market_guard_mask(
+                        candidates,
+                        state,
+                        SurvivorSelectionConfig(
+                            weekly_survival_probability=weekly_survival_probability,
+                            through_week=last_week,
+                        ),
+                    ),
                     :,
                 ]
                 if !any(market_eligible.week .== week)
@@ -382,8 +389,10 @@ function _survivor_live_backtest_season(
                 plan = optimize_survivor_pool(
                     candidates,
                     state;
-                    weekly_survival_probability=weekly_survival_probability,
-                    through_week=last_week,
+                    selection_config=SurvivorSelectionConfig(
+                        weekly_survival_probability=weekly_survival_probability,
+                        through_week=last_week,
+                    ),
                 )
                 plan.current_pick
             else

@@ -150,8 +150,10 @@ end
         plan = optimize_survivor_pool(
             build_survivor_candidates(_survivor_forecast_fixture()),
             state;
-            through_week=2,
-            weekly_survival_probability=0.65,
+            selection_config=SurvivorSelectionConfig(
+                through_week=2,
+                weekly_survival_probability=0.65,
+            ),
         )
         @test plan.selections.week == [1, 2]
         @test plan.selections.team == ["B", "A"]
@@ -167,8 +169,10 @@ end
         plan = optimize_survivor_pool(
             _market_guard_candidates(),
             state;
-            through_week=3,
-            weekly_survival_probability=0.65,
+            selection_config=SurvivorSelectionConfig(
+                through_week=3,
+                weekly_survival_probability=0.65,
+            ),
         )
         @test plan.selections.team == ["B", "D", "E"]
         @test plan.selections.market_spread == [2.0, 3.0, -10.0]
@@ -187,7 +191,7 @@ end
         missing_line_plan = optimize_survivor_pool(
             missing_line,
             SurvivorPoolState(2025, 1; strikes_remaining=0);
-            through_week=1,
+            selection_config=SurvivorSelectionConfig(through_week=1),
         )
         @test missing_line_plan.current_pick.team == ["A"]
 
@@ -202,7 +206,7 @@ end
                 market_spread=[1.0, 1.5],
             ),
             SurvivorPoolState(2025, 1; strikes_remaining=0);
-            through_week=1,
+            selection_config=SurvivorSelectionConfig(through_week=1),
         )
     end
 
@@ -223,7 +227,7 @@ end
         @test_throws ArgumentError optimize_survivor_pool(
             candidates,
             state;
-            through_week=3,
+            selection_config=SurvivorSelectionConfig(through_week=3),
         )
     end
 
@@ -244,7 +248,7 @@ end
         )
         plan = optimize_survivor_pool(
             context;
-            through_week=2,
+            selection_config=SurvivorSelectionConfig(through_week=2),
             include_completed=true,
             strikes_remaining=0,
         )
@@ -254,5 +258,59 @@ end
             forecast.home_win_probability[1],
             forecast.away_win_probability[1],
         )
+        @test plan.selection_config.through_week == 2
+    end
+
+    @testset "selection configuration" begin
+        @test SurvivorSelectionConfig().objective ===
+            :discounted_expected_wins
+        no_guard_config = SurvivorSelectionConfig(
+            objective=:discounted_expected_wins,
+            minimum_favorite_spread=nothing,
+            missing_market_policy=:exclude,
+            market_guard_weeks=0,
+            through_week=3,
+        )
+        @test no_guard_config.minimum_favorite_spread === nothing
+        @test_throws ArgumentError SurvivorSelectionConfig(
+            objective=:unknown,
+        )
+        @test_throws ArgumentError SurvivorSelectionConfig(
+            missing_market_policy=:unknown,
+        )
+        @test_throws ArgumentError SurvivorSelectionConfig(
+            minimum_favorite_spread=-1.0,
+        )
+
+        missing_line = DataFrame(
+            game_id=["missing_line", "missing_line"],
+            week=[1, 1],
+            team=["A", "B"],
+            opponent=["C", "D"],
+            is_home=[true, false],
+            win_probability=[0.95, 0.8],
+            market_spread=Union{Missing,Float64}[missing, 1.0],
+        )
+        @test_throws ArgumentError optimize_survivor_pool(
+            missing_line,
+            SurvivorPoolState(2025, 1; strikes_remaining=0);
+            selection_config=SurvivorSelectionConfig(
+                through_week=1,
+                missing_market_policy=:exclude,
+            ),
+        )
+
+        no_guard_plan = optimize_survivor_pool(
+            missing_line,
+            SurvivorPoolState(2025, 1; strikes_remaining=0);
+            selection_config=SurvivorSelectionConfig(
+                minimum_favorite_spread=nothing,
+                market_guard_weeks=0,
+                through_week=1,
+            ),
+        )
+        @test no_guard_plan.selection_config.minimum_favorite_spread === nothing
+        @test no_guard_plan.current_pick.team == ["A"]
+        @test isfinite(no_guard_plan.objective_value)
     end
 end

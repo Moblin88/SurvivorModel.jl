@@ -3,133 +3,110 @@ using Dates
 using Test
 using SurvivorModel
 
+if !isdefined(Main, :_survivor_context_fixture)
+    function _survivor_context_fixture()
+        schedule = DataFrame(
+            game_id=["2022_01_AB", "2023_01_AB", "2023_02_CD"],
+            season=[2022, 2023, 2023],
+            game_type=["REG", "REG", "REG"],
+            week=[1, 1, 2],
+            away_team=["A", "A", "C"],
+            home_team=["B", "B", "D"],
+            away_score=Union{Missing,Int}[14, 17, missing],
+            home_score=Union{Missing,Int}[21, 24, missing],
+            result=Union{Missing,Int}[7, 7, missing],
+        )
+        historical = DataFrame(
+            game_id=["2022_01_AB", "2022_01_AB", "2022_01_AB", "2022_01_AB"],
+            fixed_drive=[1, 2, 3, 4],
+            posteam=["B", "A", "B", "A"],
+            defteam=["A", "B", "A", "B"],
+            posteam_home=[true, false, true, false],
+            defteam_home=[false, true, false, true],
+            drive_result=["Touchdown", "Punt", "Field goal", "Punt"],
+            time_of_possession=Second.([60, 60, 60, 60]),
+            home_spread_change=[7.0, 0.0, 3.0, 0.0],
+        )
+        current = DataFrame(
+            game_id=["2023_01_AB", "2023_01_AB"],
+            fixed_drive=[1, 2],
+            posteam=["B", "A"],
+            defteam=["A", "B"],
+            posteam_home=[true, false],
+            defteam_home=[false, true],
+            drive_result=["Touchdown", "Punt"],
+            time_of_possession=Second.([60, 60]),
+            home_spread_change=[7.0, 0.0],
+        )
+        return schedule, historical, current
+    end
+end
+
 @testset "survivor command-line application" begin
     @testset "argument and stdin parsing" begin
         @test SurvivorModel._parse_survivor_cli_args(
             ["--season", "2023"],
         ) == (
             show_help=false,
-            benchmark=false,
-            data_source=:synthetic,
-            benchmark_scenario=:performance,
             season=2023,
             initial_strikes=2,
-            repeats=3,
-            max_seasons=5,
-            recovery_seasons=3,
-            clear_cache=false,
+            refresh_data=false,
         )
         @test SurvivorModel._parse_survivor_cli_args(
             ["--season=2023", "--strikes=4"],
         ).initial_strikes == 4
-        @test SurvivorModel._parse_survivor_cli_args(
-            ["--benchmark", "--data", "real", "--season", "2023", "--repeats", "2"],
-        ) == (
-            show_help=false,
-            benchmark=true,
-            data_source=:real,
-            benchmark_scenario=:performance,
-            season=2023,
-            initial_strikes=2,
-            repeats=2,
-            max_seasons=5,
-            recovery_seasons=3,
-            clear_cache=false,
-        )
-        @test SurvivorModel._parse_survivor_cli_args(
-            ["--benchmark"],
-        ).season == 2024
-        @test SurvivorModel._parse_survivor_cli_args(
-            ["--benchmark", "--scenario", "recovery"],
-        ).benchmark_scenario == :recovery
-        @test SurvivorModel._parse_survivor_cli_args(
-            [
-                "--benchmark",
-                "--scenario",
-                "recovery",
-                "--recovery-seasons",
-                "5",
-            ],
-        ).recovery_seasons == 5
         @test SurvivorModel._read_survivor_cli_picks(
             IOBuffer("KC\n\n sf \n"),
         ) == ["KC", "SF"]
         @test SurvivorModel._parse_survivor_cli_args(["--help"]).show_help
+        usage = SurvivorModel._survivor_cli_usage()
+        @test !occursin("--benchmark", usage)
+        @test !occursin("--clear-cache", usage)
         @test SurvivorModel._parse_survivor_cli_args(
-            ["--clear-cache"],
-        ) == (
-            show_help=false,
-            benchmark=false,
-            data_source=:synthetic,
-            benchmark_scenario=:performance,
-            season=0,
-            initial_strikes=2,
-            repeats=3,
-            max_seasons=5,
-            recovery_seasons=3,
-            clear_cache=true,
-        )
-        @test SurvivorModel._parse_survivor_cli_args(
-            ["--clear-cache", "--season", "2023"],
-        ).clear_cache
+            ["--season", "2023", "--refresh-data"],
+        ).refresh_data
         @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
-            ["--clear-cache", "--clear-cache"],
-        )
-        @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
-            ["--clear-cache", "--strikes", "1"],
+            ["--refresh-data", "--refresh-data"],
         )
         @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
             ["--strikes", "2"],
         )
         @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
-            ["--benchmark", "--data", "real"],
+            ["--benchmark", "--season", "2023"],
+        )
+        @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
+            ["--clear-cache", "--season", "2023"],
         )
         @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
             ["--data", "synthetic", "--season", "2023"],
         )
         @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
-            ["--benchmark", "--data", "real", "--scenario", "recovery", "--season", "2023"],
+            ["--scenario", "recovery", "--season", "2023"],
         )
         @test_throws ArgumentError SurvivorModel._read_survivor_cli_picks(
             IOBuffer("KC SF\n"),
         )
     end
 
-    @testset "synthetic fitting benchmark" begin
-        options = SurvivorModel._parse_survivor_cli_args(
-            ["--benchmark", "--repeats", "1"],
-        )
-        output = IOBuffer()
-        synthetic_drives = synthetic_fit_benchmark_drives(
+    @testset "synthetic fitting benchmark API" begin
+        synthetic_drives = SurvivorModel.synthetic_fit_benchmark_drives(
             drives_per_team=10,
         )
-        exit_code = SurvivorModel._run_fit_benchmark_cli(
-            options;
-            output=output,
-            drives=synthetic_drives,
-            methods=(MomentFit(),),
+        benchmark = SurvivorModel.fit_benchmark(
+            synthetic_drives;
+            current_season=2024,
+            repeats=1,
+            methods=(SurvivorModel.MomentFit(),),
         )
-        rendered = String(take!(output))
-        @test exit_code == 0
+        @test nrow(benchmark) == 1
         @test length(unique(synthetic_drives.defteam)) > 1
-        @test occursin("Fitting benchmark", rendered)
-        @test occursin("median_ms", rendered)
-        @test occursin("moment", rendered)
-        @test occursin("Fitted hazard parameters", rendered)
-        @test occursin("synthetic target", rendered)
-        @test occursin("home_advantage", rendered)
-        @test occursin("persistence", rendered)
-        @test occursin("hazard_mean", rendered)
-        @test occursin("hazard_variance", rendered)
+        @test only(benchmark.method) == "moment"
     end
 
-    @testset "synthetic recovery benchmark" begin
+    @testset "synthetic recovery benchmark API" begin
         @test SurvivorModel.FIT_RECOVERY_GAMES_PER_TEAM == 17
         @test SurvivorModel.FIT_RECOVERY_APPROX_DRIVES_PER_TEAM_GAME == 11
-        options = SurvivorModel._parse_survivor_cli_args(
-            ["--benchmark", "--scenario", "recovery", "--repeats", "1"],
-        )
-        simulation = synthetic_fit_recovery_drives(
+        simulation = SurvivorModel.synthetic_fit_recovery_drives(
             games_per_team=8,
             seed=17,
         )
@@ -139,26 +116,19 @@ using SurvivorModel
         @test nrow(simulation.schedule) == 3 * 8 * 16
         @test nrow(simulation.games) == nrow(simulation.schedule)
         @test all(simulation.games.drive_count .> 0)
-        output = IOBuffer()
-        exit_code = SurvivorModel._run_fit_benchmark_cli(
-            options;
-            output=output,
-            drives=simulation.drives,
-            truth=simulation.truth,
-            methods=(MomentFit(),),
+        benchmark = SurvivorModel.fit_recovery_benchmark(
+            simulation.drives,
+            simulation.truth;
+            current_season=2024,
+            repeats=1,
+            methods=(SurvivorModel.MomentFit(),),
         )
-        rendered = String(take!(output))
-        @test exit_code == 0
-        @test occursin("scenario: recovery", rendered)
-        @test occursin("recovery truth", rendered)
-        @test occursin("Recovery quality", rendered)
-        @test occursin("Shared-parameter recovery", rendered)
-        @test occursin("Per-bin hazard recovery", rendered)
-        @test occursin("mean_rel_err", rendered)
+        @test nrow(benchmark.summary) == 1
+        @test !isempty(benchmark.recovery_quality)
     end
 
     @testset "longer synthetic recovery history" begin
-        simulation = synthetic_fit_recovery_drives(
+        simulation = SurvivorModel.synthetic_fit_recovery_drives(
             seasons=2019:2023,
             games_per_team=1,
             seed=23,
@@ -166,17 +136,28 @@ using SurvivorModel
         @test simulation.truth.seasons == collect(2019:2023)
         @test nrow(simulation.schedule) == 5 * 1 * 16
 
-        benchmark = fit_recovery_benchmark(
+        benchmark = SurvivorModel.fit_recovery_benchmark(
             simulation.drives,
             simulation.truth;
             max_seasons=5,
             current_season=2024,
             repeats=1,
-            methods=(MomentFit(),),
+            methods=(SurvivorModel.MomentFit(),),
         )
         @test nrow(benchmark.summary) == 1
         @test only(benchmark.summary.converged)
         @test !isempty(benchmark.recovery_quality)
+    end
+
+    @testset "developer benchmark tool" begin
+        project_directory = dirname(@__DIR__)
+        tool_path = joinpath(project_directory, "tools", "fit_benchmark.jl")
+        help = read(
+            `$(Base.julia_cmd()) --project=$project_directory $tool_path --help`,
+            String,
+        )
+        @test occursin("tools/fit_benchmark.jl", help)
+        @test occursin("--scenario NAME", help)
     end
 
     @testset "schedule-derived survivor state" begin
@@ -269,7 +250,7 @@ using SurvivorModel
             first = SurvivorModel._cached_historical_prior(
                 historical;
                 current_season=2023,
-                method=MomentFit(),
+                method=SurvivorModel.MomentFit(),
                 cache_directory=cache_directory,
             )
             @test !first.cache_hit
@@ -278,12 +259,38 @@ using SurvivorModel
             second = SurvivorModel._cached_historical_prior(
                 historical;
                 current_season=2023,
-                method=MomentFit(),
+                method=SurvivorModel.MomentFit(),
                 cache_directory=cache_directory,
             )
             @test second.cache_hit
             @test second.path == first.path
             @test second.prior.time_edges == first.prior.time_edges
+            @test second.data_fingerprint == first.data_fingerprint
+
+            changed_historical = copy(historical)
+            changed_historical.drive_result[1] =
+                changed_historical.drive_result[1] == "Touchdown" ?
+                "Turnover" :
+                "Touchdown"
+            changed = SurvivorModel._cached_historical_prior(
+                changed_historical;
+                current_season=2023,
+                method=SurvivorModel.MomentFit(),
+                cache_directory=cache_directory,
+            )
+            @test !changed.cache_hit
+            @test changed.data_fingerprint != first.data_fingerprint
+            @test changed.path != first.path
+
+            open(first.path, "w") do io
+                write(io, "not a serialized cache")
+            end
+            @test_throws ArgumentError SurvivorModel._cached_historical_prior(
+                historical;
+                current_season=2023,
+                method=SurvivorModel.MomentFit(),
+                cache_directory=cache_directory,
+            )
         end
     end
 
@@ -329,7 +336,7 @@ using SurvivorModel
                 historical_drives=historical,
                 current_drives=current,
                 cache_directory=cache_directory,
-                method=MomentFit(),
+                method=SurvivorModel.MomentFit(),
                 through_week=2,
             )
             @test exit_code == 0
@@ -348,7 +355,7 @@ using SurvivorModel
                 historical_drives=historical,
                 current_drives=current,
                 cache_directory=cache_directory,
-                method=MomentFit(),
+                method=SurvivorModel.MomentFit(),
                 through_week=2,
             )
             @test exit_code == 0

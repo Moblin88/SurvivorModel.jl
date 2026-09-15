@@ -260,14 +260,16 @@ plan.selections
 plan.objective_value
 ```
 
-The default `:milp` optimizer expands each unplayed forecast game into
+The default `:exact_milp` optimizer expands each unplayed forecast game into
 model-favorite candidates with win probability at least `0.5`, excludes teams
 in `picks_made`, and solves one binary assignment model with JuMP and HiGHS.
 It selects exactly one team for every week in the requested horizon and allows
-each team to be selected at most once. Both options target a larger expected number of completed weeks
-before elimination: `:milp` uses fixed reach discounts and a linear
-candidate-level approximation, while `:micp` evaluates selected-plan terminal
-paths with a mixed-integer conic model.
+each team to be selected at most once. The two objectives target a larger
+expected number of completed weeks before elimination:
+
+- `:milp` uses fixed reach discounts and a linear candidate-level
+  approximation.
+- `:exact_milp` uses an exact finite-state probability recursion in a MILP.
 
 `plan.selections` includes each selected team's win probability, reach discount,
 selected-team market spread, and objective contribution; `plan.current_pick` is
@@ -275,30 +277,29 @@ the row to use for the current week. The effective `plan.selection_config`
 records the objective, reach-discount policy, market guard, missing-line
 policy, and horizon.
 
-The `:micp` objective uses the terminal-path conic formulation:
+The `:exact_milp` objective tracks the probability of being alive after each
+week at every loss count below the elimination threshold. It uses binary
+selection variables and exact binary-continuous product linearizations, then
+maximizes the sum of weekly survival probabilities:
 
 ```julia
 plan = optimize_survivor_pool(
     context;
     strikes_remaining=2,
     selection_config=SurvivorSelectionConfig(
-        objective=:micp,
+        objective=:exact_milp,
         through_week=18,
     ),
 )
 ```
 
-The two modes use the same strike semantics:
+This formulation accepts endpoint probabilities of `0.0` and `1.0` and
+computes the expected-weeks objective exactly. Both modes use the same strike
+semantics:
 `strikes_remaining=s` means the `s`-th future loss eliminates the pool, while
-zero means the next loss eliminates it. It enumerates terminal
-elimination paths and end-of-horizon survival paths, writes each path
-probability as the exponential of an affine function of the binary selections,
-and minimizes their positive weighted sum with an exponential-cone log-sum-exp
-formulation. It uses Pajarito with HiGHS for outer approximation and Clarabel
-for the continuous exponential-cone subproblems. Candidate win probabilities
-for this objective must be strictly between zero and one. The selected rows
-also include `survival_probability`, `elimination_probability`, and the
-per-week expected-survival contribution.
+zero means the next loss eliminates it. The selected rows for the exact
+objective also include `survival_probability`, `elimination_probability`, and
+the per-week expected-survival contribution.
 
 ### Survivor command-line app
 
@@ -324,11 +325,11 @@ Then run it from any directory:
 survivor --season 2026 < picks.txt
 ```
 
-Pass `--objective micp` to use the conic expected-weeks strategy; the default
-is `milp`:
+Pass `--objective milp` to use the discounted approximation; the default is
+`exact-milp`:
 
 ```sh
-survivor --season 2026 --objective micp < picks.txt
+survivor --season 2026 --objective milp < picks.txt
 ```
 
 The app reads one team abbreviation per nonblank line, starting with week 1.
@@ -366,11 +367,11 @@ target-season PBP and uses historical drives only. Once prior picks imply week
 not omitted. Cache clearing is a maintenance operation; normal weekly runs
 should use `--refresh-data` instead.
 
-The default `:milp` objective uses fixed reach discounts and candidate win
-probabilities as a tractable approximation to expected completed weeks. It
-does not estimate the exact selected-plan probability that the entire pool
-survives. The MILP always selects one team per week and uses each team at most
-once. `SurvivorSelectionConfig` can change the objective, weekly survival
+The default `:exact_milp` objective uses the state-transition MILP to compute
+expected completed weeks exactly. The optional `:milp` objective uses fixed
+reach discounts and candidate win probabilities as a tractable approximation.
+Both modes select one team per week and use each team at most once.
+`SurvivorSelectionConfig` can change the objective, weekly survival
 probability, reach-discount policy, market guard, missing-line policy, and
 planning horizon. The default market policy protects
 the current and following week by requiring a selected team to be favored by at

@@ -1,6 +1,5 @@
 module SurvivorModel
 
-using Clarabel
 using DataFrames
 using Dates
 using Distributions
@@ -12,9 +11,7 @@ using NFLData
 using SpecialFunctions
 using Statistics
 using JuMP
-import MathOptInterface as MOI
 using Optim
-using Pajarito
 using Printf
 using Random
 using Scratch

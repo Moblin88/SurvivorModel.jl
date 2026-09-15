@@ -67,12 +67,12 @@ full_forecast = SurvivorModel.forecast_regular_season(
 )
 ```
 
-The `:micp` survivor objective is a mixed-integer
-exponential-cone model. It uses Pajarito with HiGHS for outer approximation and
-Clarabel for continuous conic subproblems. The model enumerates terminal
-elimination and end-survival paths rather than all win/loss histories; each
-path contributes one exponential-cone log-sum-exp term. Use strictly interior
-candidate win probabilities for this objective because it takes logarithms.
+The `:exact_milp` survivor objective is an exact finite-state MILP. It tracks
+the probability of remaining alive at each loss count below the terminal loss
+threshold and maximizes the sum of weekly survival probabilities. Binary
+selection/state-product terms are linearized with bounds in `[0, 1]`, so this
+formulation avoids terminal-path enumeration and nonlinear subproblems.
+
 Candidate rows below the model-favorite threshold of `0.5` are excluded before
 either survivor objective is solved.
 

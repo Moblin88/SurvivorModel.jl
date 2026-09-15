@@ -203,17 +203,11 @@ end
         @test plan.current_pick.team == ["B"]
         @test length(unique(plan.selections.team)) == 2
         @test plan.discounts.discount ≈ [1.0, 0.65]
-        @test plan.objective_value ≈ 0.8 + 0.95 * 0.65
+        @test plan.objective_value ≈ 0.8 + 0.8 * 0.95
         @test plan.objective_value ≈ sum(plan.selections.objective_contribution)
     end
 
-    @testset "terminal path expected-weeks objective" begin
-        paths = SurvivorModel._survivor_terminal_paths(17, 2)
-        @test length(paths) == 154
-        @test count(path -> !isnothing(path.elimination_week), paths) == 136
-        @test count(path -> isnothing(path.elimination_week), paths) == 18
-        @test length(SurvivorModel._survivor_terminal_paths(4, 1)) == 5
-
+    @testset "exact expected-weeks objective" begin
         candidates = DataFrame(
             game_id=["week1", "week1", "week2", "week2"],
             week=[1, 1, 2, 2],
@@ -223,7 +217,7 @@ end
             win_probability=[0.6, 0.8, 0.9, 0.7],
         )
         config = SurvivorSelectionConfig(
-            objective=:micp,
+            objective=:exact_milp,
             minimum_favorite_spread=nothing,
             market_guard_weeks=0,
             through_week=2,
@@ -234,6 +228,7 @@ end
             selection_config=config,
         )
         @test nrow(two_loss_allowance_plan.selections) == 2
+        @test two_loss_allowance_plan.selections.team == ["B", "C"]
         @test two_loss_allowance_plan.objective_value ≈
             _survivor_expected_weeks_bruteforce([0.8, 0.9], 2)
         @test two_loss_allowance_plan.objective_value ≈
@@ -269,16 +264,18 @@ end
             is_home=[true, false],
             win_probability=[1.0, 0.8],
         )
-        @test_throws ArgumentError optimize_survivor_pool(
+        exact_endpoint_plan = optimize_survivor_pool(
             endpoint_candidates,
             SurvivorPoolState(2025, 1; strikes_remaining=1);
             selection_config=SurvivorSelectionConfig(
-                objective=:micp,
+                objective=:exact_milp,
                 minimum_favorite_spread=nothing,
                 market_guard_weeks=0,
                 through_week=1,
             ),
         )
+        @test exact_endpoint_plan.current_pick.team == ["A"]
+        @test exact_endpoint_plan.objective_value ≈ 1.0
     end
 
     @testset "near-term market favorite guard" begin
@@ -381,7 +378,9 @@ end
 
     @testset "selection configuration" begin
         @test SurvivorSelectionConfig().objective ===
-            :milp
+            :exact_milp
+        @test SurvivorSelectionConfig(objective=:exact_milp).objective ===
+            :exact_milp
         no_guard_config = SurvivorSelectionConfig(
             objective=:milp,
             minimum_favorite_spread=nothing,

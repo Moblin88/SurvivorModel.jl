@@ -19,8 +19,8 @@ function _survivor_cli_usage()
       --season YEAR       Target season (required).
       --strikes N         Initial strike count (default: 2).
       --objective NAME    Selection objective (default:
-                          milp; use micp for the conic
-                          expected-weeks strategy).
+                          exact-milp; use milp for the
+                          discounted approximation).
       --timings           Print phase timings to stderr.
       --refresh-data      Clear NFLData's raw cache and refresh summarized
                           historical drive data before running.

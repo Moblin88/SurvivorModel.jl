@@ -1,14 +1,14 @@
 const DEFAULT_SURVIVOR_WEEKLY_SURVIVAL_PROBABILITY = 0.65
 const DEFAULT_SURVIVOR_MIN_FAVORITE_SPREAD = 2.0
 const DEFAULT_SURVIVOR_MIN_MODEL_WIN_PROBABILITY = 0.5
-const DEFAULT_SURVIVOR_OBJECTIVE = :milp
+const DEFAULT_SURVIVOR_OBJECTIVE = :exact_milp
 const DEFAULT_SURVIVOR_REACH_DISCOUNT_POLICY = :binomial
 const DEFAULT_SURVIVOR_MARKET_GUARD_WEEKS = 2
 const DEFAULT_SURVIVOR_MISSING_MARKET_POLICY = :allow
 
 const SURVIVOR_OBJECTIVES = (
     :milp,
-    :micp,
+    :exact_milp,
 )
 const SURVIVOR_REACH_DISCOUNT_POLICIES = (:binomial,)
 const SURVIVOR_MISSING_MARKET_POLICIES = (:allow, :exclude)
@@ -38,8 +38,8 @@ end
 """
     SurvivorSelectionConfig(; kwargs...)
 
-Configuration for survivor selection. `:milp` is the default tractable
-expected-weeks approximation; `:micp` uses the terminal-path conic model.
+Configuration for survivor selection. `:exact_milp` is the default exact
+expected-weeks formulation; `:milp` uses the tractable approximation.
 """
 struct SurvivorSelectionConfig
     objective::Symbol
@@ -100,31 +100,11 @@ function SurvivorSelectionConfig(
     )
 end
 
-function _default_survivor_conic_optimizer()
-    oa_solver = JuMP.optimizer_with_attributes(
-        HiGHS.Optimizer,
-        MOI.Silent() => true,
-    )
-    conic_solver = JuMP.optimizer_with_attributes(
-        Clarabel.Optimizer,
-        MOI.Silent() => true,
-    )
-    return JuMP.optimizer_with_attributes(
-        Pajarito.Optimizer,
-        "verbose" => false,
-        "use_iterative_method" => true,
-        "oa_solver" => oa_solver,
-        "conic_solver" => conic_solver,
-    )
-end
-
 function _survivor_optimizer(
     config::SurvivorSelectionConfig,
     optimizer,
 )
     optimizer !== nothing && return optimizer
-    config.objective === :micp &&
-        return _default_survivor_conic_optimizer()
     return HiGHS.Optimizer
 end
 
@@ -194,8 +174,7 @@ end
 The selected forward plan returned by `optimize_survivor_pool`. `selections`
 contains one row per planned week, `current_pick` contains the current week's
 single selected row, and `discounts` records the fixed personal reach
-discount used for each week. For
-`:micp`, `selections` also contains
+discount used for each week. For `:exact_milp`, `selections` also contains
 plan-specific survival and elimination probabilities. `selection_config`
 records the effective objective and eligibility policies.
 """
@@ -573,100 +552,8 @@ function _add_survivor_assignment_constraints!(
     return candidate_indices
 end
 
-function _survivor_subsets(
-    values::AbstractVector{<:Integer},
-    cardinality::Integer,
-)
-    cardinality >= 0 || throw(ArgumentError("subset cardinality must be nonnegative"))
-    cardinality > length(values) && return Vector{Vector{Int}}()
-    result = Vector{Vector{Int}}()
-    chosen = Int[]
-
-    function visit!(start_index::Int)
-        length(chosen) == cardinality && begin
-            push!(result, copy(chosen))
-            return
-        end
-        remaining = cardinality - length(chosen)
-        last_index = length(values) - remaining + 1
-        for index in start_index:last_index
-            push!(chosen, Int(values[index]))
-            visit!(index + 1)
-            pop!(chosen)
-        end
-    end
-
-    visit!(1)
-    return result
-end
-
 function _survivor_loss_threshold(state::SurvivorPoolState)
     return max(1, state.strikes_remaining)
-end
-
-function _survivor_terminal_paths(
-    number_of_weeks::Integer,
-    losses_to_elimination::Integer,
-)
-    number_of_weeks >= 1 ||
-        throw(ArgumentError("number_of_weeks must be positive"))
-    losses_to_elimination >= 1 ||
-        throw(ArgumentError("losses_to_elimination must be positive"))
-
-    paths = NamedTuple{
-        (:loss_positions, :path_length, :elimination_week, :coefficient),
-        Tuple{Vector{Int},Int,Union{Nothing,Int},Float64},
-    }[]
-    if losses_to_elimination <= number_of_weeks
-        for elimination_week in losses_to_elimination:number_of_weeks
-            for prior_losses in _survivor_subsets(
-                collect(1:(elimination_week - 1)),
-                losses_to_elimination - 1,
-            )
-                push!(
-                    paths,
-                    (
-                        loss_positions=vcat(prior_losses, elimination_week),
-                        path_length=elimination_week,
-                        elimination_week=Int(elimination_week),
-                        coefficient=Float64(number_of_weeks - elimination_week + 2),
-                    ),
-                )
-            end
-        end
-    end
-
-    for loss_count in 0:min(
-        losses_to_elimination - 1,
-        number_of_weeks,
-    )
-        for loss_positions in _survivor_subsets(
-            collect(1:number_of_weeks),
-            loss_count,
-        )
-            push!(
-                paths,
-                (
-                    loss_positions=loss_positions,
-                    path_length=Int(number_of_weeks),
-                    elimination_week=nothing,
-                    coefficient=1.0,
-                ),
-            )
-        end
-    end
-    return paths
-end
-
-function _survivor_require_interior_probabilities(data::AbstractDataFrame)
-    any(
-        probability -> !(0.0 < probability < 1.0),
-        data.win_probability,
-    ) && throw(ArgumentError(
-        "micp requires win probabilities strictly " *
-        "between 0 and 1",
-    ))
-    return nothing
 end
 
 function _survivor_week_indices(
@@ -679,101 +566,10 @@ function _survivor_week_indices(
     return week_indices
 end
 
-function _survivor_path_log_expression(
-    model,
-    path,
-    data::AbstractDataFrame,
-    selected,
-    week_indices::Dict{Int,Vector{Int}},
-    first_week::Integer,
-)
-    loss_positions = Set(path.loss_positions)
-    terms = Any[]
-    for position in 1:path.path_length
-        week = Int(first_week) + position - 1
-        for index in week_indices[week]
-            probability = data.win_probability[index]
-            log_probability = position in loss_positions ?
-                log1p(-probability) :
-                log(probability)
-            push!(terms, log_probability * selected[index])
-        end
-    end
-    return log(path.coefficient) + sum(terms; init=0.0)
-end
-
-function _add_logsumexp_epigraph!(
-    model,
-    upper_bound,
-    terms,
-)
-    isempty(terms) && throw(ArgumentError("log-sum-exp requires at least one term"))
-    auxiliaries = @variable(model, auxiliary[1:length(terms)] >= 0)
-    @constraint(
-        model,
-        [index=1:length(terms)],
-        [terms[index] - upper_bound, 1.0, auxiliaries[index]] in
-            MOI.ExponentialCone(),
-    )
-    @constraint(model, sum(auxiliaries) <= 1.0)
-    return auxiliaries
-end
-
-function _optimize_survivor_micp!(model)
-    return Logging.with_logger(
-        Logging.SimpleLogger(stderr, Logging.Error),
-    ) do
-        redirect_stdout(devnull) do
-            optimize!(model)
-        end
-    end
-end
-
 function _survivor_selected_indices(model, selected, candidate_indices)
     return [
         index for index in candidate_indices if value(selected[index]) > 0.5
     ]
-end
-
-function _survivor_terminal_statistics(
-    paths,
-    data::AbstractDataFrame,
-    selected_indices::AbstractVector{<:Integer},
-    state::SurvivorPoolState,
-    through_week::Integer,
-)
-    selected_by_week = Dict(
-        Int(data.week[index]) => data.win_probability[index]
-        for index in selected_indices
-    )
-    number_of_weeks = through_week - state.current_week + 1
-    survival_probability = zeros(Float64, number_of_weeks)
-    cost = 0.0
-    for path in paths
-        path_probability = 1.0
-        loss_positions = Set(path.loss_positions)
-        for position in 1:path.path_length
-            week = state.current_week + position - 1
-            probability = selected_by_week[week]
-            path_probability *= position in loss_positions ?
-                1.0 - probability :
-                probability
-        end
-        cost += path.coefficient * path_probability
-        if isnothing(path.elimination_week)
-            survival_probability .+= path_probability
-        else
-            survived_weeks = path.path_length - 1
-            if survived_weeks > 0
-                survival_probability[1:survived_weeks] .+= path_probability
-            end
-        end
-    end
-    return (
-        cost=cost,
-        survival_probability=survival_probability,
-        expected_weeks=sum(survival_probability),
-    )
 end
 
 function _survivor_objective_contribution(
@@ -835,14 +631,42 @@ function _survivor_constant_plan(
     )
 end
 
-function _optimize_survivor_expected_weeks(
+function _survivor_state_statistics(
+    probabilities::AbstractVector{<:Real},
+    losses_to_elimination::Integer,
+)
+    losses_to_elimination >= 1 ||
+        throw(ArgumentError("losses_to_elimination must be positive"))
+    alive = zeros(Float64, losses_to_elimination)
+    alive[1] = 1.0
+    survival_probability = zeros(Float64, length(probabilities))
+    for (position, probability_value) in enumerate(probabilities)
+        probability = Float64(probability_value)
+        0.0 <= probability <= 1.0 ||
+            throw(ArgumentError("win probabilities must be between 0 and 1"))
+        next_alive = zeros(Float64, losses_to_elimination)
+        next_alive[1] = probability * alive[1]
+        for loss_state in 2:losses_to_elimination
+            next_alive[loss_state] =
+                probability * alive[loss_state] +
+                (1.0 - probability) * alive[loss_state - 1]
+        end
+        alive = next_alive
+        survival_probability[position] = sum(alive)
+    end
+    return (
+        survival_probability=survival_probability,
+        expected_weeks=sum(survival_probability),
+    )
+end
+
+function _optimize_survivor_expected_weeks_exact_milp(
     data::AbstractDataFrame,
     state::SurvivorPoolState,
     config::SurvivorSelectionConfig,
     discount_table::AbstractDataFrame;
     optimizer=nothing,
 )
-    _survivor_require_interior_probabilities(data)
     number_of_weeks = config.through_week - state.current_week + 1
     losses_to_elimination = _survivor_loss_threshold(state)
     losses_to_elimination > number_of_weeks &&
@@ -854,10 +678,6 @@ function _optimize_survivor_expected_weeks(
             optimizer=optimizer,
         )
 
-    paths = _survivor_terminal_paths(
-        number_of_weeks,
-        losses_to_elimination,
-    )
     model = Model(_survivor_optimizer(config, optimizer))
     set_silent(model)
     candidate_indices = 1:nrow(data)
@@ -870,21 +690,67 @@ function _optimize_survivor_expected_weeks(
         selected,
     )
 
+    state_indices = 1:losses_to_elimination
+    @variable(
+        model,
+        0 <= alive[1:(number_of_weeks + 1), state_indices] <= 1,
+    )
+    @variable(model, 0 <= transition[candidate_indices, state_indices] <= 1)
+    @constraint(model, alive[1, 1] == 1.0)
+    for loss_state in 2:losses_to_elimination
+        @constraint(model, alive[1, loss_state] == 0.0)
+    end
+
     week_indices = _survivor_week_indices(data)
-    path_terms = [
-        _survivor_path_log_expression(
+    for index in candidate_indices
+        position = Int(data.week[index]) - state.current_week + 1
+        for loss_state in state_indices
+            @constraint(model, transition[index, loss_state] <= selected[index])
+        end
+    end
+
+    for position in 1:number_of_weeks
+        week = state.current_week + position - 1
+        indices = week_indices[week]
+        for loss_state in state_indices
+            @constraint(
+                model,
+                sum(transition[index, loss_state] for index in indices) ==
+                    alive[position, loss_state],
+            )
+        end
+        @constraint(
             model,
-            path,
-            data,
-            selected,
-            week_indices,
-            state.current_week,
-        ) for path in paths
-    ]
-    @variable(model, log_cost)
-    _add_logsumexp_epigraph!(model, log_cost, path_terms)
-    @objective(model, Min, log_cost)
-    _optimize_survivor_micp!(model)
+            alive[position + 1, 1] ==
+                sum(
+                    data.win_probability[index] * transition[index, 1]
+                    for index in indices
+                ),
+        )
+        for loss_state in 2:losses_to_elimination
+            @constraint(
+                model,
+                alive[position + 1, loss_state] ==
+                    sum(
+                        data.win_probability[index] * transition[index, loss_state] +
+                        (1.0 - data.win_probability[index]) *
+                        transition[index, loss_state - 1]
+                        for index in indices
+                    ),
+            )
+        end
+    end
+
+    @objective(
+        model,
+        Max,
+        sum(
+            alive[position + 1, loss_state]
+            for position in 1:number_of_weeks,
+            loss_state in state_indices
+        ),
+    )
+    optimize!(model)
 
     JuMP.is_solved_and_feasible(model) ||
         throw(ArgumentError(
@@ -900,32 +766,20 @@ function _optimize_survivor_expected_weeks(
     nrow(selections) == number_of_weeks ||
         throw(ArgumentError("survivor optimization did not select one team per week"))
 
-    statistics = _survivor_terminal_statistics(
-        paths,
-        data,
-        selected_indices,
-        state,
-        config.through_week,
+    probabilities = Float64.(selections.win_probability)
+    statistics = _survivor_state_statistics(
+        probabilities,
+        losses_to_elimination,
     )
-    model_cost = exp(Float64(value(log_cost)))
-    isfinite(model_cost) ||
-        throw(ArgumentError("survivor conic objective returned a non-finite value"))
+    model_expected_weeks = Float64(objective_value(model))
     isapprox(
-        statistics.cost,
-        model_cost;
-        rtol=1e-4,
-        atol=1e-7,
-    ) || throw(ArgumentError(
-        "survivor conic objective and selected-path evaluation disagree",
-    ))
-    expected_weeks = (number_of_weeks + 1.0) - statistics.cost
-    isapprox(
-        expected_weeks,
+        model_expected_weeks,
         statistics.expected_weeks;
-        rtol=1e-8,
-        atol=1e-8,
+        rtol=1e-6,
+        atol=2e-6,
     ) || throw(ArgumentError(
-        "survivor terminal-path probabilities do not sum to the expected weeks",
+        "survivor state-transition objective and selected-plan evaluation disagree: " *
+        "$model_expected_weeks vs $(statistics.expected_weeks)",
     ))
 
     survival_by_week = Dict(
@@ -948,7 +802,7 @@ function _optimize_survivor_expected_weeks(
         selections,
         current_pick,
         discount_table,
-        Float64(expected_weeks),
+        Float64(statistics.expected_weeks),
         config,
     )
 end
@@ -959,9 +813,9 @@ end
 Solve the survivor assignment problem from an injected team-level candidate
 table. `selection_config` controls the objective, reach discounts, market
 guard, missing-line policy, and planning horizon. The default objective
-`:milp` uses fixed personal reach discounts as a tractable approximation to
-expected completed weeks survived. The `:micp` objective uses a terminal-path
-exponential-cone model and reports expected completed weeks survived.
+`:exact_milp` uses a state-transition MILP and reports expected completed
+weeks survived. The `:milp` objective uses fixed personal reach discounts as a
+tractable approximation.
 """
 function optimize_survivor_pool(
     candidates::AbstractDataFrame,
@@ -984,8 +838,8 @@ function optimize_survivor_pool(
         row.week => row.discount for row in eachrow(discount_table)
     )
     data.discount = [discount_by_week[week] for week in data.week]
-    if config.objective === :micp
-        return _optimize_survivor_expected_weeks(
+    if config.objective === :exact_milp
+        return _optimize_survivor_expected_weeks_exact_milp(
             data,
             state,
             config,

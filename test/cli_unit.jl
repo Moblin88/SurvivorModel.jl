@@ -50,7 +50,7 @@ end
             show_help=false,
             season=2023,
             initial_strikes=2,
-            objective=:milp,
+            objective=:exact_milp,
             timings=false,
             refresh_data=false,
         )
@@ -58,11 +58,8 @@ end
             ["--season=2023", "--strikes=4"],
         ).initial_strikes == 4
         @test SurvivorModel._parse_survivor_cli_args(
-            ["--season=2023", "--objective", "micp"],
-        ).objective == :micp
-        @test SurvivorModel._parse_survivor_cli_args(
-            ["--season=2023", "--objective=micp"],
-        ).objective == :micp
+            ["--season=2023", "--objective", "exact-milp"],
+        ).objective == :exact_milp
         @test SurvivorModel._parse_survivor_cli_args(
             ["--season=2023", "--timings"],
         ).timings
@@ -73,6 +70,8 @@ end
         usage = SurvivorModel._survivor_cli_usage()
         @test !occursin("--benchmark", usage)
         @test !occursin("--clear-cache", usage)
+        @test occursin("exact-milp", usage)
+        @test !occursin("micp", usage)
         @test occursin("--timings", usage)
         @test SurvivorModel._parse_survivor_cli_args(
             ["--season", "2023", "--refresh-data"],
@@ -96,8 +95,11 @@ end
             ["--season", "2023", "--objective", "expected_weeks_before_elimination"],
         )
         @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
+            ["--season", "2023", "--objective", "micp"],
+        )
+        @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
             ["--season", "2023", "--objective", "milp",
-             "--objective", "micp"],
+             "--objective", "exact-milp"],
         )
         @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
             ["--benchmark", "--season", "2023"],

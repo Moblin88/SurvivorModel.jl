@@ -1,20 +1,31 @@
 const DEFAULT_SURVIVOR_WEEKLY_SURVIVAL_PROBABILITY = 0.65
 const DEFAULT_SURVIVOR_MIN_FAVORITE_SPREAD = 2.0
-const DEFAULT_SURVIVOR_OBJECTIVE = :discounted_expected_wins
+const DEFAULT_SURVIVOR_OBJECTIVE = :milp
 const DEFAULT_SURVIVOR_REACH_DISCOUNT_POLICY = :binomial
 const DEFAULT_SURVIVOR_MARKET_GUARD_WEEKS = 2
 const DEFAULT_SURVIVOR_MISSING_MARKET_POLICY = :allow
 
-const SURVIVOR_OBJECTIVES = (:discounted_expected_wins,)
+const SURVIVOR_OBJECTIVES = (
+    :milp,
+    :micp,
+)
 const SURVIVOR_REACH_DISCOUNT_POLICIES = (:binomial,)
 const SURVIVOR_MISSING_MARKET_POLICIES = (:allow, :exclude)
+
+function _canonical_survivor_objective(objective::Symbol)
+    objective in SURVIVOR_OBJECTIVES && return objective
+    throw(ArgumentError(
+        "objective must be one of $(collect(SURVIVOR_OBJECTIVES)); got $objective",
+    ))
+end
 
 """
     SurvivorPoolState
 
 State required to optimize a survivor-pool plan. `picks_made` maps completed
-weeks to the teams selected in those weeks. `strikes_remaining` is the number
-of losses that the personal reach-discount model still allows.
+weeks to the teams selected in those weeks. `strikes_remaining` is the number of strikes remaining before elimination. A
+positive value `s` means the `s`-th future loss is terminal; zero means the
+next loss is terminal.
 """
 struct SurvivorPoolState
     season::Int
@@ -26,8 +37,8 @@ end
 """
     SurvivorSelectionConfig(; kwargs...)
 
-Configuration for MILP survivor selection. The default values preserve the
-original discounted-expected-wins objective and two-week market guard.
+Configuration for survivor selection. `:milp` is the default tractable
+expected-weeks approximation; `:micp` uses the terminal-path conic model.
 """
 struct SurvivorSelectionConfig
     objective::Symbol
@@ -49,10 +60,7 @@ function SurvivorSelectionConfig(
     market_guard_weeks::Integer=DEFAULT_SURVIVOR_MARKET_GUARD_WEEKS,
     through_week::Integer=18,
 )
-    objective in SURVIVOR_OBJECTIVES ||
-        throw(ArgumentError(
-            "objective must be one of $(collect(SURVIVOR_OBJECTIVES)); got $objective",
-        ))
+    objective = _canonical_survivor_objective(objective)
     probability = _validate_survivor_probability(weekly_survival_probability)
     reach_discount_policy in SURVIVOR_REACH_DISCOUNT_POLICIES ||
         throw(ArgumentError(
@@ -91,6 +99,34 @@ function SurvivorSelectionConfig(
     )
 end
 
+function _default_survivor_conic_optimizer()
+    oa_solver = JuMP.optimizer_with_attributes(
+        HiGHS.Optimizer,
+        MOI.Silent() => true,
+    )
+    conic_solver = JuMP.optimizer_with_attributes(
+        Clarabel.Optimizer,
+        MOI.Silent() => true,
+    )
+    return JuMP.optimizer_with_attributes(
+        Pajarito.Optimizer,
+        "verbose" => false,
+        "use_iterative_method" => true,
+        "oa_solver" => oa_solver,
+        "conic_solver" => conic_solver,
+    )
+end
+
+function _survivor_optimizer(
+    config::SurvivorSelectionConfig,
+    optimizer,
+)
+    optimizer !== nothing && return optimizer
+    config.objective === :micp &&
+        return _default_survivor_conic_optimizer()
+    return HiGHS.Optimizer
+end
+
 function _normalize_survivor_picks(picks_made)
     picks_made === nothing && return Dict{Int,String}()
     picks_made isa AbstractDict ||
@@ -117,7 +153,7 @@ function SurvivorPoolState(
     season::Integer,
     current_week::Integer;
     picks_made=Dict{Int,String}(),
-    strikes_remaining::Integer=1,
+    strikes_remaining::Integer=2,
 )
     season > 0 || throw(ArgumentError("season must be positive"))
     1 <= current_week <= 18 ||
@@ -141,7 +177,7 @@ function SurvivorPoolState(
     season::Integer,
     current_week::Integer,
     picks_made::AbstractDict;
-    strikes_remaining::Integer=1,
+    strikes_remaining::Integer=2,
 )
     return SurvivorPoolState(
         season,
@@ -157,8 +193,10 @@ end
 The selected forward plan returned by `optimize_survivor_pool`. `selections`
 contains one row per planned week, `current_pick` contains the current week's
 single selected row, and `discounts` records the fixed personal reach
-discount used for each week. `selection_config` records the effective MILP
-objective and eligibility policies.
+discount used for each week. For
+`:micp`, `selections` also contains
+plan-specific survival and elimination probabilities. `selection_config`
+records the effective objective and eligibility policies.
 """
 struct SurvivorPoolPlan
     state::SurvivorPoolState
@@ -223,7 +261,7 @@ end
 Return the probability of reaching each week in a future horizon under a
 fixed weekly survival probability. The first entry is always `1.0`. With `k`
 prior future weeks and `s` remaining strikes, the discount is the probability
-of at most `s` losses in those `k` weeks.
+of fewer than `s` losses in those `k` weeks; zero strikes allows no losses.
 """
 function survivor_reach_discounts(
     number_of_weeks::Integer;
@@ -247,7 +285,7 @@ function survivor_reach_discounts(
     discounts = Float64[]
     for prior_weeks in 0:(number_of_weeks - 1)
         reach_probability = 0.0
-        for losses in 0:min(Int(strikes_remaining), prior_weeks)
+        for losses in 0:min(max(Int(strikes_remaining) - 1, 0), prior_weeks)
             reach_probability +=
                 binomial(prior_weeks, losses) *
                 (1.0 - probability)^losses *
@@ -497,14 +535,397 @@ function _survivor_discount_table(
     )
 end
 
+function _add_survivor_assignment_constraints!(
+    model,
+    data::AbstractDataFrame,
+    state::SurvivorPoolState,
+    config::SurvivorSelectionConfig,
+    selected,
+)
+    candidate_indices = 1:nrow(data)
+    for week in state.current_week:config.through_week
+        indices = findall(==(week), data.week)
+        @constraint(model, sum(selected[index] for index in indices) == 1)
+    end
+    for team in unique(data.team)
+        indices = findall(==(team), data.team)
+        @constraint(model, sum(selected[index] for index in indices) <= 1)
+    end
+    market_eligible = _survivor_market_guard_mask(data, state, config)
+    for index in candidate_indices
+        market_eligible[index] || @constraint(model, selected[index] == 0)
+    end
+    return candidate_indices
+end
+
+function _survivor_subsets(
+    values::AbstractVector{<:Integer},
+    cardinality::Integer,
+)
+    cardinality >= 0 || throw(ArgumentError("subset cardinality must be nonnegative"))
+    cardinality > length(values) && return Vector{Vector{Int}}()
+    result = Vector{Vector{Int}}()
+    chosen = Int[]
+
+    function visit!(start_index::Int)
+        length(chosen) == cardinality && begin
+            push!(result, copy(chosen))
+            return
+        end
+        remaining = cardinality - length(chosen)
+        last_index = length(values) - remaining + 1
+        for index in start_index:last_index
+            push!(chosen, Int(values[index]))
+            visit!(index + 1)
+            pop!(chosen)
+        end
+    end
+
+    visit!(1)
+    return result
+end
+
+function _survivor_loss_threshold(state::SurvivorPoolState)
+    return max(1, state.strikes_remaining)
+end
+
+function _survivor_terminal_paths(
+    number_of_weeks::Integer,
+    losses_to_elimination::Integer,
+)
+    number_of_weeks >= 1 ||
+        throw(ArgumentError("number_of_weeks must be positive"))
+    losses_to_elimination >= 1 ||
+        throw(ArgumentError("losses_to_elimination must be positive"))
+
+    paths = NamedTuple{
+        (:loss_positions, :path_length, :elimination_week, :coefficient),
+        Tuple{Vector{Int},Int,Union{Nothing,Int},Float64},
+    }[]
+    if losses_to_elimination <= number_of_weeks
+        for elimination_week in losses_to_elimination:number_of_weeks
+            for prior_losses in _survivor_subsets(
+                collect(1:(elimination_week - 1)),
+                losses_to_elimination - 1,
+            )
+                push!(
+                    paths,
+                    (
+                        loss_positions=vcat(prior_losses, elimination_week),
+                        path_length=elimination_week,
+                        elimination_week=Int(elimination_week),
+                        coefficient=Float64(number_of_weeks - elimination_week + 2),
+                    ),
+                )
+            end
+        end
+    end
+
+    for loss_count in 0:min(
+        losses_to_elimination - 1,
+        number_of_weeks,
+    )
+        for loss_positions in _survivor_subsets(
+            collect(1:number_of_weeks),
+            loss_count,
+        )
+            push!(
+                paths,
+                (
+                    loss_positions=loss_positions,
+                    path_length=Int(number_of_weeks),
+                    elimination_week=nothing,
+                    coefficient=1.0,
+                ),
+            )
+        end
+    end
+    return paths
+end
+
+function _survivor_require_interior_probabilities(data::AbstractDataFrame)
+    any(
+        probability -> !(0.0 < probability < 1.0),
+        data.win_probability,
+    ) && throw(ArgumentError(
+        "micp requires win probabilities strictly " *
+        "between 0 and 1",
+    ))
+    return nothing
+end
+
+function _survivor_week_indices(
+    data::AbstractDataFrame,
+)
+    week_indices = Dict{Int,Vector{Int}}()
+    for index in 1:nrow(data)
+        push!(get!(week_indices, Int(data.week[index]), Int[]), index)
+    end
+    return week_indices
+end
+
+function _survivor_path_log_expression(
+    model,
+    path,
+    data::AbstractDataFrame,
+    selected,
+    week_indices::Dict{Int,Vector{Int}},
+    first_week::Integer,
+)
+    loss_positions = Set(path.loss_positions)
+    terms = Any[]
+    for position in 1:path.path_length
+        week = Int(first_week) + position - 1
+        for index in week_indices[week]
+            probability = data.win_probability[index]
+            log_probability = position in loss_positions ?
+                log1p(-probability) :
+                log(probability)
+            push!(terms, log_probability * selected[index])
+        end
+    end
+    return log(path.coefficient) + sum(terms; init=0.0)
+end
+
+function _add_logsumexp_epigraph!(
+    model,
+    upper_bound,
+    terms,
+)
+    isempty(terms) && throw(ArgumentError("log-sum-exp requires at least one term"))
+    auxiliaries = @variable(model, auxiliary[1:length(terms)] >= 0)
+    @constraint(
+        model,
+        [index=1:length(terms)],
+        [terms[index] - upper_bound, 1.0, auxiliaries[index]] in
+            MOI.ExponentialCone(),
+    )
+    @constraint(model, sum(auxiliaries) <= 1.0)
+    return auxiliaries
+end
+
+function _survivor_selected_indices(model, selected, candidate_indices)
+    return [
+        index for index in candidate_indices if value(selected[index]) > 0.5
+    ]
+end
+
+function _survivor_terminal_statistics(
+    paths,
+    data::AbstractDataFrame,
+    selected_indices::AbstractVector{<:Integer},
+    state::SurvivorPoolState,
+    through_week::Integer,
+)
+    selected_by_week = Dict(
+        Int(data.week[index]) => data.win_probability[index]
+        for index in selected_indices
+    )
+    number_of_weeks = through_week - state.current_week + 1
+    survival_probability = zeros(Float64, number_of_weeks)
+    cost = 0.0
+    for path in paths
+        path_probability = 1.0
+        loss_positions = Set(path.loss_positions)
+        for position in 1:path.path_length
+            week = state.current_week + position - 1
+            probability = selected_by_week[week]
+            path_probability *= position in loss_positions ?
+                1.0 - probability :
+                probability
+        end
+        cost += path.coefficient * path_probability
+        if isnothing(path.elimination_week)
+            survival_probability .+= path_probability
+        else
+            survived_weeks = path.path_length - 1
+            if survived_weeks > 0
+                survival_probability[1:survived_weeks] .+= path_probability
+            end
+        end
+    end
+    return (
+        cost=cost,
+        survival_probability=survival_probability,
+        expected_weeks=sum(survival_probability),
+    )
+end
+
 function _survivor_objective_contribution(
     probability::Real,
     discount::Real,
     objective::Symbol,
 )
-    objective === :discounted_expected_wins &&
+    objective === :milp &&
         return Float64(discount) * Float64(probability)
     throw(ArgumentError("unsupported survivor objective: $objective"))
+end
+
+function _survivor_constant_plan(
+    data::AbstractDataFrame,
+    state::SurvivorPoolState,
+    config::SurvivorSelectionConfig,
+    discount_table::AbstractDataFrame;
+    optimizer=nothing,
+)
+    model = Model(isnothing(optimizer) ? HiGHS.Optimizer : optimizer)
+    set_silent(model)
+    candidate_indices = 1:nrow(data)
+    @variable(model, selected[candidate_indices], Bin)
+    _add_survivor_assignment_constraints!(
+        model,
+        data,
+        state,
+        config,
+        selected,
+    )
+    @objective(model, Max, 0.0)
+    optimize!(model)
+    JuMP.is_solved_and_feasible(model) ||
+        throw(ArgumentError(
+            "survivor optimization failed with termination status " *
+            "$(termination_status(model))",
+        ))
+
+    selected_indices = _survivor_selected_indices(
+        model,
+        selected,
+        candidate_indices,
+    )
+    selections = sort(data[selected_indices, :], [:week, :team])
+    selections.survival_probability = ones(Float64, nrow(selections))
+    selections.elimination_probability = zeros(Float64, nrow(selections))
+    selections.objective_contribution = selections.survival_probability
+    current_pick = selections[selections.week .== state.current_week, :]
+    nrow(current_pick) == 1 ||
+        throw(ArgumentError("survivor optimization did not select one current-week pick"))
+
+    return SurvivorPoolPlan(
+        state,
+        selections,
+        current_pick,
+        discount_table,
+        Float64(config.through_week - state.current_week + 1),
+        config,
+    )
+end
+
+function _optimize_survivor_expected_weeks(
+    data::AbstractDataFrame,
+    state::SurvivorPoolState,
+    config::SurvivorSelectionConfig,
+    discount_table::AbstractDataFrame;
+    optimizer=nothing,
+)
+    _survivor_require_interior_probabilities(data)
+    number_of_weeks = config.through_week - state.current_week + 1
+    losses_to_elimination = _survivor_loss_threshold(state)
+    losses_to_elimination > number_of_weeks &&
+        return _survivor_constant_plan(
+            data,
+            state,
+            config,
+            discount_table;
+            optimizer=optimizer,
+        )
+
+    paths = _survivor_terminal_paths(
+        number_of_weeks,
+        losses_to_elimination,
+    )
+    model = Model(_survivor_optimizer(config, optimizer))
+    set_silent(model)
+    candidate_indices = 1:nrow(data)
+    @variable(model, selected[candidate_indices], Bin)
+    _add_survivor_assignment_constraints!(
+        model,
+        data,
+        state,
+        config,
+        selected,
+    )
+
+    week_indices = _survivor_week_indices(data)
+    path_terms = [
+        _survivor_path_log_expression(
+            model,
+            path,
+            data,
+            selected,
+            week_indices,
+            state.current_week,
+        ) for path in paths
+    ]
+    @variable(model, log_cost)
+    _add_logsumexp_epigraph!(model, log_cost, path_terms)
+    @objective(model, Min, log_cost)
+    optimize!(model)
+
+    JuMP.is_solved_and_feasible(model) ||
+        throw(ArgumentError(
+            "survivor optimization failed with termination status " *
+            "$(termination_status(model))",
+        ))
+    selected_indices = _survivor_selected_indices(
+        model,
+        selected,
+        candidate_indices,
+    )
+    selections = sort(data[selected_indices, :], [:week, :team])
+    nrow(selections) == number_of_weeks ||
+        throw(ArgumentError("survivor optimization did not select one team per week"))
+
+    statistics = _survivor_terminal_statistics(
+        paths,
+        data,
+        selected_indices,
+        state,
+        config.through_week,
+    )
+    model_cost = exp(Float64(value(log_cost)))
+    isfinite(model_cost) ||
+        throw(ArgumentError("survivor conic objective returned a non-finite value"))
+    isapprox(
+        statistics.cost,
+        model_cost;
+        rtol=1e-4,
+        atol=1e-7,
+    ) || throw(ArgumentError(
+        "survivor conic objective and selected-path evaluation disagree",
+    ))
+    expected_weeks = (number_of_weeks + 1.0) - statistics.cost
+    isapprox(
+        expected_weeks,
+        statistics.expected_weeks;
+        rtol=1e-8,
+        atol=1e-8,
+    ) || throw(ArgumentError(
+        "survivor terminal-path probabilities do not sum to the expected weeks",
+    ))
+
+    survival_by_week = Dict(
+        state.current_week + position - 1 => probability
+        for (position, probability) in enumerate(
+            statistics.survival_probability,
+        )
+    )
+    selections.survival_probability = [
+        survival_by_week[Int(week)] for week in selections.week
+    ]
+    selections.elimination_probability = 1.0 .- selections.survival_probability
+    selections.objective_contribution = selections.survival_probability
+    current_pick = selections[selections.week .== state.current_week, :]
+    nrow(current_pick) == 1 ||
+        throw(ArgumentError("survivor optimization did not select one current-week pick"))
+
+    return SurvivorPoolPlan(
+        state,
+        selections,
+        current_pick,
+        discount_table,
+        Float64(expected_weeks),
+        config,
+    )
 end
 
 """
@@ -513,14 +934,15 @@ end
 Solve the survivor assignment problem from an injected team-level candidate
 table. `selection_config` controls the objective, reach discounts, market
 guard, missing-line policy, and planning horizon. The default objective
-maximizes expected future wins using fixed personal reach discounts; it does
-not model the probability that the entire pool survives.
+`:milp` uses fixed personal reach discounts as a tractable approximation to
+expected completed weeks survived. The `:micp` objective uses a terminal-path
+exponential-cone model and reports expected completed weeks survived.
 """
 function optimize_survivor_pool(
     candidates::AbstractDataFrame,
     state::SurvivorPoolState;
     selection_config::SurvivorSelectionConfig=SurvivorSelectionConfig(),
-    optimizer=HiGHS.Optimizer,
+    optimizer=nothing,
 )
     config = selection_config
     state.current_week <= config.through_week ||
@@ -537,6 +959,15 @@ function optimize_survivor_pool(
         row.week => row.discount for row in eachrow(discount_table)
     )
     data.discount = [discount_by_week[week] for week in data.week]
+    if config.objective === :micp
+        return _optimize_survivor_expected_weeks(
+            data,
+            state,
+            config,
+            discount_table;
+            optimizer=optimizer,
+        )
+    end
     data.objective_contribution = [
         _survivor_objective_contribution(
             probability,
@@ -549,23 +980,17 @@ function optimize_survivor_pool(
         )
     ]
 
-    model = Model(optimizer)
+    model = Model(_survivor_optimizer(config, optimizer))
     set_silent(model)
     candidate_indices = 1:nrow(data)
     @variable(model, selected[candidate_indices], Bin)
-
-    for week in state.current_week:config.through_week
-        indices = findall(==(week), data.week)
-        @constraint(model, sum(selected[index] for index in indices) == 1)
-    end
-    for team in unique(data.team)
-        indices = findall(==(team), data.team)
-        @constraint(model, sum(selected[index] for index in indices) <= 1)
-    end
-    market_eligible = _survivor_market_guard_mask(data, state, config)
-    for index in candidate_indices
-        market_eligible[index] || @constraint(model, selected[index] == 0)
-    end
+    _add_survivor_assignment_constraints!(
+        model,
+        data,
+        state,
+        config,
+        selected,
+    )
     @objective(
         model,
         Max,
@@ -578,9 +1003,11 @@ function optimize_survivor_pool(
             "survivor optimization failed with termination status $(termination_status(model))",
         ))
 
-    selected_indices = [
-        index for index in candidate_indices if value(selected[index]) > 0.5
-    ]
+    selected_indices = _survivor_selected_indices(
+        model,
+        selected,
+        candidate_indices,
+    )
     selections = sort(data[selected_indices, :], [:week, :team])
     current_pick = selections[selections.week .== state.current_week, :]
     nrow(current_pick) == 1 ||
@@ -608,7 +1035,7 @@ function optimize_survivor_pool(
     selection_config::SurvivorSelectionConfig=SurvivorSelectionConfig(),
     include_completed::Bool=false,
     horizon::Real=GAME_CLOCK_SECONDS,
-    optimizer=HiGHS.Optimizer,
+    optimizer=nothing,
 )
     state.season == context.season ||
         throw(ArgumentError("survivor state season must match forecast context season"))
@@ -640,7 +1067,7 @@ function optimize_survivor_pool(
     season::Integer;
     as_of_week::Integer,
     picks_made=Dict{Int,String}(),
-    strikes_remaining::Integer=1,
+    strikes_remaining::Integer=2,
     selection_config::SurvivorSelectionConfig=SurvivorSelectionConfig(),
     schedule::Union{Nothing,AbstractDataFrame}=nothing,
     historical_drives::Union{Nothing,AbstractDataFrame}=nothing,
@@ -650,7 +1077,7 @@ function optimize_survivor_pool(
     method::PriorFitMethod=DEFAULT_PRIOR_FIT_METHOD,
     include_completed::Bool=false,
     horizon::Real=GAME_CLOCK_SECONDS,
-    optimizer=HiGHS.Optimizer,
+    optimizer=nothing,
 )
     state = SurvivorPoolState(
         season,
@@ -681,11 +1108,11 @@ end
 function optimize_survivor_pool(
     context::RegularSeasonForecastContext;
     picks_made=Dict{Int,String}(),
-    strikes_remaining::Integer=1,
+    strikes_remaining::Integer=2,
     selection_config::SurvivorSelectionConfig=SurvivorSelectionConfig(),
     include_completed::Bool=false,
     horizon::Real=GAME_CLOCK_SECONDS,
-    optimizer=HiGHS.Optimizer,
+    optimizer=nothing,
 )
     state = SurvivorPoolState(
         context.season,

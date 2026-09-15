@@ -68,6 +68,30 @@ function _market_guard_candidates()
     )
 end
 
+function _survivor_expected_weeks_bruteforce(
+    probabilities::AbstractVector{<:Real},
+    losses_to_elimination::Integer,
+)
+    total = Ref(0.0)
+    number_of_weeks = length(probabilities)
+    visit = function(week, losses, probability)
+        if week > number_of_weeks
+            total[] += number_of_weeks * probability
+            return
+        end
+        win_probability = Float64(probabilities[week])
+        visit(week + 1, losses, probability * win_probability)
+        loss_probability = probability * (1.0 - win_probability)
+        if losses + 1 >= losses_to_elimination
+            total[] += (week - 1) * loss_probability
+        else
+            visit(week + 1, losses + 1, loss_probability)
+        end
+    end
+    visit(1, 0, 1.0)
+    return total[]
+end
+
 @testset "survivor pool optimization" begin
     @testset "reach discounts" begin
         @test survivor_reach_discounts(
@@ -79,18 +103,18 @@ end
             5;
             weekly_survival_probability=0.65,
             strikes_remaining=1,
-        ) ≈ [1.0, 1.0, 0.8775, 0.71825, 0.56298125]
+        ) ≈ [1.0, 0.65, 0.4225, 0.274625, 0.17850625]
         @test survivor_reach_discounts(
             4;
             weekly_survival_probability=0.65,
             strikes_remaining=2,
-        ) ≈ [1.0, 1.0, 1.0, 0.957125]
+        ) ≈ [1.0, 1.0, 0.8775, 0.71825]
         @test survivor_reach_discounts(
             2,
             4;
             weekly_survival_probability=0.65,
             strikes_remaining=1,
-        ) ≈ [1.0, 1.0, 0.8775]
+        ) ≈ [1.0, 0.65, 0.4225]
         @test survivor_reach_discounts(0) == Float64[]
         @test_throws ArgumentError survivor_reach_discounts(
             2;
@@ -162,6 +186,80 @@ end
         @test plan.discounts.discount ≈ [1.0, 0.65]
         @test plan.objective_value ≈ 0.8 + 0.95 * 0.65
         @test plan.objective_value ≈ sum(plan.selections.objective_contribution)
+    end
+
+    @testset "terminal path expected-weeks objective" begin
+        paths = SurvivorModel._survivor_terminal_paths(17, 2)
+        @test length(paths) == 154
+        @test count(path -> !isnothing(path.elimination_week), paths) == 136
+        @test count(path -> isnothing(path.elimination_week), paths) == 18
+        @test length(SurvivorModel._survivor_terminal_paths(4, 1)) == 5
+
+        candidates = DataFrame(
+            game_id=["week1", "week1", "week2", "week2"],
+            week=[1, 1, 2, 2],
+            team=["A", "B", "C", "D"],
+            opponent=["X", "Y", "Z", "W"],
+            is_home=[false, true, false, true],
+            win_probability=[0.6, 0.8, 0.9, 0.7],
+        )
+        config = SurvivorSelectionConfig(
+            objective=:micp,
+            minimum_favorite_spread=nothing,
+            market_guard_weeks=0,
+            through_week=2,
+        )
+        two_loss_allowance_plan = optimize_survivor_pool(
+            candidates,
+            SurvivorPoolState(2025, 1; strikes_remaining=2);
+            selection_config=config,
+        )
+        @test nrow(two_loss_allowance_plan.selections) == 2
+        @test two_loss_allowance_plan.objective_value ≈
+            _survivor_expected_weeks_bruteforce([0.8, 0.9], 2)
+        @test two_loss_allowance_plan.objective_value ≈
+            sum(two_loss_allowance_plan.selections.objective_contribution)
+        @test two_loss_allowance_plan.selections.survival_probability ≈ [1.0, 0.98]
+        @test two_loss_allowance_plan.selections.elimination_probability ≈ [0.0, 0.02]
+
+        one_loss_allowance_plan = optimize_survivor_pool(
+            candidates,
+            SurvivorPoolState(2025, 1; strikes_remaining=1);
+            selection_config=config,
+        )
+        @test one_loss_allowance_plan.selections.team == ["B", "C"]
+        @test one_loss_allowance_plan.objective_value ≈
+            _survivor_expected_weeks_bruteforce([0.8, 0.9], 1)
+        @test one_loss_allowance_plan.selections.survival_probability ≈ [0.8, 0.72]
+
+        constant_plan = optimize_survivor_pool(
+            candidates,
+            SurvivorPoolState(2025, 1; strikes_remaining=3);
+            selection_config=config,
+        )
+        @test constant_plan.objective_value ≈ 2.0
+        @test all(constant_plan.selections.survival_probability .== 1.0)
+    end
+
+    @testset "expected-weeks probability validation" begin
+        endpoint_candidates = DataFrame(
+            game_id=["endpoint", "endpoint"],
+            week=[1, 1],
+            team=["A", "B"],
+            opponent=["C", "D"],
+            is_home=[true, false],
+            win_probability=[0.0, 0.8],
+        )
+        @test_throws ArgumentError optimize_survivor_pool(
+            endpoint_candidates,
+            SurvivorPoolState(2025, 1; strikes_remaining=1);
+            selection_config=SurvivorSelectionConfig(
+                objective=:micp,
+                minimum_favorite_spread=nothing,
+                market_guard_weeks=0,
+                through_week=1,
+            ),
+        )
     end
 
     @testset "near-term market favorite guard" begin
@@ -263,9 +361,9 @@ end
 
     @testset "selection configuration" begin
         @test SurvivorSelectionConfig().objective ===
-            :discounted_expected_wins
+            :milp
         no_guard_config = SurvivorSelectionConfig(
-            objective=:discounted_expected_wins,
+            objective=:milp,
             minimum_favorite_spread=nothing,
             missing_market_policy=:exclude,
             market_guard_weeks=0,

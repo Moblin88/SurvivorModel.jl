@@ -50,11 +50,18 @@ end
             show_help=false,
             season=2023,
             initial_strikes=2,
+            objective=:milp,
             refresh_data=false,
         )
         @test SurvivorModel._parse_survivor_cli_args(
             ["--season=2023", "--strikes=4"],
         ).initial_strikes == 4
+        @test SurvivorModel._parse_survivor_cli_args(
+            ["--season=2023", "--objective", "micp"],
+        ).objective == :micp
+        @test SurvivorModel._parse_survivor_cli_args(
+            ["--season=2023", "--objective=micp"],
+        ).objective == :micp
         @test SurvivorModel._read_survivor_cli_picks(
             IOBuffer("KC\n\n sf \n"),
         ) == ["KC", "SF"]
@@ -70,6 +77,19 @@ end
         )
         @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
             ["--strikes", "2"],
+        )
+        @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
+            ["--season", "2023", "--objective", "unknown"],
+        )
+        @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
+            ["--season", "2023", "--objective", "discounted_expected_wins"],
+        )
+        @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
+            ["--season", "2023", "--objective", "expected_weeks_before_elimination"],
+        )
+        @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
+            ["--season", "2023", "--objective", "milp",
+             "--objective", "micp"],
         )
         @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
             ["--benchmark", "--season", "2023"],
@@ -178,6 +198,14 @@ end
             2023,
             ["A"],
             0,
+        )
+        two_loss_schedule = copy(schedule)
+        two_loss_schedule.result[two_loss_schedule.week .== 2] .= 7
+        @test_throws ArgumentError SurvivorModel._survivor_cli_state(
+            SurvivorModel.load_schedule(two_loss_schedule),
+            2023,
+            ["A", "C"],
+            2,
         )
 
         tie_schedule = copy(schedule)

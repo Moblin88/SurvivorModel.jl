@@ -25,8 +25,8 @@ end
 function _survivor_cli_usage()
     return """
     Usage:
-      survivor --season YEAR [--strikes N] < picks.txt
-      julia --project=. -m SurvivorModel --season YEAR [--strikes N] < picks.txt
+      survivor --season YEAR [--strikes N] [--objective NAME] < picks.txt
+      julia --project=. -m SurvivorModel --season YEAR [--strikes N] [--objective NAME] < picks.txt
 
     Input:
       One team abbreviation per nonblank line, starting with week 1.
@@ -34,7 +34,10 @@ function _survivor_cli_usage()
 
     Options:
       --season YEAR       Target season (required).
-      --strikes N         Initial loss allowance (default: 2).
+      --strikes N         Initial strike count (default: 2).
+      --objective NAME    Selection objective (default:
+                          milp; use micp for the conic
+                          expected-weeks strategy).
       --refresh-data      Clear NFLData's raw cache and refresh summarized
                           historical drive data before running.
       --help              Show this help.
@@ -48,10 +51,17 @@ function _parse_survivor_cli_integer(value::AbstractString, option::AbstractStri
     return parsed
 end
 
+function _parse_survivor_cli_objective(value::AbstractString)
+    normalized = lowercase(replace(strip(value), '-' => '_'))
+    return _canonical_survivor_objective(Symbol(normalized))
+end
+
 function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
     season = nothing
     initial_strikes = 2
     strikes_specified = false
+    objective = DEFAULT_SURVIVOR_OBJECTIVE
+    objective_specified = false
     refresh_data = false
     refresh_data_specified = false
     show_help = false
@@ -81,7 +91,9 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
 
         option = nothing
         value = nothing
-        if argument == "--season" || argument == "--strikes"
+        if argument == "--season" ||
+            argument == "--strikes" ||
+            argument == "--objective"
             option = argument
             index += 1
             index <= length(args) ||
@@ -93,6 +105,9 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
         elseif startswith(argument, "--strikes=")
             option = "--strikes"
             value = argument[length("--strikes=") + 1:end]
+        elseif startswith(argument, "--objective=")
+            option = "--objective"
+            value = argument[length("--objective=") + 1:end]
         else
             throw(ArgumentError("unknown option: $argument"))
         end
@@ -109,6 +124,11 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
                 throw(ArgumentError("--strikes may only be specified once"))
             initial_strikes = parsed
             strikes_specified = true
+        elseif option == "--objective"
+            objective_specified &&
+                throw(ArgumentError("--objective may only be specified once"))
+            objective = _parse_survivor_cli_objective(value)
+            objective_specified = true
         end
         index += 1
     end
@@ -117,6 +137,7 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
         show_help=true,
         season=0,
         initial_strikes=2,
+        objective=DEFAULT_SURVIVOR_OBJECTIVE,
         refresh_data=false,
     )
     season === nothing && throw(ArgumentError("--season is required"))
@@ -127,6 +148,7 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
         show_help=false,
         season=Int(season),
         initial_strikes=Int(initial_strikes),
+        objective=objective,
         refresh_data=refresh_data,
     )
 end
@@ -202,7 +224,11 @@ function _survivor_cli_state(
     strikes_remaining >= 0 ||
         throw(ArgumentError(
             "the supplied picks contain $losses losses, exceeding the " *
-            "$initial_strikes-strike allowance",
+            "$initial_strikes-strike count",
+        ))
+    losses < max(1, Int(initial_strikes)) ||
+        throw(ArgumentError(
+            "the supplied picks already reach the elimination loss threshold",
         ))
     return (
         current_week=length(picks) + 1,
@@ -337,7 +363,10 @@ function _run_survivor_cli(
         picks_made=state.picks_made,
         strikes_remaining=state.strikes_remaining,
         include_completed=true,
-        selection_config=SurvivorSelectionConfig(through_week=through_week),
+        selection_config=SurvivorSelectionConfig(
+            objective=options.objective,
+            through_week=through_week,
+        ),
     )
     record_timing(:optimize)
     nrow(plan.current_pick) == 1 ||

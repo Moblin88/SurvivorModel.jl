@@ -248,7 +248,7 @@ context = fit_regular_season_forecast(2025; as_of_week=1)
 plan = optimize_survivor_pool(
     context;
     picks_made=Dict{Int,String}(),
-    strikes_remaining=1,
+    strikes_remaining=2,
     selection_config=SurvivorSelectionConfig(
         weekly_survival_probability=0.65,
         through_week=18,
@@ -260,15 +260,45 @@ plan.selections
 plan.objective_value
 ```
 
-The optimizer expands each unplayed forecast game into a home-team and
-away-team candidate, excludes teams in `picks_made`, and solves one binary
-assignment model with JuMP and HiGHS. It selects exactly one team for every
-week in the requested horizon and allows each team to be selected at most
-once. `plan.selections` includes each selected team's win probability, reach
-discount, selected-team market spread, and discounted objective contribution;
-`plan.current_pick` is the row to use for the current week. The effective
-`plan.selection_config` records the objective, reach-discount policy, market
-guard, missing-line policy, and horizon used by the MILP.
+The default `:milp` optimizer expands each unplayed forecast game into a
+home-team and away-team candidate, excludes teams in `picks_made`, and solves
+one binary assignment model with JuMP and HiGHS. It selects exactly one team
+for every week in the requested horizon and allows each team to be selected at
+most once. Both options target a larger expected number of completed weeks
+before elimination: `:milp` uses fixed reach discounts and a linear
+candidate-level approximation, while `:micp` evaluates selected-plan terminal
+paths with a mixed-integer conic model.
+
+`plan.selections` includes each selected team's win probability, reach discount,
+selected-team market spread, and objective contribution; `plan.current_pick` is
+the row to use for the current week. The effective `plan.selection_config`
+records the objective, reach-discount policy, market guard, missing-line
+policy, and horizon.
+
+The `:micp` objective uses the terminal-path conic formulation:
+
+```julia
+plan = optimize_survivor_pool(
+    context;
+    strikes_remaining=2,
+    selection_config=SurvivorSelectionConfig(
+        objective=:micp,
+        through_week=18,
+    ),
+)
+```
+
+The two modes use the same strike semantics:
+`strikes_remaining=s` means the `s`-th future loss eliminates the pool, while
+zero means the next loss eliminates it. It enumerates terminal
+elimination paths and end-of-horizon survival paths, writes each path
+probability as the exponential of an affine function of the binary selections,
+and minimizes their positive weighted sum with an exponential-cone log-sum-exp
+formulation. It uses Pajarito with HiGHS for outer approximation and Clarabel
+for the continuous exponential-cone subproblems. Candidate win probabilities
+for this objective must be strictly between zero and one. The selected rows
+also include `survival_probability`, `elimination_probability`, and the
+per-week expected-survival contribution.
 
 ### Survivor command-line app
 
@@ -294,10 +324,17 @@ Then run it from any directory:
 survivor --season 2026 < picks.txt
 ```
 
+Pass `--objective micp` to use the conic expected-weeks strategy; the default
+is `milp`:
+
+```sh
+survivor --season 2026 --objective micp < picks.txt
+```
+
 The app reads one team abbreviation per nonblank line, starting with week 1.
 It infers the next week from the number of picks, loads the season schedule to
 count completed losses (ties count as losses), and defaults to two initial
-strikes. Use `--strikes N` to choose a different initial loss allowance. The
+strikes. Use `--strikes N` to choose a different initial strike count. The
 effective week is one plus the number of supplied picks; games at or after
 that week are treated as future games even when the schedule already contains
 their results, which allows replaying an earlier week of a completed season.
@@ -329,22 +366,23 @@ target-season PBP and uses historical drives only. Once prior picks imply week
 not omitted. Cache clearing is a maintenance operation; normal weekly runs
 should use `--refresh-data` instead.
 
-The default objective is expected future wins weighted by the probability of
-still being alive before each week. It does not estimate the exact probability
-that the entire pool survives. The MILP always selects one team per week and
-uses each team at most once. `SurvivorSelectionConfig` can change the
-objective, weekly survival probability, reach-discount policy, market guard,
-missing-line policy, and planning horizon. The default market policy protects
+The default `:milp` objective uses fixed reach discounts and candidate win
+probabilities as a tractable approximation to expected completed weeks. It
+does not estimate the exact selected-plan probability that the entire pool
+survives. The MILP always selects one team per week and uses each team at most
+once. `SurvivorSelectionConfig` can change the objective, weekly survival
+probability, reach-discount policy, market guard, missing-line policy, and
+planning horizon. The default market policy protects
 the current and following week by requiring a selected team to be favored by at
 least `2.0` points; missing lines remain eligible. Positive `market_spread`
 values mean the selected team is favored.
 
-With fixed weekly survival probability `q`, no remaining strikes uses
-`d[k] = q^k`, where `k` is the number of prior planned weeks. With `s`
-remaining strikes, the discount is the probability of having at most `s`
+With fixed weekly survival probability `q`, zero or one remaining strike uses
+`d[k] = q^k`, where `k` is the number of prior planned weeks. With `s >= 2`
+remaining strikes, the discount is the probability of having fewer than `s`
 losses in those prior weeks:
 `d[k] = sum(binomial(k, losses) * (1-q)^losses * q^(k-losses))` for
-`losses = 0:min(s, k)`.
+`losses = 0:min(s - 1, k)`.
 
 ### Developer benchmarks
 

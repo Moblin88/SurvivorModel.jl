@@ -67,6 +67,13 @@ full_forecast = SurvivorModel.forecast_regular_season(
 )
 ```
 
+The `:micp` survivor objective is a mixed-integer
+exponential-cone model. It uses Pajarito with HiGHS for outer approximation and
+Clarabel for continuous conic subproblems. The model enumerates terminal
+elimination and end-survival paths rather than all win/loss histories; each
+path contributes one exponential-cone log-sum-exp term. Use strictly interior
+candidate win probabilities for this objective because it takes logarithms.
+
 For a matchup-level diagnostic, use
 `SurvivorModel.expected_game_metrics`. Score-mark, drive-moment, hazard-theta,
 and predictive-spread helpers are likewise qualified research interfaces.

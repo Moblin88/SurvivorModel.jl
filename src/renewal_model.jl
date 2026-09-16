@@ -1003,13 +1003,6 @@ function _drive_moments_from_hazards(
     p_td = sum(td_weights)
     p_defensive = sum(defensive_weights)
 
-    conditional_mean_time = (weights, probability) ->
-        probability > 0 ?
-            sum(weights[k] * e_time[k] for k in 1:n) / probability :
-            zero(T)
-    mean_T_td = conditional_mean_time(td_weights, p_td)
-    mean_T_defensive = conditional_mean_time(defensive_weights, p_defensive)
-
     mean_T = sum(contrib_ET)
     mean_T2 = sum(contrib_ET2)
     var_T = mean_T2 - mean_T^2

@@ -823,6 +823,30 @@ struct ScoreMarks
     var_td::Float64
     mean_defensive::Float64
     var_defensive::Float64
+    mean_td_by_bin::Vector{Float64}
+    var_td_by_bin::Vector{Float64}
+    mean_defensive_by_bin::Vector{Float64}
+    var_defensive_by_bin::Vector{Float64}
+end
+
+ScoreMarks(mean_td::Real, var_td::Real, mean_defensive::Real, var_defensive::Real) =
+    ScoreMarks(
+        Float64(mean_td),
+        Float64(var_td),
+        Float64(mean_defensive),
+        Float64(var_defensive),
+        Float64[],
+        Float64[],
+        Float64[],
+        Float64[],
+    )
+
+function _score_mark_bin(duration, edges::AbstractVector{<:Real})
+    seconds = Dates.value(Second(duration))
+    for bin in 1:(length(edges) - 1)
+        seconds <= edges[bin + 1] && return bin
+    end
+    throw(ArgumentError("drive duration falls outside time_edges"))
 end
 
 """
@@ -830,9 +854,11 @@ end
 
 Estimate outcome-conditional score moments. Censored drives are excluded.
 All non-touchdown, non-censored outcomes are included in the defensive-event
-mark.
+mark. When `time_edges` is supplied, the returned mark moments are also
+estimated separately for each elapsed-drive-time bin; bins without observations
+fall back to the corresponding overall moment.
 """
-function fit_score_marks(drives::AbstractDataFrame)
+function fit_score_marks(drives::AbstractDataFrame; time_edges=nothing)
     complete = subset(
         drives,
         :drive_result => ByRow(x -> _classify_event(x) !== :censored);
@@ -851,11 +877,57 @@ function fit_score_marks(drives::AbstractDataFrame)
     isempty(defensive_points) &&
         throw(ArgumentError("no defensive-event drives available for score marks"))
 
-    return ScoreMarks(
+    overall = ScoreMarks(
         mean(td_points),
         var(td_points; corrected=false),
         mean(defensive_points),
         var(defensive_points; corrected=false),
+    )
+    time_edges === nothing && return overall
+
+    edges = _validate_time_edges(time_edges)
+    binned = subset(
+        complete,
+        :time_of_possession => ByRow(!ismissing);
+        skipmissing=true,
+    )
+    bin_events = _classify_event.(binned.drive_result)
+    bin_scores = ifelse.(
+        binned.posteam_home,
+        binned.home_spread_change,
+        -binned.home_spread_change,
+    )
+    n_bins = length(edges) - 1
+    mean_td = fill(overall.mean_td, n_bins)
+    var_td = fill(overall.var_td, n_bins)
+    mean_defensive = fill(overall.mean_defensive, n_bins)
+    var_defensive = fill(overall.var_defensive, n_bins)
+    for bin in 1:n_bins
+        in_bin = [
+            _score_mark_bin(binned.time_of_possession[i], edges) == bin
+            for i in 1:nrow(binned)
+        ]
+        td_bin = bin_scores[in_bin .& (bin_events .=== :td)]
+        defensive_bin = bin_scores[in_bin .& (bin_events .=== :defensive)]
+        isempty(td_bin) || begin
+            mean_td[bin] = mean(td_bin)
+            var_td[bin] = var(td_bin; corrected=false)
+        end
+        isempty(defensive_bin) || begin
+            mean_defensive[bin] = mean(defensive_bin)
+            var_defensive[bin] = var(defensive_bin; corrected=false)
+        end
+    end
+
+    return ScoreMarks(
+        overall.mean_td,
+        overall.var_td,
+        overall.mean_defensive,
+        overall.var_defensive,
+        mean_td,
+        var_td,
+        mean_defensive,
+        var_defensive,
     )
 end
 
@@ -931,23 +1003,36 @@ function _drive_moments_from_hazards(
     p_td = sum(td_weights)
     p_defensive = sum(defensive_weights)
 
-    conditional_mean_time = (weights, probability) ->
-        probability > 0 ?
-            sum(weights[k] * e_time[k] for k in 1:n) / probability :
-            zero(T)
-    mean_T_td = conditional_mean_time(td_weights, p_td)
-    mean_T_defensive = conditional_mean_time(defensive_weights, p_defensive)
-
     mean_T = sum(contrib_ET)
     mean_T2 = sum(contrib_ET2)
     var_T = mean_T2 - mean_T^2
 
-    mean_S = p_td * marks.mean_td + p_defensive * marks.mean_defensive
-    mean_S2 = p_td * (marks.var_td + marks.mean_td^2) +
-        p_defensive * (marks.var_defensive + marks.mean_defensive^2)
+    td_mean = isempty(marks.mean_td_by_bin) ?
+        fill(marks.mean_td, n) : marks.mean_td_by_bin
+    td_var = isempty(marks.var_td_by_bin) ?
+        fill(marks.var_td, n) : marks.var_td_by_bin
+    defensive_mean = isempty(marks.mean_defensive_by_bin) ?
+        fill(marks.mean_defensive, n) : marks.mean_defensive_by_bin
+    defensive_var = isempty(marks.var_defensive_by_bin) ?
+        fill(marks.var_defensive, n) : marks.var_defensive_by_bin
+    length(td_mean) == n && length(defensive_mean) == n ||
+        throw(ArgumentError("score marks must contain one value per time bin"))
+
+    mean_S = sum(
+        td_weights[k] * td_mean[k] + defensive_weights[k] * defensive_mean[k]
+        for k in 1:n
+    )
+    mean_S2 = sum(
+        td_weights[k] * (td_var[k] + td_mean[k]^2) +
+        defensive_weights[k] * (defensive_var[k] + defensive_mean[k]^2)
+        for k in 1:n
+    )
     var_S = mean_S2 - mean_S^2
-    mean_TS = p_td * mean_T_td * marks.mean_td +
-        p_defensive * mean_T_defensive * marks.mean_defensive
+    mean_TS = sum(
+        td_weights[k] * e_time[k] * td_mean[k] +
+        defensive_weights[k] * e_time[k] * defensive_mean[k]
+        for k in 1:n
+    )
     cov_TS = mean_TS - mean_T * mean_S
 
     return DriveMoments(

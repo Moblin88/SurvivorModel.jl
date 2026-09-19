@@ -285,7 +285,7 @@ function fit_regular_season_forecast(
         method=method,
     ) : prior
     model = fit_hazard_model(cutoff; prior=fitted_prior, time_edges=time_edges)
-    marks = fit_score_marks(training)
+    marks = fit_score_marks(training; time_edges=time_edges)
     games = target_schedule[target_schedule.week .>= as_of_week, :]
 
     return RegularSeasonForecastContext(

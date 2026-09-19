@@ -989,6 +989,20 @@ import SurvivorModel: expected_game_metrics
         @test marks.var_defensive == 2.25
     end
 
+    @testset "time-binned score marks" begin
+        drives = DataFrame(
+            posteam_home=[true, true, false, false],
+            drive_result=["Touchdown", "Touchdown", "Punt", "Punt"],
+            time_of_possession=[Second(30), Second(150), Second(30), Second(150)],
+            home_spread_change=[7.0, 3.0, 0.0, -2.0],
+        )
+        marks = fit_score_marks(drives; time_edges=[0, 120, Inf])
+        @test marks.mean_td_by_bin == [7.0, 3.0]
+        @test marks.var_td_by_bin == [0.0, 0.0]
+        @test marks.mean_defensive_by_bin == [0.0, 2.0]
+        @test marks.var_defensive_by_bin == [0.0, 0.0]
+    end
+
     @testset "two-outcome drive moments" begin
         drives = vcat(_make_drives(), _make_drives(), _make_drives())
         model = fit_hazard_model(drives; time_edges=[0, 120, 240, Inf])

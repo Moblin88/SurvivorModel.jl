@@ -1,5 +1,6 @@
 using DataFrames
 using Dates
+using ForwardDiff
 using Test
 using SurvivorModel
 
@@ -142,9 +143,20 @@ end
         direct_plan = optimize_survivor_pool(
             direct_candidates,
             SurvivorPoolState(2025, 1; strikes_remaining=0);
-            selection_config=SurvivorSelectionConfig(through_week=1),
+            selection_config=SurvivorSelectionConfig(
+                objective=:fixed_exact_milp,
+                through_week=1,
+            ),
         )
         @test direct_plan.current_pick.team == ["Favorite"]
+        @test_throws ArgumentError optimize_survivor_pool(
+            direct_candidates,
+            SurvivorPoolState(2025, 1; strikes_remaining=0);
+            selection_config=SurvivorSelectionConfig(
+                objective=:exact_milp,
+                through_week=1,
+            ),
+        )
 
         @test candidates.win_probability[
             (candidates.week .== 1) .& (candidates.team .== "B")
@@ -194,6 +206,7 @@ end
             build_survivor_candidates(_survivor_forecast_fixture()),
             state;
             selection_config=SurvivorSelectionConfig(
+                objective=:fixed_exact_milp,
                 through_week=2,
                 weekly_survival_probability=0.65,
             ),
@@ -217,7 +230,7 @@ end
             win_probability=[0.6, 0.8, 0.9, 0.7],
         )
         config = SurvivorSelectionConfig(
-            objective=:exact_milp,
+            objective=:fixed_exact_milp,
             minimum_favorite_spread=nothing,
             market_guard_weeks=0,
             through_week=2,
@@ -268,7 +281,7 @@ end
             endpoint_candidates,
             SurvivorPoolState(2025, 1; strikes_remaining=1);
             selection_config=SurvivorSelectionConfig(
-                objective=:exact_milp,
+                objective=:fixed_exact_milp,
                 minimum_favorite_spread=nothing,
                 market_guard_weeks=0,
                 through_week=1,
@@ -284,6 +297,7 @@ end
             _market_guard_candidates(),
             state;
             selection_config=SurvivorSelectionConfig(
+                objective=:fixed_exact_milp,
                 through_week=3,
                 weekly_survival_probability=0.65,
             ),
@@ -306,7 +320,10 @@ end
         missing_line_plan = optimize_survivor_pool(
             missing_line,
             SurvivorPoolState(2025, 1; strikes_remaining=0);
-            selection_config=SurvivorSelectionConfig(through_week=1),
+            selection_config=SurvivorSelectionConfig(
+                objective=:fixed_exact_milp,
+                through_week=1,
+            ),
         )
         @test missing_line_plan.current_pick.team == ["A"]
 
@@ -321,7 +338,10 @@ end
                 market_spread=[1.0, 1.5],
             ),
             SurvivorPoolState(2025, 1; strikes_remaining=0);
-            selection_config=SurvivorSelectionConfig(through_week=1),
+            selection_config=SurvivorSelectionConfig(
+                objective=:fixed_exact_milp,
+                through_week=1,
+            ),
         )
     end
 
@@ -342,7 +362,10 @@ end
         @test_throws ArgumentError optimize_survivor_pool(
             candidates,
             state;
-            selection_config=SurvivorSelectionConfig(through_week=3),
+            selection_config=SurvivorSelectionConfig(
+                objective=:fixed_exact_milp,
+                through_week=3,
+            ),
         )
     end
 
@@ -376,11 +399,396 @@ end
         @test plan.selection_config.through_week == 2
     end
 
+    @testset "analytic posterior derivatives" begin
+        schedule, historical, current = _survivor_context_fixture()
+        context = fit_regular_season_forecast(
+            2023;
+            as_of_week=2,
+            schedule=schedule,
+            historical_drives=historical,
+            current_drives=current,
+            time_edges=[0, Inf],
+        )
+        candidates = DataFrame(
+            game_id=["derivative_game"],
+            week=[2],
+            team=["C"],
+            opponent=["D"],
+            is_home=[false],
+            win_probability=[0.9],
+        )
+        state = SurvivorPoolState(2023, 2; strikes_remaining=0)
+        data = SurvivorModel._normalize_survivor_candidates(
+            candidates,
+            state,
+            2,
+        )
+        inputs = SurvivorModel._survivor_objective_inputs(
+            context.model,
+            context.marks,
+            data;
+            horizon=GAME_CLOCK_SECONDS,
+        )
+        row = first(eachrow(data))
+        local_mean, global_indices =
+            SurvivorModel._survivor_candidate_local_parameters(
+                context.model,
+                row,
+                inputs.parameters,
+            )
+        probability_function = SurvivorModel._survivor_candidate_win_function(
+            context.model,
+            context.marks,
+            row;
+            horizon=GAME_CLOCK_SECONDS,
+        )
+        forward_gradient = ForwardDiff.gradient(
+            probability_function,
+            local_mean,
+        )
+        forward_hessian = ForwardDiff.hessian(
+            probability_function,
+            local_mean,
+        )
+        derivative = only(inputs.derivatives)
+        expected_gradient = zeros(length(inputs.parameters.keys))
+        for (local_index, global_index) in enumerate(global_indices)
+            expected_gradient[global_index] += forward_gradient[local_index]
+        end
+        @test derivative.base_probability ≈ probability_function(local_mean)
+        @test derivative.gradient ≈ expected_gradient
+        @test inputs.covariance_gradient_gram[1, 1] ≈ sum(
+            expected_gradient[index]^2 * inputs.parameters.variance[index]
+            for index in eachindex(expected_gradient)
+        )
+        @test derivative.hessian_covariance ≈ sum(
+            forward_hessian[local_index, local_index] *
+            inputs.parameters.variance[global_index]
+            for (local_index, global_index) in enumerate(global_indices)
+        )
+    end
+
+    @testset "whole-plan scalar covariance recursion" begin
+        schedule, historical, current = _survivor_context_fixture()
+        context = fit_regular_season_forecast(
+            2023;
+            as_of_week=2,
+            schedule=schedule,
+            historical_drives=historical,
+            current_drives=current,
+            time_edges=[0, Inf],
+        )
+        candidates = DataFrame(
+            game_id=["shared_game_1", "shared_game_2"],
+            week=[1, 2],
+            team=["B", "C"],
+            opponent=["A", "A"],
+            is_home=[true, true],
+            win_probability=[0.9, 0.9],
+        )
+        state = SurvivorPoolState(2023, 1; strikes_remaining=0)
+        data = SurvivorModel._normalize_survivor_candidates(
+            candidates,
+            state,
+            2,
+        )
+        config = SurvivorSelectionConfig(
+            objective=:exact_milp,
+            minimum_favorite_spread=nothing,
+            market_guard_weeks=0,
+            through_week=2,
+        )
+        inputs = SurvivorModel._survivor_objective_inputs(
+            context.model,
+            context.marks,
+            data;
+            horizon=GAME_CLOCK_SECONDS,
+        )
+        @test size(inputs.covariance_gradient_gram) == (nrow(data), nrow(data))
+        @test all(isfinite, inputs.covariance_gradient_gram)
+        defensive_a_index = findfirst(
+            ==((:defensive, "A", 1)),
+            inputs.parameters.keys,
+        )
+        @test defensive_a_index !== nothing
+        first_local_mean, first_indices =
+            SurvivorModel._survivor_candidate_local_parameters(
+                context.model,
+                first(eachrow(data)),
+                inputs.parameters,
+            )
+        second_local_mean, second_indices =
+            SurvivorModel._survivor_candidate_local_parameters(
+                context.model,
+                last(eachrow(data)),
+                inputs.parameters,
+            )
+        @test first_indices[2] == defensive_a_index
+        @test second_indices[2] == defensive_a_index
+
+        discount_table = SurvivorModel._survivor_discount_table(state, config)
+        covariance_plan =
+            SurvivorModel._optimize_survivor_expected_weeks_scalar_milp(
+                data,
+                state,
+                config,
+                discount_table,
+                inputs,
+            )
+        parameter_mean = inputs.parameters.log_mean
+        probability_functions = [
+            SurvivorModel._survivor_candidate_win_function(
+                context.model,
+                context.marks,
+                row;
+                horizon=GAME_CLOCK_SECONDS,
+            )
+            for row in eachrow(data)
+        ]
+        local_means = [first_local_mean, second_local_mean]
+        local_indices = [first_indices, second_indices]
+        objective_function = global_theta -> begin
+            probabilities = [
+                probability_functions[index](
+                    [
+                        global_theta[local_indices[index][local_position]] +
+                        (
+                            local_means[index][local_position] -
+                            parameter_mean[local_indices[index][local_position]]
+                        )
+                        for local_position in eachindex(local_indices[index])
+                    ],
+                )
+                for index in eachindex(probability_functions)
+            ]
+            probabilities[1] + probabilities[1] * probabilities[2]
+        end
+        objective_hessian = ForwardDiff.hessian(
+            objective_function,
+            parameter_mean,
+        )
+        expected_objective =
+            objective_function(parameter_mean) +
+            0.5 * sum(
+                objective_hessian[index, index] *
+                inputs.parameters.variance[index]
+                for index in eachindex(parameter_mean)
+            )
+        @test covariance_plan.objective_value ≈ expected_objective
+        @test sum(covariance_plan.selections.objective_contribution) ≈
+            covariance_plan.objective_value
+
+        zero_parameters = SurvivorModel.SurvivorParameterSystem(
+            inputs.parameters.keys,
+            inputs.parameters.indices,
+            inputs.parameters.log_mean,
+            zeros(length(inputs.parameters.variance)),
+        )
+        zero_derivatives = [
+            SurvivorModel.SurvivorCandidateDerivatives(
+                derivative.base_probability,
+                derivative.gradient,
+                0.0,
+            )
+            for derivative in inputs.derivatives
+        ]
+        zero_inputs = SurvivorModel.SurvivorObjectiveInputs(
+            zero_parameters,
+            zero_derivatives,
+        )
+        @test all(zero_inputs.covariance_gradient_gram .== 0.0)
+        zero_plan =
+            SurvivorModel._optimize_survivor_expected_weeks_scalar_milp(
+                data,
+                state,
+                config,
+                discount_table,
+                zero_inputs,
+            )
+        fixed_data = DataFrame(data)
+        fixed_data.win_probability = [
+            derivative.base_probability for derivative in inputs.derivatives
+        ]
+        fixed_plan =
+            SurvivorModel._optimize_survivor_expected_weeks_fixed_milp(
+                fixed_data,
+                state,
+                SurvivorSelectionConfig(
+                    objective=:fixed_exact_milp,
+                    minimum_favorite_spread=nothing,
+                    market_guard_weeks=0,
+                    through_week=2,
+                ),
+                discount_table,
+            )
+        @test zero_plan.objective_value ≈ fixed_plan.objective_value
+        @test zero_plan.selections.team == fixed_plan.selections.team
+    end
+
+    @testset "scalar recurrence bounds" begin
+        keys = [
+            (:td, "A", 1),
+            (:td, "B", 1),
+        ]
+        parameters = SurvivorModel.SurvivorParameterSystem(
+            keys,
+            Dict(key => index for (index, key) in enumerate(keys)),
+            [0.0, 0.0],
+            [1.0, 1.0],
+        )
+        derivatives = [
+            SurvivorModel.SurvivorCandidateDerivatives(
+                0.8,
+                [1.0, -2.0],
+                0.4,
+            ),
+            SurvivorModel.SurvivorCandidateDerivatives(
+                0.7,
+                [-1.0, 1.0],
+                -0.3,
+            ),
+        ]
+        inputs = SurvivorModel.SurvivorObjectiveInputs(
+            parameters,
+            derivatives,
+        )
+        @test inputs.covariance_gradient_gram ≈
+            [5.0 -3.0; -3.0 2.0]
+        bounds = SurvivorModel._survivor_scalar_bounds(
+            inputs,
+            [1, 2],
+            2,
+            2,
+        )
+        values = SurvivorModel._survivor_scalar_forward_values(
+            [1, 2],
+            inputs,
+            2,
+            2,
+        )
+        @test all(values.probability .>= bounds.probability.lower)
+        @test all(values.probability .<= bounds.probability.upper)
+        @test all(values.gradient .>= bounds.gradient.lower)
+        @test all(values.gradient .<= bounds.gradient.upper)
+        @test all(values.hessian .>= bounds.hessian.lower)
+        @test all(values.hessian .<= bounds.hessian.upper)
+        @test SurvivorModel._survivor_other_interval(
+            bounds.candidate_probability.lower,
+            bounds.candidate_probability.upper,
+            [1],
+            1,
+            1,
+        ) === nothing
+
+        single_bounds = SurvivorModel._survivor_scalar_bounds(
+            SurvivorModel.SurvivorObjectiveInputs(
+                parameters,
+                derivatives[1:1],
+            ),
+            [1],
+            1,
+            1,
+        )
+        @test single_bounds.candidate_probability.lower[1, 1] <= 0.8
+        @test single_bounds.candidate_probability.upper[1, 1] >= 0.8
+    end
+
+    @testset "scalar one-hot gating" begin
+        keys = [
+            (:td, "A", 1),
+            (:td, "B", 1),
+        ]
+        parameters = SurvivorModel.SurvivorParameterSystem(
+            keys,
+            Dict(key => index for (index, key) in enumerate(keys)),
+            [0.0, 0.0],
+            [1.0, 1.0],
+        )
+        derivatives = [
+            SurvivorModel.SurvivorCandidateDerivatives(
+                0.85,
+                [0.4, 0.0],
+                0.1,
+            ),
+            SurvivorModel.SurvivorCandidateDerivatives(
+                0.60,
+                [-0.2, 0.1],
+                -0.05,
+            ),
+            SurvivorModel.SurvivorCandidateDerivatives(
+                0.80,
+                [0.1, 0.3],
+                0.02,
+            ),
+            SurvivorModel.SurvivorCandidateDerivatives(
+                0.70,
+                [-0.1, 0.4],
+                -0.01,
+            ),
+        ]
+        inputs = SurvivorModel.SurvivorObjectiveInputs(
+            parameters,
+            derivatives,
+        )
+        candidates = DataFrame(
+            game_id=["week1", "week1", "week2", "week2"],
+            week=[1, 1, 2, 2],
+            team=["A", "B", "C", "D"],
+            opponent=["X", "Y", "Z", "W"],
+            is_home=[true, false, true, false],
+            win_probability=[0.85, 0.60, 0.80, 0.70],
+        )
+        state = SurvivorPoolState(2025, 1; strikes_remaining=0)
+        data = SurvivorModel._normalize_survivor_candidates(
+            candidates,
+            state,
+            2,
+        )
+        config = SurvivorSelectionConfig(
+            objective=:exact_milp,
+            minimum_favorite_spread=nothing,
+            market_guard_weeks=0,
+            through_week=2,
+        )
+        discount_table = SurvivorModel._survivor_discount_table(state, config)
+        plan = SurvivorModel._optimize_survivor_expected_weeks_scalar_milp(
+            data,
+            state,
+            config,
+            discount_table,
+            inputs,
+        )
+        expected_objective = maximum(
+            begin
+                values = SurvivorModel._survivor_scalar_forward_values(
+                    [first_index, second_index],
+                    inputs,
+                    2,
+                    1,
+                )
+                sum(
+                    values.probability[position + 1, 1] +
+                    0.5 * values.hessian[position + 1, 1]
+                    for position in 1:2
+                )
+            end
+            for first_index in 1:2,
+            second_index in 3:4
+        )
+        @test plan.objective_value ≈ expected_objective
+        @test nrow(plan.selections) == 2
+        @test plan.selections.week == [1, 2]
+    end
+
     @testset "selection configuration" begin
         @test SurvivorSelectionConfig().objective ===
             :exact_milp
+        @test SurvivorSelectionConfig().timeout_seconds === nothing
+        @test SurvivorSelectionConfig(timeout_seconds=12.5).timeout_seconds == 12.5
         @test SurvivorSelectionConfig(objective=:exact_milp).objective ===
             :exact_milp
+        @test SurvivorSelectionConfig(objective=:fixed_exact_milp).objective ===
+            :fixed_exact_milp
         no_guard_config = SurvivorSelectionConfig(
             objective=:milp,
             minimum_favorite_spread=nothing,
@@ -398,6 +806,55 @@ end
         @test_throws ArgumentError SurvivorSelectionConfig(
             minimum_favorite_spread=-1.0,
         )
+        @test_throws ArgumentError SurvivorSelectionConfig(
+            timeout_seconds=0.0,
+        )
+        @test_throws ArgumentError SurvivorSelectionConfig(
+            timeout_seconds=-1.0,
+        )
+        @test_throws ArgumentError SurvivorSelectionConfig(
+            timeout_seconds=NaN,
+        )
+        @test_throws ArgumentError SurvivorSelectionConfig(
+            timeout_seconds=Inf,
+        )
+
+        @testset "timed feasible incumbent" begin
+            model = SurvivorModel.JuMP.Model(
+                SurvivorModel.JuMP.optimizer_with_attributes(
+                    SurvivorModel.HiGHS.Optimizer,
+                    "time_limit" => 0.01,
+                    "threads" => 4,
+                    "parallel" => "on",
+                ),
+            )
+            SurvivorModel.JuMP.set_silent(model)
+            SurvivorModel.JuMP.@variable(model, selected[1:600], Bin)
+            for offset in 1:30
+                SurvivorModel.JuMP.@constraint(
+                    model,
+                    [index=1:20],
+                    sum(
+                        selected[mod1(index + offset * step, 600)]
+                        for step in 0:30
+                    ) <= 4,
+                )
+            end
+            SurvivorModel.JuMP.@objective(
+                model,
+                Max,
+                sum((index % 101 + 1) * selected[index] for index in 1:600),
+            )
+            for variable in selected
+                SurvivorModel.JuMP.set_start_value(variable, 0.0)
+            end
+            SurvivorModel.JuMP.optimize!(model)
+            @test SurvivorModel.JuMP.termination_status(model) ==
+                SurvivorModel.JuMP.MOI.TIME_LIMIT
+            @test SurvivorModel.JuMP.primal_status(model) ==
+                SurvivorModel.JuMP.MOI.FEASIBLE_POINT
+            @test SurvivorModel._survivor_has_feasible_incumbent(model)
+        end
 
         missing_line = DataFrame(
             game_id=["missing_line", "missing_line"],
@@ -412,6 +869,7 @@ end
             missing_line,
             SurvivorPoolState(2025, 1; strikes_remaining=0);
             selection_config=SurvivorSelectionConfig(
+                objective=:fixed_exact_milp,
                 through_week=1,
                 missing_market_policy=:exclude,
             ),
@@ -421,6 +879,7 @@ end
             missing_line,
             SurvivorPoolState(2025, 1; strikes_remaining=0);
             selection_config=SurvivorSelectionConfig(
+                objective=:fixed_exact_milp,
                 minimum_favorite_spread=nothing,
                 market_guard_weeks=0,
                 through_week=1,

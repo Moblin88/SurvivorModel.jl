@@ -67,11 +67,56 @@ full_forecast = SurvivorModel.forecast_regular_season(
 )
 ```
 
-The `:exact_milp` survivor objective is an exact finite-state MILP. It tracks
-the probability of remaining alive at each loss count below the terminal loss
-threshold and maximizes the sum of weekly survival probabilities. Binary
-selection/state-product terms are linearized with bounds in `[0, 1]`, so this
-formulation avoids terminal-path enumeration and nonlinear subproblems.
+The `:fixed_exact_milp` survivor objective is the exact finite-state MILP for
+fixed candidate probabilities. It tracks the probability of remaining alive at
+each loss count below the terminal loss threshold and maximizes the sum of
+weekly survival probabilities. Binary selection/state-product terms are
+linearized with bounds in `[0, 1]`, so this formulation avoids terminal-path
+enumeration and nonlinear subproblems.
+
+The default context-based `:exact_milp` objective expands that recursion with a
+second-order delta correction for posterior parameter uncertainty. For each
+candidate, the model evaluates the win probability and its derivatives at the
+joint posterior mean using the existing game-level ForwardDiff path. The
+objective is the second-order approximation
+`F(mu) + 1/2 * trace(H_F(mu) * Sigma)`, not exact posterior integration.
+
+The recursion defines `p[w,l]` as the probability of reaching the start of
+week `w` with exactly `l` losses. If candidate `t` is selected in week `w`,
+its successor is
+`v[w,t] * p[w,l] + (1 - v[w,t]) * p[w,l - 1]`, with `p[0,0] = 1` and negative
+loss indices equal to zero. Candidate-specific successors are represented
+directly in affine constraints rather than as separate team-specific state
+variables. When a candidate is selected, its equality is tight; when it is not
+selected, its bounds are relaxed using the minimum and maximum intervals of the
+other candidates in that week. This produces tighter one-hot gates than a
+generic `[0, 1]` big-M.
+
+To include shared-team uncertainty without parameter-sized MILP state, the
+model precomputes the candidate gradient Gram constants
+`K[t,k] = gradient(v[t])' * Sigma * gradient(v[k])` and the scalar
+`trace(Sigma * Hessian(v[t]))` values. It tracks
+`g[w,l,k] = gradient(p[w,l])' * Sigma * gradient(v[k])` for each selectable
+candidate reference `k`, followed by
+`h[w,l] = trace(Sigma * Hessian(p[w,l]))`. The selected candidate recurrence
+for `g` includes `K[t,k] * (p[w,l] - p[w,l - 1])`; the `h` recurrence includes
+the candidate Hessian contraction and
+`2 * (g[w,l,t] - g[w,l - 1,t])`. Signed lower and upper intervals for all
+three state families are propagated recursively and reused for the one-hot
+gates.
+
+The candidate Gram matrix is sized by selectable rows rather than by the
+posterior parameter vector, and the current fitted covariance remains
+diagonal. The covariance MILP first solves the fixed-probability exact
+recursion and uses that plan to seed the selected binaries and the
+forward-evaluated probability, gradient-contraction, and Hessian-contraction
+states. The selected plan is then forward-evaluated again to verify the
+reported adjusted objective.
+
+`SurvivorSelectionConfig(timeout_seconds=...)` passes a HiGHS `time_limit`
+attribute to the default optimizer. If the limit is reached with a feasible
+incumbent, the MILP returns that best-known plan; a timeout without any
+feasible incumbent is reported as an optimization failure.
 
 Candidate rows below the model-favorite threshold of `0.5` are excluded before
 either survivor objective is solved.

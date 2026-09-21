@@ -8,6 +8,7 @@ const DEFAULT_SURVIVOR_MISSING_MARKET_POLICY = :allow
 
 const SURVIVOR_OBJECTIVES = (
     :milp,
+    :fixed_exact_milp,
     :exact_milp,
 )
 const SURVIVOR_REACH_DISCOUNT_POLICIES = (:binomial,)
@@ -38,8 +39,12 @@ end
 """
     SurvivorSelectionConfig(; kwargs...)
 
-Configuration for survivor selection. `:exact_milp` is the default exact
-expected-weeks formulation; `:milp` uses the tractable approximation.
+Configuration for survivor selection. `:exact_milp` is the default
+covariance-aware expected-weeks formulation for fitted contexts;
+`:fixed_exact_milp` is the fixed-probability compatibility formulation; and
+`:milp` uses the tractable reach-discount approximation. `timeout_seconds`
+limits the default HiGHS solve and returns its best feasible incumbent when
+the limit is reached.
 """
 struct SurvivorSelectionConfig
     objective::Symbol
@@ -49,6 +54,7 @@ struct SurvivorSelectionConfig
     missing_market_policy::Symbol
     market_guard_weeks::Int
     through_week::Int
+    timeout_seconds::Union{Nothing,Float64}
 end
 
 function SurvivorSelectionConfig(
@@ -60,6 +66,7 @@ function SurvivorSelectionConfig(
     missing_market_policy::Symbol=DEFAULT_SURVIVOR_MISSING_MARKET_POLICY,
     market_guard_weeks::Integer=DEFAULT_SURVIVOR_MARKET_GUARD_WEEKS,
     through_week::Integer=18,
+    timeout_seconds=nothing,
 )
     objective = _canonical_survivor_objective(objective)
     probability = _validate_survivor_probability(weekly_survival_probability)
@@ -89,6 +96,16 @@ function SurvivorSelectionConfig(
         throw(ArgumentError("market_guard_weeks must be nonnegative"))
     1 <= through_week <= 18 ||
         throw(ArgumentError("through_week must be between 1 and 18"))
+    normalized_timeout = if timeout_seconds === nothing
+        nothing
+    else
+        value = Float64(timeout_seconds)
+        isfinite(value) && value > 0.0 ||
+            throw(ArgumentError(
+                "timeout_seconds must be nothing or a finite positive value",
+            ))
+        value
+    end
     return SurvivorSelectionConfig(
         objective,
         probability,
@@ -97,6 +114,7 @@ function SurvivorSelectionConfig(
         missing_market_policy,
         Int(market_guard_weeks),
         Int(through_week),
+        normalized_timeout,
     )
 end
 
@@ -105,7 +123,13 @@ function _survivor_optimizer(
     optimizer,
 )
     optimizer !== nothing && return optimizer
-    return HiGHS.Optimizer
+    attributes = Pair{String,Any}[
+        "threads" => BLAS.get_num_threads(),
+        "parallel" => "on",
+    ]
+    config.timeout_seconds === nothing ||
+        push!(attributes, "time_limit" => config.timeout_seconds)
+    return optimizer_with_attributes(HiGHS.Optimizer, attributes...)
 end
 
 function _normalize_survivor_picks(picks_made)
@@ -174,9 +198,11 @@ end
 The selected forward plan returned by `optimize_survivor_pool`. `selections`
 contains one row per planned week, `current_pick` contains the current week's
 single selected row, and `discounts` records the fixed personal reach
-discount used for each week. For `:exact_milp`, `selections` also contains
-plan-specific survival and elimination probabilities. `selection_config`
-records the effective objective and eligibility policies.
+discount used for each week. For exact objectives, `selections` also contains plan-specific survival and
+elimination probabilities. The covariance-aware objective additionally reports
+the posterior-mean survival probability, its parameter-variance adjustment,
+and the adjusted survival estimate. `selection_config` records the effective
+objective and eligibility policies.
 """
 struct SurvivorPoolPlan
     state::SurvivorPoolState
@@ -572,6 +598,13 @@ function _survivor_selected_indices(model, selected, candidate_indices)
     ]
 end
 
+function _survivor_has_feasible_incumbent(model)
+    JuMP.is_solved_and_feasible(model) && return true
+    return termination_status(model) == JuMP.MOI.TIME_LIMIT &&
+        primal_status(model) == JuMP.MOI.FEASIBLE_POINT &&
+        JuMP.has_values(model)
+end
+
 function _survivor_objective_contribution(
     probability::Real,
     discount::Real,
@@ -589,7 +622,7 @@ function _survivor_constant_plan(
     discount_table::AbstractDataFrame;
     optimizer=nothing,
 )
-    model = Model(isnothing(optimizer) ? HiGHS.Optimizer : optimizer)
+    model = Model(_survivor_optimizer(config, optimizer))
     set_silent(model)
     candidate_indices = 1:nrow(data)
     @variable(model, selected[candidate_indices], Bin)
@@ -602,7 +635,7 @@ function _survivor_constant_plan(
     )
     @objective(model, Max, 0.0)
     optimize!(model)
-    JuMP.is_solved_and_feasible(model) ||
+    _survivor_has_feasible_incumbent(model) ||
         throw(ArgumentError(
             "survivor optimization failed with termination status " *
             "$(termination_status(model))",
@@ -614,9 +647,11 @@ function _survivor_constant_plan(
         candidate_indices,
     )
     selections = sort(data[selected_indices, :], [:week, :team])
-    selections.survival_probability = ones(Float64, nrow(selections))
-    selections.elimination_probability = zeros(Float64, nrow(selections))
-    selections.objective_contribution = selections.survival_probability
+    _set_survivor_plan_diagnostics!(
+        selections,
+        ones(Float64, nrow(selections)),
+        zeros(Float64, nrow(selections)),
+    )
     current_pick = selections[selections.week .== state.current_week, :]
     nrow(current_pick) == 1 ||
         throw(ArgumentError("survivor optimization did not select one current-week pick"))
@@ -629,6 +664,28 @@ function _survivor_constant_plan(
         Float64(config.through_week - state.current_week + 1),
         config,
     )
+end
+
+function _set_survivor_plan_diagnostics!(
+    selections::AbstractDataFrame,
+    survival_probability::AbstractVector{<:Real},
+    parameter_variance_adjustment::AbstractVector{<:Real},
+)
+    length(survival_probability) == nrow(selections) ||
+        throw(ArgumentError("survival probabilities must match selections"))
+    length(parameter_variance_adjustment) == nrow(selections) ||
+        throw(ArgumentError("variance adjustments must match selections"))
+    base = Float64.(survival_probability)
+    adjustment = Float64.(parameter_variance_adjustment)
+    adjusted = base .+ adjustment
+    all(isfinite, base) && all(isfinite, adjustment) && all(isfinite, adjusted) ||
+        throw(ArgumentError("survivor plan diagnostics must be finite"))
+    selections.survival_probability = base
+    selections.elimination_probability = 1.0 .- base
+    selections.parameter_variance_adjustment = adjustment
+    selections.variance_adjusted_survival_probability = adjusted
+    selections.objective_contribution = adjusted
+    return selections
 end
 
 function _survivor_state_statistics(
@@ -660,7 +717,7 @@ function _survivor_state_statistics(
     )
 end
 
-function _optimize_survivor_expected_weeks_exact_milp(
+function _optimize_survivor_expected_weeks_fixed_milp(
     data::AbstractDataFrame,
     state::SurvivorPoolState,
     config::SurvivorSelectionConfig,
@@ -723,7 +780,8 @@ function _optimize_survivor_expected_weeks_exact_milp(
             model,
             alive[position + 1, 1] ==
                 sum(
-                    data.win_probability[index] * transition[index, 1]
+                    data.win_probability[index] *
+                    transition[index, 1]
                     for index in indices
                 ),
         )
@@ -740,7 +798,6 @@ function _optimize_survivor_expected_weeks_exact_milp(
             )
         end
     end
-
     @objective(
         model,
         Max,
@@ -752,7 +809,7 @@ function _optimize_survivor_expected_weeks_exact_milp(
     )
     optimize!(model)
 
-    JuMP.is_solved_and_feasible(model) ||
+    _survivor_has_feasible_incumbent(model) ||
         throw(ArgumentError(
             "survivor optimization failed with termination status " *
             "$(termination_status(model))",
@@ -788,11 +845,14 @@ function _optimize_survivor_expected_weeks_exact_milp(
             statistics.survival_probability,
         )
     )
-    selections.survival_probability = [
+    survival_probability = [
         survival_by_week[Int(week)] for week in selections.week
     ]
-    selections.elimination_probability = 1.0 .- selections.survival_probability
-    selections.objective_contribution = selections.survival_probability
+    _set_survivor_plan_diagnostics!(
+        selections,
+        survival_probability,
+        zeros(Float64, nrow(selections)),
+    )
     current_pick = selections[selections.week .== state.current_week, :]
     nrow(current_pick) == 1 ||
         throw(ArgumentError("survivor optimization did not select one current-week pick"))
@@ -807,15 +867,896 @@ function _optimize_survivor_expected_weeks_exact_milp(
     )
 end
 
+function _survivor_interval_product(
+    lower::Float64,
+    upper::Float64,
+    coefficient::Float64,
+)
+    lower <= upper ||
+        throw(ArgumentError("survivor interval bounds must be ordered"))
+    coefficient >= 0.0 ?
+        (coefficient * lower, coefficient * upper) :
+        (coefficient * upper, coefficient * lower)
+end
+
+function _survivor_widen_interval(
+    lower::Float64,
+    upper::Float64,
+)
+    lower <= upper ||
+        throw(ArgumentError("survivor interval bounds must be ordered"))
+    scale = max(abs(lower), abs(upper), 1.0e-12)
+    margin = 1.0e-9 * scale
+    return lower - margin, upper + margin
+end
+
+function _survivor_fixed_selected_indices(
+    data::AbstractDataFrame,
+    selections::AbstractDataFrame,
+    state::SurvivorPoolState,
+    number_of_weeks::Integer,
+)
+    selected_by_position = zeros(Int, number_of_weeks)
+    for row in eachrow(selections)
+        position = Int(row.week) - state.current_week + 1
+        1 <= position <= number_of_weeks ||
+            throw(ArgumentError(
+                "survivor warm-start selection is outside the optimization horizon",
+            ))
+        matches = findall(
+            index ->
+                Int(data.week[index]) == Int(row.week) &&
+                String(data.team[index]) == String(row.team),
+            1:nrow(data),
+        )
+        length(matches) == 1 ||
+            throw(ArgumentError(
+                "survivor warm-start selection does not identify one candidate",
+            ))
+        selected_by_position[position] = only(matches)
+    end
+    all(>(0), selected_by_position) ||
+        throw(ArgumentError(
+            "survivor warm-start plan did not select one candidate per week",
+        ))
+    return selected_by_position
+end
+
+
+function _survivor_interval_difference(
+    first_lower::Float64,
+    first_upper::Float64,
+    second_lower::Float64,
+    second_upper::Float64,
+)
+    first_lower <= first_upper ||
+        throw(ArgumentError("survivor interval bounds must be ordered"))
+    second_lower <= second_upper ||
+        throw(ArgumentError("survivor interval bounds must be ordered"))
+    return first_lower - second_upper, first_upper - second_lower
+end
+
+function _survivor_other_interval(
+    lower::AbstractArray{<:Real},
+    upper::AbstractArray{<:Real},
+    indices,
+    excluded::Integer,
+    coordinates::Vararg{Int},
+)
+    other_indices = [index for index in indices if index != excluded]
+    isempty(other_indices) && return nothing
+    lower_value = minimum(
+        lower[index, coordinates...]
+        for index in other_indices
+    )
+    upper_value = maximum(
+        upper[index, coordinates...]
+        for index in other_indices
+    )
+    return Float64(lower_value), Float64(upper_value)
+end
+
+function _survivor_add_gated_recurrence!(
+    model,
+    aggregate,
+    recurrence,
+    selected,
+    candidate_lower::Float64,
+    candidate_upper::Float64,
+    other_interval,
+)
+    candidate_lower <= candidate_upper ||
+        throw(ArgumentError("survivor candidate recurrence bounds must be ordered"))
+    if isnothing(other_interval)
+        @constraint(model, aggregate == recurrence)
+    else
+        other_lower, other_upper = other_interval
+        @constraint(
+            model,
+            aggregate - recurrence >=
+                (other_lower - candidate_upper) * (1.0 - selected),
+        )
+        @constraint(
+            model,
+            aggregate - recurrence <=
+                (other_upper - candidate_lower) * (1.0 - selected),
+        )
+    end
+    return nothing
+end
+
+function _survivor_scalar_bounds(
+    inputs::SurvivorObjectiveInputs,
+    candidate_positions::AbstractVector{<:Integer},
+    number_of_weeks::Integer,
+    losses_to_elimination::Integer,
+)
+    n_candidates = length(inputs.derivatives)
+    length(candidate_positions) == n_candidates ||
+        throw(ArgumentError(
+            "survivor candidate positions must match derivative inputs",
+        ))
+    all(
+        position -> 1 <= position <= number_of_weeks,
+        candidate_positions,
+    ) ||
+        throw(ArgumentError("survivor candidate positions must be in the horizon"))
+    week_indices = [
+        findall(==(position), candidate_positions)
+        for position in 1:number_of_weeks
+    ]
+    all(!isempty, week_indices) ||
+        throw(ArgumentError(
+            "survivor derivative bounds require candidates in every week",
+        ))
+
+    probability_lower =
+        zeros(Float64, number_of_weeks + 1, losses_to_elimination)
+    probability_upper =
+        zeros(Float64, number_of_weeks + 1, losses_to_elimination)
+    gradient_lower = zeros(
+        Float64,
+        number_of_weeks + 1,
+        losses_to_elimination,
+        n_candidates,
+    )
+    gradient_upper = zeros(
+        Float64,
+        number_of_weeks + 1,
+        losses_to_elimination,
+        n_candidates,
+    )
+    hessian_lower =
+        zeros(Float64, number_of_weeks + 1, losses_to_elimination)
+    hessian_upper =
+        zeros(Float64, number_of_weeks + 1, losses_to_elimination)
+
+    candidate_probability_lower =
+        zeros(Float64, n_candidates, losses_to_elimination)
+    candidate_probability_upper =
+        zeros(Float64, n_candidates, losses_to_elimination)
+    candidate_gradient_lower = zeros(
+        Float64,
+        n_candidates,
+        losses_to_elimination,
+        n_candidates,
+    )
+    candidate_gradient_upper = zeros(
+        Float64,
+        n_candidates,
+        losses_to_elimination,
+        n_candidates,
+    )
+    candidate_hessian_lower =
+        zeros(Float64, n_candidates, losses_to_elimination)
+    candidate_hessian_upper =
+        zeros(Float64, n_candidates, losses_to_elimination)
+
+    probability_lower[1, 1] = 1.0
+    probability_upper[1, 1] = 1.0
+    for position in 1:number_of_weeks
+        for index in week_indices[position]
+            derivative = inputs.derivatives[index]
+            probability = derivative.base_probability
+            for loss_state in 1:losses_to_elimination
+                previous_lower, previous_upper = loss_state == 1 ?
+                    (0.0, 0.0) :
+                    (
+                        probability_lower[position, loss_state - 1],
+                        probability_upper[position, loss_state - 1],
+                    )
+                current_lower = probability_lower[position, loss_state]
+                current_upper = probability_upper[position, loss_state]
+                lower, upper = _survivor_interval_product(
+                    current_lower,
+                    current_upper,
+                    probability,
+                )
+                previous_term_lower, previous_term_upper =
+                    _survivor_interval_product(
+                        previous_lower,
+                        previous_upper,
+                        1.0 - probability,
+                    )
+                lower += previous_term_lower
+                upper += previous_term_upper
+                candidate_probability_lower[index, loss_state],
+                    candidate_probability_upper[index, loss_state] =
+                    _survivor_widen_interval(lower, upper)
+
+                probability_difference_lower, probability_difference_upper =
+                    _survivor_interval_difference(
+                        current_lower,
+                        current_upper,
+                        previous_lower,
+                        previous_upper,
+                    )
+                for reference in 1:n_candidates
+                    current_gradient_lower =
+                        gradient_lower[position, loss_state, reference]
+                    current_gradient_upper =
+                        gradient_upper[position, loss_state, reference]
+                    lower, upper = _survivor_interval_product(
+                        current_gradient_lower,
+                        current_gradient_upper,
+                        probability,
+                    )
+                    previous_gradient_lower, previous_gradient_upper =
+                        loss_state == 1 ?
+                        (0.0, 0.0) :
+                        (
+                            gradient_lower[
+                                position,
+                                loss_state - 1,
+                                reference,
+                            ],
+                            gradient_upper[
+                                position,
+                                loss_state - 1,
+                                reference,
+                            ],
+                        )
+                    previous_term_lower, previous_term_upper =
+                        _survivor_interval_product(
+                            previous_gradient_lower,
+                            previous_gradient_upper,
+                            1.0 - probability,
+                        )
+                    lower += previous_term_lower
+                    upper += previous_term_upper
+                    source_lower, source_upper = _survivor_interval_product(
+                        probability_difference_lower,
+                        probability_difference_upper,
+                        inputs.covariance_gradient_gram[index, reference],
+                    )
+                    lower += source_lower
+                    upper += source_upper
+                    candidate_gradient_lower[index, loss_state, reference],
+                        candidate_gradient_upper[index, loss_state, reference] =
+                        _survivor_widen_interval(lower, upper)
+                end
+
+                current_hessian_lower = hessian_lower[position, loss_state]
+                current_hessian_upper = hessian_upper[position, loss_state]
+                lower, upper = _survivor_interval_product(
+                    current_hessian_lower,
+                    current_hessian_upper,
+                    probability,
+                )
+                previous_hessian_lower, previous_hessian_upper =
+                    loss_state == 1 ?
+                    (0.0, 0.0) :
+                    (
+                        hessian_lower[position, loss_state - 1],
+                        hessian_upper[position, loss_state - 1],
+                    )
+                previous_term_lower, previous_term_upper =
+                    _survivor_interval_product(
+                        previous_hessian_lower,
+                        previous_hessian_upper,
+                        1.0 - probability,
+                    )
+                lower += previous_term_lower
+                upper += previous_term_upper
+                source_lower, source_upper = _survivor_interval_product(
+                    probability_difference_lower,
+                    probability_difference_upper,
+                    derivative.hessian_covariance,
+                )
+                lower += source_lower
+                upper += source_upper
+                current_gradient_lower =
+                    gradient_lower[position, loss_state, index]
+                current_gradient_upper =
+                    gradient_upper[position, loss_state, index]
+                previous_gradient_lower, previous_gradient_upper =
+                    loss_state == 1 ?
+                    (0.0, 0.0) :
+                    (
+                        gradient_lower[position, loss_state - 1, index],
+                        gradient_upper[position, loss_state - 1, index],
+                    )
+                gradient_difference_lower, gradient_difference_upper =
+                    _survivor_interval_difference(
+                        current_gradient_lower,
+                        current_gradient_upper,
+                        previous_gradient_lower,
+                        previous_gradient_upper,
+                    )
+                source_lower, source_upper = _survivor_interval_product(
+                    gradient_difference_lower,
+                    gradient_difference_upper,
+                    2.0,
+                )
+                lower += source_lower
+                upper += source_upper
+                candidate_hessian_lower[index, loss_state],
+                    candidate_hessian_upper[index, loss_state] =
+                    _survivor_widen_interval(lower, upper)
+            end
+        end
+
+        for loss_state in 1:losses_to_elimination
+            probability_lower[position + 1, loss_state],
+                probability_upper[position + 1, loss_state] =
+                _survivor_widen_interval(
+                    minimum(
+                        candidate_probability_lower[index, loss_state]
+                        for index in week_indices[position]
+                    ),
+                    maximum(
+                        candidate_probability_upper[index, loss_state]
+                        for index in week_indices[position]
+                    ),
+                )
+            for reference in 1:n_candidates
+                gradient_lower[position + 1, loss_state, reference],
+                    gradient_upper[position + 1, loss_state, reference] =
+                    _survivor_widen_interval(
+                        minimum(
+                            candidate_gradient_lower[
+                                index,
+                                loss_state,
+                                reference,
+                            ]
+                            for index in week_indices[position]
+                        ),
+                        maximum(
+                            candidate_gradient_upper[
+                                index,
+                                loss_state,
+                                reference,
+                            ]
+                            for index in week_indices[position]
+                        ),
+                    )
+            end
+            hessian_lower[position + 1, loss_state],
+                hessian_upper[position + 1, loss_state] =
+                _survivor_widen_interval(
+                    minimum(
+                        candidate_hessian_lower[index, loss_state]
+                        for index in week_indices[position]
+                    ),
+                    maximum(
+                        candidate_hessian_upper[index, loss_state]
+                        for index in week_indices[position]
+                    ),
+                )
+        end
+    end
+
+    all(isfinite, probability_lower) &&
+        all(isfinite, probability_upper) &&
+        all(isfinite, gradient_lower) &&
+        all(isfinite, gradient_upper) &&
+        all(isfinite, hessian_lower) &&
+        all(isfinite, hessian_upper) ||
+        throw(ArgumentError("survivor scalar recurrence bounds are not finite"))
+    return (
+        probability=(lower=probability_lower, upper=probability_upper),
+        gradient=(lower=gradient_lower, upper=gradient_upper),
+        hessian=(lower=hessian_lower, upper=hessian_upper),
+        candidate_probability=(
+            lower=candidate_probability_lower,
+            upper=candidate_probability_upper,
+        ),
+        candidate_gradient=(
+            lower=candidate_gradient_lower,
+            upper=candidate_gradient_upper,
+        ),
+        candidate_hessian=(
+            lower=candidate_hessian_lower,
+            upper=candidate_hessian_upper,
+        ),
+    )
+end
+
+function _survivor_scalar_forward_values(
+    selected_by_position::AbstractVector{<:Integer},
+    inputs::SurvivorObjectiveInputs,
+    number_of_weeks::Integer,
+    losses_to_elimination::Integer,
+)
+    n_candidates = length(inputs.derivatives)
+    length(selected_by_position) == number_of_weeks ||
+        throw(ArgumentError(
+            "survivor warm-start selections must cover the horizon",
+        ))
+    all(
+        index -> 1 <= index <= n_candidates,
+        selected_by_position,
+    ) || throw(ArgumentError(
+        "survivor warm-start selections must identify candidates",
+    ))
+    probability = zeros(
+        Float64,
+        number_of_weeks + 1,
+        losses_to_elimination,
+    )
+    gradient = zeros(
+        Float64,
+        number_of_weeks + 1,
+        losses_to_elimination,
+        n_candidates,
+    )
+    hessian = zeros(
+        Float64,
+        number_of_weeks + 1,
+        losses_to_elimination,
+    )
+    probability[1, 1] = 1.0
+    for position in 1:number_of_weeks
+        index = Int(selected_by_position[position])
+        derivative = inputs.derivatives[index]
+        win_probability = derivative.base_probability
+        for loss_state in 1:losses_to_elimination
+            previous_probability = loss_state == 1 ?
+                0.0 :
+                probability[position, loss_state - 1]
+            probability[position + 1, loss_state] =
+                win_probability * probability[position, loss_state] +
+                (1.0 - win_probability) * previous_probability
+            for reference in 1:n_candidates
+                previous_gradient = loss_state == 1 ?
+                    0.0 :
+                    gradient[position, loss_state - 1, reference]
+                gradient[position + 1, loss_state, reference] =
+                    win_probability *
+                    gradient[position, loss_state, reference] +
+                    (1.0 - win_probability) * previous_gradient +
+                    inputs.covariance_gradient_gram[index, reference] *
+                    (
+                        probability[position, loss_state] -
+                        previous_probability
+                    )
+            end
+            previous_hessian = loss_state == 1 ?
+                0.0 :
+                hessian[position, loss_state - 1]
+            previous_gradient_for_selected = loss_state == 1 ?
+                0.0 :
+                gradient[position, loss_state - 1, index]
+            hessian[position + 1, loss_state] =
+                win_probability * hessian[position, loss_state] +
+                (1.0 - win_probability) * previous_hessian +
+                derivative.hessian_covariance *
+                (
+                    probability[position, loss_state] -
+                    previous_probability
+                ) +
+                2.0 *
+                (
+                    gradient[position, loss_state, index] -
+                    previous_gradient_for_selected
+                )
+        end
+    end
+    return (
+        probability=probability,
+        gradient=gradient,
+        hessian=hessian,
+    )
+end
+
+function _survivor_scalar_warm_start(
+    data::AbstractDataFrame,
+    state::SurvivorPoolState,
+    fixed_plan::SurvivorPoolPlan,
+    inputs::SurvivorObjectiveInputs,
+    number_of_weeks::Integer,
+    losses_to_elimination::Integer,
+)
+    selected_by_position = _survivor_fixed_selected_indices(
+        data,
+        fixed_plan.selections,
+        state,
+        number_of_weeks,
+    )
+    values = _survivor_scalar_forward_values(
+        selected_by_position,
+        inputs,
+        number_of_weeks,
+        losses_to_elimination,
+    )
+    return merge(values, (selected=selected_by_position,))
+end
+
+function _set_survivor_scalar_warm_start!(
+    selected,
+    probability,
+    gradient,
+    hessian,
+    warm_start,
+    candidate_indices,
+    number_of_weeks::Integer,
+    losses_to_elimination::Integer,
+)
+    for index in candidate_indices
+        set_start_value(
+            selected[index],
+            any(warm_start.selected .== index) ? 1.0 : 0.0,
+        )
+    end
+    for position in 1:(number_of_weeks + 1), loss_state in 1:losses_to_elimination
+        set_start_value(
+            probability[position, loss_state],
+            warm_start.probability[position, loss_state],
+        )
+        set_start_value(
+            hessian[position, loss_state],
+            warm_start.hessian[position, loss_state],
+        )
+        for reference in candidate_indices
+            set_start_value(
+                gradient[position, loss_state, reference],
+                warm_start.gradient[position, loss_state, reference],
+            )
+        end
+    end
+    return nothing
+end
+
+function _optimize_survivor_expected_weeks_scalar_milp(
+    data::AbstractDataFrame,
+    state::SurvivorPoolState,
+    config::SurvivorSelectionConfig,
+    discount_table::AbstractDataFrame,
+    inputs::SurvivorObjectiveInputs;
+    optimizer=nothing,
+)
+    number_of_weeks = config.through_week - state.current_week + 1
+    losses_to_elimination = _survivor_loss_threshold(state)
+    losses_to_elimination > number_of_weeks &&
+        return _survivor_constant_plan(
+            data,
+            state,
+            config,
+            discount_table;
+            optimizer=optimizer,
+        )
+    length(inputs.derivatives) == nrow(data) ||
+        throw(ArgumentError("survivor derivative inputs must match candidates"))
+
+    model = Model(_survivor_optimizer(config, optimizer))
+    set_silent(model)
+    candidate_indices = 1:nrow(data)
+    @variable(model, selected[candidate_indices], Bin)
+    _add_survivor_assignment_constraints!(
+        model,
+        data,
+        state,
+        config,
+        selected,
+    )
+
+    state_indices = 1:losses_to_elimination
+    candidate_positions = [
+        Int(data.week[index]) - state.current_week + 1
+        for index in candidate_indices
+    ]
+    bounds = _survivor_scalar_bounds(
+        inputs,
+        candidate_positions,
+        number_of_weeks,
+        losses_to_elimination,
+    )
+    @variable(
+        model,
+        probability[1:(number_of_weeks + 1), state_indices],
+    )
+    @variable(
+        model,
+        gradient[
+            1:(number_of_weeks + 1),
+            state_indices,
+            candidate_indices,
+        ],
+    )
+    @variable(
+        model,
+        hessian[1:(number_of_weeks + 1), state_indices],
+    )
+
+    for position in 1:(number_of_weeks + 1), loss_state in state_indices
+        set_lower_bound(
+            probability[position, loss_state],
+            bounds.probability.lower[position, loss_state],
+        )
+        set_upper_bound(
+            probability[position, loss_state],
+            bounds.probability.upper[position, loss_state],
+        )
+        set_lower_bound(
+            hessian[position, loss_state],
+            bounds.hessian.lower[position, loss_state],
+        )
+        set_upper_bound(
+            hessian[position, loss_state],
+            bounds.hessian.upper[position, loss_state],
+        )
+        for reference in candidate_indices
+            set_lower_bound(
+                gradient[position, loss_state, reference],
+                bounds.gradient.lower[position, loss_state, reference],
+            )
+            set_upper_bound(
+                gradient[position, loss_state, reference],
+                bounds.gradient.upper[position, loss_state, reference],
+            )
+        end
+    end
+
+    @constraint(model, probability[1, 1] == 1.0)
+    for loss_state in 2:losses_to_elimination
+        @constraint(model, probability[1, loss_state] == 0.0)
+    end
+    for loss_state in state_indices
+        @constraint(model, hessian[1, loss_state] == 0.0)
+        for reference in candidate_indices
+            @constraint(model, gradient[1, loss_state, reference] == 0.0)
+        end
+    end
+
+    week_indices = [
+        findall(==(position), candidate_positions)
+        for position in 1:number_of_weeks
+    ]
+    for position in 1:number_of_weeks
+        indices = week_indices[position]
+        for loss_state in state_indices
+            previous_probability = loss_state == 1 ?
+                0.0 :
+                probability[position, loss_state - 1]
+            for index in indices
+                derivative = inputs.derivatives[index]
+                recurrence =
+                    derivative.base_probability *
+                    probability[position, loss_state] +
+                    (1.0 - derivative.base_probability) *
+                    previous_probability
+                other_interval = _survivor_other_interval(
+                    bounds.candidate_probability.lower,
+                    bounds.candidate_probability.upper,
+                    indices,
+                    index,
+                    loss_state,
+                )
+                _survivor_add_gated_recurrence!(
+                    model,
+                    probability[position + 1, loss_state],
+                    recurrence,
+                    selected[index],
+                    bounds.candidate_probability.lower[index, loss_state],
+                    bounds.candidate_probability.upper[index, loss_state],
+                    other_interval,
+                )
+
+                probability_difference =
+                    probability[position, loss_state] -
+                    previous_probability
+                for reference in candidate_indices
+                    previous_gradient = loss_state == 1 ?
+                        0.0 :
+                        gradient[position, loss_state - 1, reference]
+                    recurrence =
+                        derivative.base_probability *
+                        gradient[position, loss_state, reference] +
+                        (1.0 - derivative.base_probability) *
+                        previous_gradient +
+                        inputs.covariance_gradient_gram[index, reference] *
+                        probability_difference
+                    other_interval = _survivor_other_interval(
+                        bounds.candidate_gradient.lower,
+                        bounds.candidate_gradient.upper,
+                        indices,
+                        index,
+                        loss_state,
+                        reference,
+                    )
+                    _survivor_add_gated_recurrence!(
+                        model,
+                        gradient[
+                            position + 1,
+                            loss_state,
+                            reference,
+                        ],
+                        recurrence,
+                        selected[index],
+                        bounds.candidate_gradient.lower[
+                            index,
+                            loss_state,
+                            reference,
+                        ],
+                        bounds.candidate_gradient.upper[
+                            index,
+                            loss_state,
+                            reference,
+                        ],
+                        other_interval,
+                    )
+                end
+
+                previous_hessian = loss_state == 1 ?
+                    0.0 :
+                    hessian[position, loss_state - 1]
+                previous_gradient_for_selected = loss_state == 1 ?
+                    0.0 :
+                    gradient[position, loss_state - 1, index]
+                recurrence =
+                    derivative.base_probability *
+                    hessian[position, loss_state] +
+                    (1.0 - derivative.base_probability) *
+                    previous_hessian +
+                    derivative.hessian_covariance *
+                    probability_difference +
+                    2.0 *
+                    (
+                        gradient[position, loss_state, index] -
+                        previous_gradient_for_selected
+                    )
+                other_interval = _survivor_other_interval(
+                    bounds.candidate_hessian.lower,
+                    bounds.candidate_hessian.upper,
+                    indices,
+                    index,
+                    loss_state,
+                )
+                _survivor_add_gated_recurrence!(
+                    model,
+                    hessian[position + 1, loss_state],
+                    recurrence,
+                    selected[index],
+                    bounds.candidate_hessian.lower[index, loss_state],
+                    bounds.candidate_hessian.upper[index, loss_state],
+                    other_interval,
+                )
+            end
+        end
+    end
+
+    fixed_plan = _optimize_survivor_expected_weeks_fixed_milp(
+        data,
+        state,
+        config,
+        discount_table;
+        optimizer=optimizer,
+    )
+    warm_start = _survivor_scalar_warm_start(
+        data,
+        state,
+        fixed_plan,
+        inputs,
+        number_of_weeks,
+        losses_to_elimination,
+    )
+    _set_survivor_scalar_warm_start!(
+        selected,
+        probability,
+        gradient,
+        hessian,
+        warm_start,
+        candidate_indices,
+        number_of_weeks,
+        losses_to_elimination,
+    )
+
+    @objective(
+        model,
+        Max,
+        sum(
+            probability[position + 1, loss_state] +
+            0.5 * hessian[position + 1, loss_state]
+            for position in 1:number_of_weeks,
+            loss_state in state_indices
+        ),
+    )
+    optimize!(model)
+
+    _survivor_has_feasible_incumbent(model) ||
+        throw(ArgumentError(
+            "survivor optimization failed with termination status " *
+            "$(termination_status(model))",
+        ))
+    selected_indices = _survivor_selected_indices(
+        model,
+        selected,
+        candidate_indices,
+    )
+    selections = sort(data[selected_indices, :], [:week, :team])
+    nrow(selections) == number_of_weeks ||
+        throw(ArgumentError("survivor optimization did not select one team per week"))
+
+    selected_by_position = _survivor_fixed_selected_indices(
+        data,
+        selections,
+        state,
+        number_of_weeks,
+    )
+    selected_values = _survivor_scalar_forward_values(
+        selected_by_position,
+        inputs,
+        number_of_weeks,
+        losses_to_elimination,
+    )
+    base_by_week = Dict{Int,Float64}()
+    adjustment_by_week = Dict{Int,Float64}()
+    for position in 1:number_of_weeks
+        week = state.current_week + position - 1
+        base_by_week[week] = sum(
+            selected_values.probability[position + 1, loss_state]
+            for loss_state in state_indices
+        )
+        adjustment_by_week[week] = 0.5 * sum(
+            selected_values.hessian[position + 1, loss_state]
+            for loss_state in state_indices
+        )
+    end
+    base_survival = [base_by_week[Int(week)] for week in selections.week]
+    parameter_variance_adjustment = [
+        adjustment_by_week[Int(week)] for week in selections.week
+    ]
+    _set_survivor_plan_diagnostics!(
+        selections,
+        base_survival,
+        parameter_variance_adjustment,
+    )
+    model_expected_weeks = Float64(objective_value(model))
+    selected_expected_weeks = sum(selections.objective_contribution)
+    isapprox(
+        model_expected_weeks,
+        selected_expected_weeks;
+        rtol=1e-6,
+        atol=2e-6,
+    ) || throw(ArgumentError(
+        "survivor covariance objective and selected-plan evaluation disagree: " *
+        "$model_expected_weeks vs $selected_expected_weeks",
+    ))
+
+    current_pick = selections[selections.week .== state.current_week, :]
+    nrow(current_pick) == 1 ||
+        throw(ArgumentError("survivor optimization did not select one current-week pick"))
+
+    return SurvivorPoolPlan(
+        state,
+        selections,
+        current_pick,
+        discount_table,
+        selected_expected_weeks,
+        config,
+    )
+end
+
 """
     optimize_survivor_pool(candidates, state; ...)
 
 Solve the survivor assignment problem from an injected team-level candidate
 table. `selection_config` controls the objective, reach discounts, market
 guard, missing-line policy, and planning horizon. The default objective
-`:exact_milp` uses a state-transition MILP and reports expected completed
-weeks survived. The `:milp` objective uses fixed personal reach discounts as a
-tractable approximation.
+`:exact_milp` requires a fitted context for its covariance-aware objective.
+Use `:fixed_exact_milp` for the fixed-probability exact state-transition MILP
+with injected candidates. The `:milp` objective uses fixed personal reach
+discounts as a tractable approximation.
 """
 function optimize_survivor_pool(
     candidates::AbstractDataFrame,
@@ -839,7 +1780,13 @@ function optimize_survivor_pool(
     )
     data.discount = [discount_by_week[week] for week in data.week]
     if config.objective === :exact_milp
-        return _optimize_survivor_expected_weeks_exact_milp(
+        throw(ArgumentError(
+            "covariance-aware :exact_milp requires a " *
+            "RegularSeasonForecastContext; use objective=:fixed_exact_milp " *
+            "for injected candidate tables",
+        ))
+    elseif config.objective === :fixed_exact_milp
+        return _optimize_survivor_expected_weeks_fixed_milp(
             data,
             state,
             config,
@@ -877,7 +1824,7 @@ function optimize_survivor_pool(
     )
     optimize!(model)
 
-    JuMP.is_solved_and_feasible(model) ||
+    _survivor_has_feasible_incumbent(model) ||
         throw(ArgumentError(
             "survivor optimization failed with termination status $(termination_status(model))",
         ))
@@ -927,10 +1874,36 @@ function optimize_survivor_pool(
         picks_made=state.picks_made,
         horizon=horizon,
     )
-    return optimize_survivor_pool(
+    selection_config.objective !== :exact_milp &&
+        return optimize_survivor_pool(
+            candidates,
+            state;
+            selection_config=selection_config,
+            optimizer=optimizer,
+        )
+
+    data = _normalize_survivor_candidates(
         candidates,
-        state;
-        selection_config=selection_config,
+        state,
+        selection_config.through_week,
+    )
+    discount_table = _survivor_discount_table(state, selection_config)
+    discount_by_week = Dict(
+        row.week => row.discount for row in eachrow(discount_table)
+    )
+    data.discount = [discount_by_week[week] for week in data.week]
+    inputs = _survivor_objective_inputs(
+        context.model,
+        context.marks,
+        data;
+        horizon=horizon,
+    )
+    return _optimize_survivor_expected_weeks_scalar_milp(
+        data,
+        state,
+        selection_config,
+        discount_table,
+        inputs;
         optimizer=optimizer,
     )
 end

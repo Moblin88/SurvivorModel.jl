@@ -252,6 +252,7 @@ plan = optimize_survivor_pool(
     selection_config=SurvivorSelectionConfig(
         weekly_survival_probability=0.65,
         through_week=18,
+        timeout_seconds=600.0,
     ),
 )
 
@@ -264,12 +265,15 @@ The default `:exact_milp` optimizer expands each unplayed forecast game into
 model-favorite candidates with win probability at least `0.5`, excludes teams
 in `picks_made`, and solves one binary assignment model with JuMP and HiGHS.
 It selects exactly one team for every week in the requested horizon and allows
-each team to be selected at most once. The two objectives target a larger
-expected number of completed weeks before elimination:
+each team to be selected at most once. The objectives target a larger expected
+number of completed weeks before elimination:
 
 - `:milp` uses fixed reach discounts and a linear candidate-level
   approximation.
-- `:exact_milp` uses an exact finite-state probability recursion in a MILP.
+- `:fixed_exact_milp` uses the exact finite-state probability recursion for
+  fixed candidate probabilities.
+- `:exact_milp` uses the covariance-aware finite-state recursion described
+  below. It is the default for fitted forecast contexts.
 
 `plan.selections` includes each selected team's win probability, reach discount,
 selected-team market spread, and objective contribution; `plan.current_pick` is
@@ -277,10 +281,37 @@ the row to use for the current week. The effective `plan.selection_config`
 records the objective, reach-discount policy, market guard, missing-line
 policy, and horizon.
 
-The `:exact_milp` objective tracks the probability of being alive after each
-week at every loss count below the elimination threshold. It uses binary
-selection variables and exact binary-continuous product linearizations, then
-maximizes the sum of weekly survival probabilities:
+The context-based `:exact_milp` objective tracks the probability of being alive
+after each week at every loss count below the elimination threshold. It uses
+the posterior-mean win probability for each candidate and propagates scalar
+gradient and Hessian contractions needed for the second-order delta
+approximation of the complete expected-weeks objective:
+
+`F(mu) + 1/2 * trace(H_F(mu) * Sigma)`.
+
+If `p[w,l]` is the probability of reaching the start of week `w` with `l`
+losses, selecting candidate `t` in week `w` gives the successor
+`v[w,t] * p[w,l] + (1 - v[w,t]) * p[w,l - 1]`. The initial state is
+`p[0,0] = 1`, with other initial loss states and negative loss indices equal to
+zero. Candidate-specific successors are affine expressions, not separate
+team-specific state variables. One-hot selection constraints make the
+successor equality exact for the selected candidate and relax it for
+unselected candidates using the minimum and maximum intervals of the other
+selectable candidates in that week.
+
+Posterior coordinates are shared by `(hazard kind, team, time bin)` across the
+whole horizon. The fitted posterior covariance is currently diagonal. The
+MILP precomputes candidate gradient Gram constants
+`K[t,k] = gradient(v[t])' * Sigma * gradient(v[k])` and tracks
+`gradient(p[w,l])' * Sigma * gradient(v[k])` for each selectable candidate
+reference `k`. A second scalar state tracks
+`trace(Sigma * Hessian(p[w,l]))`; its recurrence includes the candidate
+Hessian contraction and the gradient cross term. Signed interval recurrences
+provide finite one-hot bounds for the probability, gradient, and Hessian
+states. The number of these scalar states depends on selectable candidates,
+not on the number of posterior parameter coordinates. This remains a
+second-order approximation to posterior uncertainty, not exact posterior
+integration.
 
 ```julia
 plan = optimize_survivor_pool(
@@ -293,13 +324,30 @@ plan = optimize_survivor_pool(
 )
 ```
 
-This formulation accepts endpoint probabilities of `0.0` and `1.0` and
-computes the expected-weeks objective exactly. Both modes use the same strike
-semantics:
+The selected rows for this objective include the posterior-mean
+`survival_probability`, its `parameter_variance_adjustment`, the
+`variance_adjusted_survival_probability`, and the adjusted
+`objective_contribution`. `:fixed_exact_milp` is available when callers inject
+a candidate table without fitted posterior metadata:
+
+```julia
+plan = optimize_survivor_pool(
+    candidates,
+    state;
+    selection_config=SurvivorSelectionConfig(
+        objective=:fixed_exact_milp,
+        through_week=18,
+    ),
+)
+```
+
+The fixed-probability formulation accepts endpoint probabilities of `0.0` and
+`1.0` and computes its expected-weeks objective exactly. Both exact modes use
+the same strike semantics:
 `strikes_remaining=s` means the `s`-th future loss eliminates the pool, while
 zero means the next loss eliminates it. The selected rows for the exact
-objective also include `survival_probability`, `elimination_probability`, and
-the per-week expected-survival contribution.
+objectives also include `survival_probability`, `elimination_probability`, and
+the per-week objective contribution.
 
 ### Survivor command-line app
 
@@ -326,10 +374,20 @@ survivor --season 2026 < picks.txt
 ```
 
 Pass `--objective milp` to use the discounted approximation; the default is
-`exact-milp`:
+`exact-milp`. `fixed-exact-milp` selects the fixed-probability compatibility
+formulation:
 
 ```sh
 survivor --season 2026 --objective milp < picks.txt
+```
+
+Pass `--timeout SECONDS` to limit the default HiGHS MILP solve. If HiGHS
+reaches the limit after finding a feasible incumbent, the app returns the best
+incumbent found so far; if no feasible incumbent exists, the optimization
+reports an error. Omit the option for an unlimited solve:
+
+```sh
+survivor --season 2026 --timeout 600 < picks.txt
 ```
 
 The app reads one team abbreviation per nonblank line, starting with week 1.
@@ -367,13 +425,17 @@ target-season PBP and uses historical drives only. Once prior picks imply week
 not omitted. Cache clearing is a maintenance operation; normal weekly runs
 should use `--refresh-data` instead.
 
-The default `:exact_milp` objective uses the state-transition MILP to compute
-expected completed weeks exactly. The optional `:milp` objective uses fixed
-reach discounts and candidate win probabilities as a tractable approximation.
-Both modes select one team per week and use each team at most once.
+The default `:exact_milp` objective uses the expanded state-transition MILP
+with a second-order delta correction for shared posterior parameter
+uncertainty. The `:fixed_exact_milp` objective uses fixed candidate
+probabilities and computes expected completed weeks exactly. The optional
+`:milp` objective uses fixed reach discounts and candidate win probabilities as
+a tractable approximation. All modes select one team per week and use each
+team at most once.
 `SurvivorSelectionConfig` can change the objective, weekly survival
 probability, reach-discount policy, market guard, missing-line policy, and
-planning horizon. The default market policy protects
+planning horizon. `timeout_seconds` optionally limits the default HiGHS solve
+in seconds and defaults to unlimited. The default market policy protects
 the current and following week by requiring a selected team to be favored by at
 least `2.0` points; missing lines remain eligible. Positive `market_spread`
 values mean the selected team is favored.

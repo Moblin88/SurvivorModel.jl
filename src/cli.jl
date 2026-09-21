@@ -8,8 +8,8 @@ end
 function _survivor_cli_usage()
     return """
     Usage:
-      survivor --season YEAR [--strikes N] [--objective NAME] [--timings] < picks.txt
-      julia --project=. -m SurvivorModel --season YEAR [--strikes N] [--objective NAME] [--timings] < picks.txt
+      survivor --season YEAR [--strikes N] [--objective NAME] [--timeout SECONDS] [--timings] < picks.txt
+      julia --project=. -m SurvivorModel --season YEAR [--strikes N] [--objective NAME] [--timeout SECONDS] [--timings] < picks.txt
 
     Input:
       One team abbreviation per nonblank line, starting with week 1.
@@ -20,7 +20,9 @@ function _survivor_cli_usage()
       --strikes N         Initial strike count (default: 2).
       --objective NAME    Selection objective (default:
                           exact-milp; use milp for the
-                          discounted approximation).
+                          discounted approximation or
+                          fixed-exact-milp for fixed probabilities).
+      --timeout SECONDS  HiGHS MILP time limit in seconds (default: unlimited).
       --timings           Print phase timings to stderr.
       --refresh-data      Clear NFLData's raw cache and refresh summarized
                           historical drive data before running.
@@ -35,6 +37,13 @@ function _parse_survivor_cli_integer(value::AbstractString, option::AbstractStri
     return parsed
 end
 
+function _parse_survivor_cli_real(value::AbstractString, option::AbstractString)
+    parsed = tryparse(Float64, value)
+    parsed === nothing ||
+        (isfinite(parsed) && parsed > 0.0 && return parsed)
+    throw(ArgumentError("$option requires a finite positive number of seconds"))
+end
+
 function _parse_survivor_cli_objective(value::AbstractString)
     normalized = lowercase(replace(strip(value), '-' => '_'))
     return _canonical_survivor_objective(Symbol(normalized))
@@ -46,6 +55,8 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
     strikes_specified = false
     objective = DEFAULT_SURVIVOR_OBJECTIVE
     objective_specified = false
+    timeout_seconds = nothing
+    timeout_specified = false
     timings = false
     timings_specified = false
     refresh_data = false
@@ -87,7 +98,8 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
         value = nothing
         if argument == "--season" ||
             argument == "--strikes" ||
-            argument == "--objective"
+        argument == "--objective" ||
+        argument == "--timeout"
             option = argument
             index += 1
             index <= length(args) ||
@@ -102,6 +114,9 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
         elseif startswith(argument, "--objective=")
             option = "--objective"
             value = argument[length("--objective=") + 1:end]
+        elseif startswith(argument, "--timeout=")
+            option = "--timeout"
+            value = argument[length("--timeout=") + 1:end]
         else
             throw(ArgumentError("unknown option: $argument"))
         end
@@ -123,6 +138,11 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
                 throw(ArgumentError("--objective may only be specified once"))
             objective = _parse_survivor_cli_objective(value)
             objective_specified = true
+        elseif option == "--timeout"
+            timeout_specified &&
+                throw(ArgumentError("--timeout may only be specified once"))
+            timeout_seconds = _parse_survivor_cli_real(value, option)
+            timeout_specified = true
         end
         index += 1
     end
@@ -132,6 +152,7 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
         season=0,
         initial_strikes=2,
         objective=DEFAULT_SURVIVOR_OBJECTIVE,
+        timeout_seconds=nothing,
         timings=false,
         refresh_data=false,
     )
@@ -144,6 +165,7 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
         season=Int(season),
         initial_strikes=Int(initial_strikes),
         objective=objective,
+        timeout_seconds=timeout_seconds,
         timings=timings,
         refresh_data=refresh_data,
     )
@@ -367,6 +389,7 @@ function _run_survivor_cli(
         selection_config=SurvivorSelectionConfig(
             objective=options.objective,
             through_week=through_week,
+            timeout_seconds=options.timeout_seconds,
         ),
     )
     record_timing(:optimize)

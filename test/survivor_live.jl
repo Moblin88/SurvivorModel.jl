@@ -390,6 +390,7 @@ function _survivor_live_backtest_season(
                     candidates,
                     state;
                     selection_config=SurvivorSelectionConfig(
+                        objective=:fixed_exact_milp,
                         weekly_survival_probability=weekly_survival_probability,
                         through_week=last_week,
                     ),

@@ -626,6 +626,26 @@ end
     end
 
     @testset "scalar recurrence bounds" begin
+        gradient_references =
+            SurvivorModel._survivor_gradient_reference_indices(
+                [1, 1, 2, 2],
+                2,
+            )
+        @test gradient_references == [[1, 2, 3, 4], [3, 4]]
+        @test sum(length, gradient_references) == 6
+        sparse_gradient_references =
+            SurvivorModel._survivor_gradient_reference_indices(
+                [1, 1, 2, 2],
+                2,
+                [
+                    0.0 0.0 1.0 0.0
+                    0.0 0.0 0.0 0.0
+                    1.0 0.0 0.0 0.0
+                    0.0 0.0 0.0 0.0
+                ],
+            )
+        @test sparse_gradient_references == [Int[], [3]]
+
         keys = [
             (:td, "A", 1),
             (:td, "B", 1),
@@ -854,6 +874,20 @@ end
             @test SurvivorModel.JuMP.primal_status(model) ==
                 SurvivorModel.JuMP.MOI.FEASIBLE_POINT
             @test SurvivorModel._survivor_has_feasible_incumbent(model)
+            diagnostics = SurvivorModel._survivor_log_milp_result(
+                model,
+                :test,
+                0.01,
+            )
+            @test diagnostics.termination_status ==
+                SurvivorModel.JuMP.MOI.TIME_LIMIT
+            @test diagnostics.primal_status ==
+                SurvivorModel.JuMP.MOI.FEASIBLE_POINT
+            @test diagnostics.has_values
+            @test diagnostics.incumbent_objective !== nothing
+            @test diagnostics.objective_bound !== nothing
+            @test diagnostics.relative_gap !== nothing
+            @test diagnostics.node_count !== nothing
         end
 
         missing_line = DataFrame(

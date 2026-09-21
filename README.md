@@ -405,6 +405,11 @@ to stderr so stdout remains suitable for a picks file:
 survivor --season 2026 --timings < picks.txt
 ```
 
+With `--timings`, the stderr diagnostics also include one record for each MILP
+solve. Each record reports the phase, termination/primal status, whether an
+incumbent is available, incumbent objective, objective bound, relative gap, and
+branch-and-bound node count.
+
 Use `--refresh-data` (or set `SURVIVORMODEL_REFRESH_DATA=true`) for an explicit
 data refresh. This clears NFLData's raw-data cache and rebuilds the package's
 summarized historical-drive cache before running; normal invocations reuse

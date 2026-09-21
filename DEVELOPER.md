@@ -105,6 +105,19 @@ the candidate Hessian contraction and
 three state families are propagated recursively and reused for the one-hot
 gates.
 
+The model also adds redundant aggregate recurrence cuts for
+`P[w] = sum(p[w,l])` and
+`A[w] = sum(p[w,l] + 0.5 * h[w,l])`. For a selected candidate, these
+recurrences telescope the loss-state transitions and directly constrain the
+objective state in the LP relaxation. The probability aggregate is additionally
+constrained to be nonincreasing over time.
+
+Gradient reference states are omitted when the Gram matrix proves that no
+candidate in any earlier week can contribute to that reference. A reference
+state is added again at the first week where a nonzero covariance-gradient
+contraction is possible. This support pruning is exact; zero-support states
+are fixed at zero rather than approximated.
+
 The candidate Gram matrix is sized by selectable rows rather than by the
 posterior parameter vector, and the current fitted covariance remains
 diagonal. The covariance MILP first solves the fixed-probability exact
@@ -117,6 +130,12 @@ reported adjusted objective.
 attribute to the default optimizer. If the limit is reached with a feasible
 incumbent, the MILP returns that best-known plan; a timeout without any
 feasible incumbent is reported as an optimization failure.
+
+The CLI's `--timings` mode raises the timing logger to debug level so each
+MILP phase records its termination and primal statuses, result count,
+incumbent availability and objective, objective bound, relative gap, and
+branch-and-bound node count. Library callers retain the normal quiet logging
+behavior unless they enable debug logging themselves.
 
 Candidate rows below the model-favorite threshold of `0.5` are excluded before
 either survivor objective is solved.

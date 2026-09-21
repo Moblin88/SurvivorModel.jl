@@ -304,7 +304,7 @@ function _run_survivor_cli(
     timing_output::IO=stderr,
 )
     timing_started = time_ns()
-    timing_logger = Logging.SimpleLogger(timing_output, Logging.Info)
+    timing_logger = Logging.SimpleLogger(timing_output, Logging.Debug)
     record_timing = function(phase::Symbol)
         timings_enabled || return nothing
         now = time_ns()
@@ -381,7 +381,7 @@ function _run_survivor_cli(
     )
     record_timing(:fit)
     record_timing(:optimize_start)
-    plan = optimize_survivor_pool(
+    solve_plan = () -> optimize_survivor_pool(
         context;
         picks_made=state.picks_made,
         strikes_remaining=state.strikes_remaining,
@@ -392,6 +392,13 @@ function _run_survivor_cli(
             timeout_seconds=options.timeout_seconds,
         ),
     )
+    plan = if timings_enabled
+        Logging.with_logger(timing_logger) do
+            solve_plan()
+        end
+    else
+        solve_plan()
+    end
     record_timing(:optimize)
     nrow(plan.current_pick) == 1 ||
         throw(ArgumentError("survivor optimization did not produce one current pick"))

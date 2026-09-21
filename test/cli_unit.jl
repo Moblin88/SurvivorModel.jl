@@ -408,6 +408,7 @@ end
             @test occursin("survivor phase complete", timing_text)
             @test occursin("optimize_start", timing_text)
             @test occursin("optimize", timing_text)
+            @test occursin("survivor MILP solve complete", timing_text)
         end
 
         completed_schedule = copy(schedule)

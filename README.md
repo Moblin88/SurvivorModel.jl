@@ -451,8 +451,10 @@ If that data changes, the cached prior is recomputed. current-season drives and 
 invocation. An opening-week forecast can run before NFLData publishes
 target-season PBP and uses historical drives only. Once prior picks imply week
 2 or later, target-season PBP must be available so the current-season update is
-not omitted. Cache clearing is a maintenance operation; normal weekly runs
-should use `--refresh-data` instead.
+not omitted. If a cached schedule still marks a supplied previous pick as
+uncompleted, the CLI automatically clears NFLData's cache and retries the
+schedule validation once. `--refresh-data` remains available when an explicit
+full data refresh is desired.
 
 The default `:exact_milp` objective uses the expanded state-transition MILP
 with a configurable initial Hessian correction for shared posterior parameter

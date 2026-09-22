@@ -225,6 +225,42 @@ function _survivor_cli_result_value(value)
     throw(ArgumentError("schedule results must be finite numeric margins"))
 end
 
+function _survivor_cli_schedule_and_state(
+    schedule,
+    season::Integer,
+    picks::AbstractVector{<:AbstractString},
+    initial_strikes::Integer;
+    schedule_loader::Function=load_schedule,
+    clear_data_cache::Function=NFLData.clear_cache,
+)
+    normalized_schedule = schedule === nothing ?
+        schedule_loader() :
+        load_schedule(schedule)
+    state = try
+        _survivor_cli_state(
+            normalized_schedule,
+            season,
+            picks,
+            initial_strikes,
+        )
+    catch error
+        stale_schedule = schedule === nothing &&
+            error isa ArgumentError &&
+            error.msg ==
+            "a previous pick refers to an uncompleted game"
+        stale_schedule || rethrow()
+        clear_data_cache()
+        normalized_schedule = schedule_loader()
+        _survivor_cli_state(
+            normalized_schedule,
+            season,
+            picks,
+            initial_strikes,
+        )
+    end
+    return normalized_schedule, state
+end
+
 function _survivor_cli_state(
     schedule::AbstractDataFrame,
     season::Integer,
@@ -335,6 +371,8 @@ function _run_survivor_cli(
     max_seasons::Int=DEFAULT_HISTORICAL_SEASONS,
     through_week::Int=18,
     timing_output::IO=stderr,
+    schedule_loader::Function=load_schedule,
+    clear_data_cache::Function=NFLData.clear_cache,
 )
     timing_started = time_ns()
     timing_logger = Logging.SimpleLogger(timing_output, Logging.Debug)
@@ -357,17 +395,18 @@ function _run_survivor_cli(
         return 0
     end
     refresh_data = options.refresh_data || _survivor_cli_refresh_data_enabled()
-    refresh_data && NFLData.clear_cache()
+    refresh_data && clear_data_cache()
 
     picks = _read_survivor_cli_picks(input)
-    normalized_schedule = schedule === nothing ? load_schedule() : load_schedule(schedule)
-    record_timing(:schedule)
-    state = _survivor_cli_state(
-        normalized_schedule,
+    normalized_schedule, state = _survivor_cli_schedule_and_state(
+        schedule,
         options.season,
         picks,
-        options.initial_strikes,
+        options.initial_strikes;
+        schedule_loader=schedule_loader,
+        clear_data_cache=clear_data_cache,
     )
+    record_timing(:schedule)
     record_timing(:state)
     historical_source = _survivor_cli_load_historical_drives(
         options.season,

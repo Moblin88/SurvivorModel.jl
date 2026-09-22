@@ -435,6 +435,40 @@ end
 
         completed_schedule = copy(schedule)
         completed_schedule.result = [7, 7, 3]
+        stale_schedule = copy(schedule)
+        stale_schedule.result[
+            (stale_schedule.season .== 2023) .&
+            (stale_schedule.week .== 1),
+        ] .= missing
+        schedule_calls = Ref(0)
+        cache_clear_calls = Ref(0)
+        schedule_loader = () -> begin
+            schedule_calls[] += 1
+            current_schedule = schedule_calls[] == 1 ?
+                stale_schedule :
+                completed_schedule
+            return SurvivorModel.load_schedule(current_schedule)
+        end
+        mktempdir() do cache_directory
+            output = IOBuffer()
+            exit_code = SurvivorModel._run_survivor_cli(
+                ["--season", "2023"];
+                input=IOBuffer("A\n"),
+                output=output,
+                schedule_loader=schedule_loader,
+                clear_data_cache=() -> (cache_clear_calls[] += 1),
+                historical_drives=historical,
+                current_drives=current,
+                cache_directory=cache_directory,
+                method=SurvivorModel.MomentFit(),
+                through_week=2,
+            )
+            @test exit_code == 0
+            @test !isempty(strip(String(take!(output))))
+            @test schedule_calls[] == 2
+            @test cache_clear_calls[] == 1
+        end
+
         mktempdir() do cache_directory
             output = IOBuffer()
             exit_code = SurvivorModel._run_survivor_cli(

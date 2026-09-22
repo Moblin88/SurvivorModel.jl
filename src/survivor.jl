@@ -1522,8 +1522,17 @@ function _optimize_survivor_expected_weeks_scalar_milp(
     discount_table::AbstractDataFrame,
     inputs::SurvivorObjectiveInputs;
     optimizer=nothing,
+    forbid_warm_start_first_pick::Bool=false,
+    use_warm_start::Bool=true,
+    integer_prefix_weeks::Union{Nothing,Integer}=nothing,
+    return_solver_diagnostics::Bool=false,
 )
     number_of_weeks = config.through_week - state.current_week + 1
+    integer_prefix_weeks === nothing ||
+        1 <= integer_prefix_weeks <= number_of_weeks ||
+        throw(ArgumentError(
+            "integer_prefix_weeks must be within the optimization horizon",
+        ))
     losses_to_elimination = _survivor_loss_threshold(state)
     losses_to_elimination > number_of_weeks &&
         return _survivor_constant_plan(
@@ -1889,17 +1898,39 @@ function _optimize_survivor_expected_weeks_scalar_milp(
         loss_state in state_indices
     )
     @debug "survivor MILP warm start" phase=:exact_milp objective=warm_start_objective
-    _set_survivor_scalar_warm_start!(
-        selected,
-        probability,
-        gradient,
-        hessian,
-        warm_start,
-        candidate_indices,
-        gradient_reference_indices,
-        number_of_weeks,
-        losses_to_elimination,
-    )
+    forbidden_index = nothing
+    if forbid_warm_start_first_pick
+        first_candidates = findall(==(1), candidate_positions)
+        first_selected = intersect(first_candidates, warm_start.selected)
+        length(first_selected) == 1 ||
+            throw(ArgumentError(
+                "survivor warm start must select one first-week candidate",
+            ))
+        forbidden_index = only(first_selected)
+        @constraint(model, selected[forbidden_index] == 0.0)
+    end
+    if integer_prefix_weeks !== nothing
+        for index in candidate_indices
+            if candidate_positions[index] > integer_prefix_weeks
+                unset_binary(selected[index])
+                set_lower_bound(selected[index], 0.0)
+                set_upper_bound(selected[index], 1.0)
+            end
+        end
+    end
+    if !forbid_warm_start_first_pick && use_warm_start
+        _set_survivor_scalar_warm_start!(
+            selected,
+            probability,
+            gradient,
+            hessian,
+            warm_start,
+            candidate_indices,
+            gradient_reference_indices,
+            number_of_weeks,
+            losses_to_elimination,
+        )
+    end
 
     @objective(
         model,
@@ -1913,17 +1944,48 @@ function _optimize_survivor_expected_weeks_scalar_milp(
     )
     solve_started_at = time_ns()
     optimize!(model)
-    _survivor_log_milp_result(
+    solve_diagnostics = _survivor_log_milp_result(
         model,
         :exact_milp,
         (time_ns() - solve_started_at) / 1.0e9,
     )
-
     _survivor_has_feasible_incumbent(model) ||
         throw(ArgumentError(
             "survivor optimization failed with termination status " *
             "$(termination_status(model))",
         ))
+    if return_solver_diagnostics
+        prefix = something(integer_prefix_weeks, number_of_weeks)
+        returned_selected_values = Float64.(value.(selected))
+        relaxed_prefix_selections = [
+            (
+                index=index,
+                week=Int(data.week[index]),
+                team=String(data.team[index]),
+                value=returned_selected_values[index],
+            )
+            for index in candidate_indices
+            if candidate_positions[index] <= prefix
+        ]
+        warm_start_prefix_selections = [
+            (
+                index=index,
+                week=Int(data.week[index]),
+                team=String(data.team[index]),
+            )
+            for index in warm_start.selected
+            if candidate_positions[index] <= prefix
+        ]
+        return merge(
+            solve_diagnostics,
+            (
+                warm_start_objective=warm_start_objective,
+                forbidden_index,
+                relaxed_prefix_selections,
+                warm_start_prefix_selections,
+            ),
+        )
+    end
     selected_indices = _survivor_selected_indices(
         model,
         selected,
@@ -2157,6 +2219,60 @@ function optimize_survivor_pool(
         discount_table,
         inputs;
         optimizer=optimizer,
+    )
+end
+
+function _survivor_first_pick_relaxation(
+    context::RegularSeasonForecastContext,
+    state::SurvivorPoolState;
+    selection_config::SurvivorSelectionConfig=SurvivorSelectionConfig(),
+    include_completed::Bool=false,
+    horizon::Real=GAME_CLOCK_SECONDS,
+    optimizer=nothing,
+    integer_prefix_weeks::Integer=1,
+    forbid_warm_start_first_pick::Bool=true,
+)
+    state.season == context.season ||
+        throw(ArgumentError("survivor state season must match forecast context season"))
+    state.current_week == context.as_of_week ||
+        throw(ArgumentError("survivor state current_week must match context as_of_week"))
+    selection_config.objective === :exact_milp ||
+        throw(ArgumentError(
+            "first-pick relaxation requires objective=:exact_milp",
+        ))
+    candidates = build_survivor_candidates(
+        context;
+        through_week=selection_config.through_week,
+        include_completed=include_completed,
+        picks_made=state.picks_made,
+        horizon=horizon,
+    )
+    data = _normalize_survivor_candidates(
+        candidates,
+        state,
+        selection_config.through_week,
+    )
+    discount_table = _survivor_discount_table(state, selection_config)
+    discount_by_week = Dict(
+        row.week => row.discount for row in eachrow(discount_table)
+    )
+    data.discount = [discount_by_week[week] for week in data.week]
+    inputs = _survivor_objective_inputs(
+        context.model,
+        context.marks,
+        data;
+        horizon=horizon,
+    )
+    return _optimize_survivor_expected_weeks_scalar_milp(
+        data,
+        state,
+        selection_config,
+        discount_table,
+        inputs;
+        optimizer=optimizer,
+        forbid_warm_start_first_pick=forbid_warm_start_first_pick,
+        integer_prefix_weeks=integer_prefix_weeks,
+        return_solver_diagnostics=true,
     )
 end
 

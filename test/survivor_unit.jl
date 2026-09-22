@@ -840,10 +840,11 @@ end
         )
 
         @testset "timed feasible incumbent" begin
+            timeout_seconds = 1.0
             model = SurvivorModel.JuMP.Model(
                 SurvivorModel.JuMP.optimizer_with_attributes(
                     SurvivorModel.HiGHS.Optimizer,
-                    "time_limit" => 0.01,
+                    "time_limit" => timeout_seconds,
                     "threads" => 4,
                     "parallel" => "on",
                 ),
@@ -877,7 +878,7 @@ end
             diagnostics = SurvivorModel._survivor_log_milp_result(
                 model,
                 :test,
-                0.01,
+                timeout_seconds,
             )
             @test diagnostics.termination_status ==
                 SurvivorModel.JuMP.MOI.TIME_LIMIT

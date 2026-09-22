@@ -157,6 +157,15 @@ end
                 through_week=1,
             ),
         )
+        @test_throws ArgumentError optimize_survivor_pool(
+            direct_candidates,
+            SurvivorPoolState(2025, 1; strikes_remaining=0);
+            selection_config=SurvivorSelectionConfig(
+                objective=:fixed_exact_milp,
+                prove_first_pick=true,
+                through_week=1,
+            ),
+        )
 
         @test candidates.win_probability[
             (candidates.week .== 1) .& (candidates.team .== "B")
@@ -914,6 +923,97 @@ end
             inputs,
         )
         @test clamped_plan.objective_value ≈ plan.objective_value
+
+        proof_inputs = SurvivorModel.SurvivorObjectiveInputs(
+            parameters,
+            [
+                SurvivorModel.SurvivorCandidateDerivatives(
+                    0.95,
+                    [0.0, 0.0],
+                    0.2,
+                ),
+                SurvivorModel.SurvivorCandidateDerivatives(
+                    0.60,
+                    [0.0, 0.0],
+                    -0.1,
+                ),
+                SurvivorModel.SurvivorCandidateDerivatives(
+                    0.90,
+                    [0.0, 0.0],
+                    0.3,
+                ),
+                SurvivorModel.SurvivorCandidateDerivatives(
+                    0.70,
+                    [0.0, 0.0],
+                    -0.05,
+                ),
+            ],
+        )
+        first_selection = sort(data[[1, 3], :], [:week, :team])
+        alternate_selection = sort(data[[2, 3], :], [:week, :team])
+        first_evaluation = SurvivorModel._survivor_full_scalar_objective(
+            data,
+            state,
+            proof_inputs,
+            first_selection,
+        )
+        alternate_evaluation = SurvivorModel._survivor_full_scalar_objective(
+            data,
+            state,
+            proof_inputs,
+            alternate_selection,
+        )
+        @test first_evaluation.objective > alternate_evaluation.objective
+        @test any(abs.(first_evaluation.values.hessian[2:end, :]) .> 0.0)
+        infeasible_proof =
+            SurvivorModel._optimize_survivor_expected_weeks_scalar_milp(
+                data,
+                state,
+                config,
+                discount_table,
+                proof_inputs;
+                use_warm_start=false,
+                curvature_weeks_override=2,
+                objective_lower_bound=first_evaluation.objective,
+                forbidden_first_pick_index=1,
+                proof_mode=true,
+                phase=:first_pick_proof,
+                return_solver_diagnostics=true,
+            )
+        @test infeasible_proof.proof_status === :infeasible
+        feasible_proof =
+            SurvivorModel._optimize_survivor_expected_weeks_scalar_milp(
+                data,
+                state,
+                config,
+                discount_table,
+                proof_inputs;
+                use_warm_start=false,
+                curvature_weeks_override=2,
+                objective_lower_bound=alternate_evaluation.objective,
+                forbidden_first_pick_index=1,
+                proof_mode=true,
+                phase=:first_pick_proof,
+                return_solver_diagnostics=true,
+            )
+        @test feasible_proof.proof_status === :feasible
+        @test only(feasible_proof.proof_first_pick).index == 2
+        fake_plan = SurvivorPoolPlan(
+            state,
+            alternate_selection,
+            alternate_selection[alternate_selection.week .== 1, :],
+            discount_table,
+            alternate_evaluation.objective,
+            config,
+        )
+        @test_throws ArgumentError SurvivorModel._survivor_prove_first_pick(
+            data,
+            state,
+            config,
+            discount_table,
+            proof_inputs,
+            fake_plan,
+        )
     end
 
     @testset "selection configuration" begin
@@ -922,6 +1022,8 @@ end
         @test SurvivorSelectionConfig().hessian_weeks == 3
         @test SurvivorSelectionConfig(hessian_weeks=0).hessian_weeks == 0
         @test SurvivorSelectionConfig(hessian_weeks=19).hessian_weeks == 19
+        @test !SurvivorSelectionConfig().prove_first_pick
+        @test SurvivorSelectionConfig(prove_first_pick=true).prove_first_pick
         @test SurvivorSelectionConfig().timeout_seconds === nothing
         @test SurvivorSelectionConfig(timeout_seconds=12.5).timeout_seconds == 12.5
         @test SurvivorSelectionConfig(objective=:exact_milp).objective ===

@@ -328,6 +328,15 @@ eligible teams not already used, with stable candidate-order tie breaking.
 This warm start uses the same prefix objective as the final model and does not
 solve the separate `:fixed_exact_milp` formulation.
 
+Set `prove_first_pick=true` to run an optional first-pick proof after the
+configured-prefix solve. The selected plan is forward-evaluated with Hessian
+terms through the full horizon, then a full-Hessian feasibility MILP forbids
+that first pick and requires an objective at least as large as the evaluated
+full-horizon score. Only a proven infeasible alternate-first-pick model
+returns the plan; a feasible, timed-out, or otherwise unresolved proof raises
+an error. The proof reuses `timeout_seconds` and is also available from the
+CLI as `--prove-first-pick`.
+
 ```julia
 plan = optimize_survivor_pool(
     context;
@@ -456,8 +465,10 @@ All modes select one team per week and use each team at most once.
 probability, reach-discount policy, market guard, missing-line policy, planning
 horizon, and `hessian_weeks`. The latter defaults to three for `:exact_milp`,
 allows zero for a linear-only objective, and is clamped to the available
-horizon. `timeout_seconds` optionally limits the default HiGHS solve
-in seconds and defaults to unlimited. The default market policy protects
+horizon. `prove_first_pick` enables the optional full-Hessian alternate-first-
+pick proof and defaults to false. `timeout_seconds` optionally limits both the
+main and proof HiGHS solves in seconds and defaults to unlimited. The default
+market policy protects
 the current and following week by requiring a selected team to be favored by at
 least `2.0` points; missing lines remain eligible. Positive `market_spread`
 values mean the selected team is favored.

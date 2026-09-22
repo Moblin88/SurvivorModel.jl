@@ -134,6 +134,15 @@ gradient-contraction, and retained Hessian-contraction states. The selected
 plan is then forward-evaluated again to verify the reported hybrid objective;
 it does not solve `:fixed_exact_milp` as a preliminary warm-start problem.
 
+When `prove_first_pick=true`, the selected plan is evaluated again with
+Hessian states through the full horizon. A second scalar MILP then keeps all
+full-Hessian terms, forbids the selected first candidate, and imposes a
+non-strict lower bound equal to that full-Hessian score. This is a
+feasibility check rather than a second optimization: only `INFEASIBLE` proves
+the first pick under the requested threshold. A feasible alternate, timeout,
+or any other unresolved status raises an explicit error, and the proof reuses
+the configured `timeout_seconds`.
+
 `SurvivorSelectionConfig(timeout_seconds=...)` passes a HiGHS `time_limit`
 attribute to the default optimizer. If the limit is reached with a feasible
 incumbent, the MILP returns that best-known plan; a timeout without any

@@ -46,7 +46,8 @@ covariance-aware expected-weeks formulation for fitted contexts;
 limits the default HiGHS solve and returns its best feasible incumbent when
 the limit is reached. `hessian_weeks` controls how many future weeks receive
 the covariance-aware Hessian adjustment in `:exact_milp`; later weeks retain
-their posterior-mean probability terms only.
+their posterior-mean probability terms only. `prove_first_pick` optionally
+runs a full-Hessian alternate-first-pick feasibility proof after `:exact_milp`.
 """
 struct SurvivorSelectionConfig
     objective::Symbol
@@ -57,6 +58,7 @@ struct SurvivorSelectionConfig
     market_guard_weeks::Int
     through_week::Int
     hessian_weeks::Int
+    prove_first_pick::Bool
     timeout_seconds::Union{Nothing,Float64}
 end
 
@@ -70,6 +72,7 @@ function SurvivorSelectionConfig(
     market_guard_weeks::Integer=DEFAULT_SURVIVOR_MARKET_GUARD_WEEKS,
     through_week::Integer=18,
     hessian_weeks::Integer=3,
+    prove_first_pick::Bool=false,
     timeout_seconds=nothing,
 )
     objective = _canonical_survivor_objective(objective)
@@ -121,6 +124,7 @@ function SurvivorSelectionConfig(
         Int(market_guard_weeks),
         Int(through_week),
         Int(hessian_weeks),
+        prove_first_pick,
         normalized_timeout,
     )
 end
@@ -1638,6 +1642,57 @@ function _set_survivor_scalar_warm_start!(
     return nothing
 end
 
+function _survivor_full_scalar_objective(
+    data::AbstractDataFrame,
+    state::SurvivorPoolState,
+    inputs::SurvivorObjectiveInputs,
+    selections::AbstractDataFrame,
+)
+    number_of_weeks = maximum(Int.(data.week)) - state.current_week + 1
+    losses_to_elimination = _survivor_loss_threshold(state)
+    selected_by_position = _survivor_fixed_selected_indices(
+        data,
+        selections,
+        state,
+        number_of_weeks,
+    )
+    candidate_positions = [
+        Int(data.week[index]) - state.current_week + 1
+        for index in 1:nrow(data)
+    ]
+    gradient_reference_indices = _survivor_gradient_reference_indices(
+        candidate_positions,
+        number_of_weeks,
+        inputs.covariance_gradient_gram;
+        maximum_reference_position=number_of_weeks,
+    )
+    values = _survivor_scalar_forward_values(
+        selected_by_position,
+        inputs,
+        number_of_weeks,
+        losses_to_elimination;
+        curvature_weeks=number_of_weeks,
+        gradient_reference_indices=gradient_reference_indices,
+    )
+    objective = sum(
+        values.probability[position + 1, loss_state]
+        for position in 1:number_of_weeks,
+        loss_state in 1:losses_to_elimination
+    ) + 0.5 * sum(
+        values.hessian[position + 1, loss_state]
+        for position in 1:number_of_weeks,
+        loss_state in 1:losses_to_elimination
+    )
+    isfinite(objective) ||
+        throw(ArgumentError("survivor full-Hessian objective must be finite"))
+    return (
+        objective=Float64(objective),
+        selected_by_position,
+        values,
+        gradient_reference_indices,
+    )
+end
+
 function _optimize_survivor_expected_weeks_scalar_milp(
     data::AbstractDataFrame,
     state::SurvivorPoolState,
@@ -1649,9 +1704,34 @@ function _optimize_survivor_expected_weeks_scalar_milp(
     use_warm_start::Bool=true,
     integer_prefix_weeks::Union{Nothing,Integer}=nothing,
     return_solver_diagnostics::Bool=false,
+    curvature_weeks_override::Union{Nothing,Integer}=nothing,
+    objective_lower_bound=nothing,
+    forbidden_first_pick_index::Union{Nothing,Integer}=nothing,
+    proof_mode::Bool=false,
+    phase::Symbol=:exact_milp,
 )
     number_of_weeks = config.through_week - state.current_week + 1
-    curvature_weeks = min(config.hessian_weeks, number_of_weeks)
+    curvature_weeks = isnothing(curvature_weeks_override) ?
+        min(config.hessian_weeks, number_of_weeks) :
+        Int(curvature_weeks_override)
+    0 <= curvature_weeks <= number_of_weeks ||
+        throw(ArgumentError(
+            "survivor curvature weeks must be within the optimization horizon",
+        ))
+    normalized_objective_lower_bound = if objective_lower_bound === nothing
+        nothing
+    else
+        bound_value = Float64(objective_lower_bound)
+        isfinite(bound_value) ||
+            throw(ArgumentError(
+                "survivor objective lower bound must be finite",
+            ))
+        bound_value
+    end
+    proof_mode && normalized_objective_lower_bound === nothing &&
+        throw(ArgumentError(
+            "survivor proof mode requires an objective lower bound",
+        ))
     integer_prefix_weeks === nothing ||
         1 <= integer_prefix_weeks <= number_of_weeks ||
         throw(ArgumentError(
@@ -2039,8 +2119,21 @@ function _optimize_survivor_expected_weeks_scalar_milp(
         loss_state in state_indices;
         init=0.0,
     )
-    @debug "survivor MILP warm start" phase=:exact_milp objective=warm_start_objective
+    warm_start_used = !forbid_warm_start_first_pick && use_warm_start
+    @debug "survivor MILP warm start" phase=phase objective=warm_start_objective used=warm_start_used
     forbidden_index = nothing
+    if forbidden_first_pick_index !== nothing
+        forbidden_index = Int(forbidden_first_pick_index)
+        forbidden_index in candidate_indices ||
+            throw(ArgumentError(
+                "survivor forbidden first-pick candidate is not in the model",
+            ))
+        candidate_positions[forbidden_index] == 1 ||
+            throw(ArgumentError(
+                "survivor forbidden candidate must be in the first week",
+            ))
+        @constraint(model, selected[forbidden_index] == 0.0)
+    end
     if forbid_warm_start_first_pick
         first_candidates = findall(==(1), candidate_positions)
         first_selected = intersect(first_candidates, warm_start.selected)
@@ -2048,7 +2141,12 @@ function _optimize_survivor_expected_weeks_scalar_milp(
             throw(ArgumentError(
                 "survivor warm start must select one first-week candidate",
             ))
-        forbidden_index = only(first_selected)
+        warm_forbidden_index = only(first_selected)
+        forbidden_index === nothing || forbidden_index == warm_forbidden_index ||
+            throw(ArgumentError(
+                "survivor proof and warm-start first-pick exclusions disagree",
+            ))
+        forbidden_index = warm_forbidden_index
         @constraint(model, selected[forbidden_index] == 0.0)
     end
     if integer_prefix_weeks !== nothing
@@ -2060,7 +2158,7 @@ function _optimize_survivor_expected_weeks_scalar_milp(
             end
         end
     end
-    if !forbid_warm_start_first_pick && use_warm_start
+    if warm_start_used
         _set_survivor_scalar_warm_start!(
             selected,
             probability,
@@ -2075,9 +2173,7 @@ function _optimize_survivor_expected_weeks_scalar_milp(
         )
     end
 
-    @objective(
-        model,
-        Max,
+    objective_expression =
         sum(
             probability[position + 1, loss_state]
             for position in 1:number_of_weeks,
@@ -2085,16 +2181,72 @@ function _optimize_survivor_expected_weeks_scalar_milp(
         ) + 0.5 * sum(
             hessian[position + 1, loss_state]
             for position in 1:curvature_weeks,
-            loss_state in state_indices
-        ),
-    )
+            loss_state in state_indices;
+            init=0.0,
+        )
+    if normalized_objective_lower_bound !== nothing
+        @constraint(
+            model,
+            objective_expression >= normalized_objective_lower_bound,
+        )
+    end
+    if proof_mode
+        @objective(model, Max, 0.0)
+    else
+        @objective(model, Max, objective_expression)
+    end
     solve_started_at = time_ns()
     optimize!(model)
     solve_diagnostics = _survivor_log_milp_result(
         model,
-        :exact_milp,
+        phase,
         (time_ns() - solve_started_at) / 1.0e9,
     )
+    if proof_mode
+        proof_status = if termination_status(model) == JuMP.MOI.INFEASIBLE
+            :infeasible
+        elseif _survivor_has_feasible_incumbent(model)
+            :feasible
+        else
+            :unknown
+        end
+        if proof_status === :feasible
+            returned_selected_values = Float64.(value.(selected))
+            proof_first_pick = [
+                (
+                    index=index,
+                    week=Int(data.week[index]),
+                    team=String(data.team[index]),
+                    value=returned_selected_values[index],
+                )
+                for index in candidate_indices
+                if candidate_positions[index] == 1 &&
+                    returned_selected_values[index] > 0.5
+            ]
+            length(proof_first_pick) == 1 ||
+                throw(ArgumentError(
+                    "survivor first-pick proof returned an invalid first-week assignment",
+                ))
+            return merge(
+                solve_diagnostics,
+                (
+                    proof_status,
+                    forbidden_index,
+                    proof_first_pick,
+                    objective_lower_bound=normalized_objective_lower_bound,
+                ),
+            )
+        end
+        return merge(
+            solve_diagnostics,
+            (
+                proof_status,
+                forbidden_index,
+                proof_first_pick=NamedTuple[],
+                objective_lower_bound=normalized_objective_lower_bound,
+            ),
+        )
+    end
     _survivor_has_feasible_incumbent(model) ||
         throw(ArgumentError(
             "survivor optimization failed with termination status " *
@@ -2203,6 +2355,63 @@ function _optimize_survivor_expected_weeks_scalar_milp(
     )
 end
 
+function _survivor_prove_first_pick(
+    data::AbstractDataFrame,
+    state::SurvivorPoolState,
+    config::SurvivorSelectionConfig,
+    discount_table::AbstractDataFrame,
+    inputs::SurvivorObjectiveInputs,
+    plan::SurvivorPoolPlan;
+    optimizer=nothing,
+)
+    number_of_weeks = config.through_week - state.current_week + 1
+    losses_to_elimination = _survivor_loss_threshold(state)
+    losses_to_elimination <= number_of_weeks ||
+        throw(ArgumentError(
+            "survivor first-pick proof is unavailable when the loss threshold " *
+            "exceeds the planning horizon",
+        ))
+    full_evaluation = _survivor_full_scalar_objective(
+        data,
+        state,
+        inputs,
+        plan.selections,
+    )
+    first_index = full_evaluation.selected_by_position[1]
+    @debug "survivor first-pick proof start" phase=:first_pick_proof objective=full_evaluation.objective forbidden_index=first_index
+    proof_diagnostics = _optimize_survivor_expected_weeks_scalar_milp(
+        data,
+        state,
+        config,
+        discount_table,
+        inputs;
+        optimizer=optimizer,
+        use_warm_start=false,
+        curvature_weeks_override=number_of_weeks,
+        objective_lower_bound=full_evaluation.objective,
+        forbidden_first_pick_index=first_index,
+        proof_mode=true,
+        phase=:first_pick_proof,
+        return_solver_diagnostics=true,
+    )
+    proof_diagnostics.proof_status === :infeasible &&
+        return nothing
+    if proof_diagnostics.proof_status === :feasible
+        alternate_first_pick = isempty(proof_diagnostics.proof_first_pick) ?
+            "unknown" :
+            only(proof_diagnostics.proof_first_pick).team
+        throw(ArgumentError(
+            "survivor first-pick proof found an alternate first pick " *
+            "$alternate_first_pick meeting full-Hessian objective " *
+            "$(full_evaluation.objective)",
+        ))
+    end
+    throw(ArgumentError(
+        "survivor first-pick proof was not established; termination status " *
+        "$(proof_diagnostics.termination_status)",
+    ))
+end
+
 """
     optimize_survivor_pool(candidates, state; ...)
 
@@ -2221,6 +2430,10 @@ function optimize_survivor_pool(
     optimizer=nothing,
 )
     config = selection_config
+    config.prove_first_pick &&
+        throw(ArgumentError(
+            "prove_first_pick requires a context-based :exact_milp objective",
+        ))
     state.current_week <= config.through_week ||
         throw(ArgumentError(
             "selection through_week must be at least the current week",
@@ -2360,7 +2573,7 @@ function optimize_survivor_pool(
         data;
         horizon=horizon,
     )
-    return _optimize_survivor_expected_weeks_scalar_milp(
+    plan = _optimize_survivor_expected_weeks_scalar_milp(
         data,
         state,
         selection_config,
@@ -2368,6 +2581,18 @@ function optimize_survivor_pool(
         inputs;
         optimizer=optimizer,
     )
+    if selection_config.prove_first_pick
+        _survivor_prove_first_pick(
+            data,
+            state,
+            selection_config,
+            discount_table,
+            inputs,
+            plan;
+            optimizer=optimizer,
+        )
+    end
+    return plan
 end
 
 function _survivor_first_pick_relaxation(

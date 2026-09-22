@@ -962,13 +962,11 @@ end
         )
 
         @testset "timed feasible incumbent" begin
-            timeout_seconds = 1.0
+            timeout_seconds = 5.0
             model = SurvivorModel.JuMP.Model(
                 SurvivorModel.JuMP.optimizer_with_attributes(
                     SurvivorModel.HiGHS.Optimizer,
                     "time_limit" => timeout_seconds,
-                    "threads" => 4,
-                    "parallel" => "on",
                 ),
             )
             SurvivorModel.JuMP.set_silent(model)

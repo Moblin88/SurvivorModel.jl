@@ -75,10 +75,14 @@ linearized with bounds in `[0, 1]`, so this formulation avoids terminal-path
 enumeration and nonlinear subproblems.
 
 The default context-based `:exact_milp` objective expands that recursion with a
-second-order delta correction for posterior parameter uncertainty. For each
-candidate, the model evaluates the win probability and its derivatives at the
-joint posterior mean using the existing game-level ForwardDiff path. The
-objective is the second-order approximation
+configurable initial Hessian correction for posterior parameter uncertainty.
+For each candidate, the model evaluates the win probability and its
+derivatives at the joint posterior mean using the existing game-level
+ForwardDiff path. With `hessian_weeks=K`, the objective includes all
+posterior-mean probability states and only the `1/2 * H` correction for the
+first `K` transitions. The default is three weeks; zero is linear-only, and a
+larger value is clamped to the available horizon. When `K` covers the full
+horizon, this is the second-order approximation
 `F(mu) + 1/2 * trace(H_F(mu) * Sigma)`, not exact posterior integration.
 
 The recursion defines `p[w,l]` as the probability of reaching the start of
@@ -106,25 +110,29 @@ three state families are propagated recursively and reused for the one-hot
 gates.
 
 The model also adds redundant aggregate recurrence cuts for
-`P[w] = sum(p[w,l])` and
-`A[w] = sum(p[w,l] + 0.5 * h[w,l])`. For a selected candidate, these
-recurrences telescope the loss-state transitions and directly constrain the
-objective state in the LP relaxation. The probability aggregate is additionally
-constrained to be nonincreasing over time.
+`P[w] = sum(p[w,l])` over the full horizon and
+`A[w] = sum(p[w,l] + 0.5 * h[w,l])` only through the retained prefix. For a
+selected candidate, these recurrences telescope the loss-state transitions and
+directly constrain the objective state in the LP relaxation. The probability
+aggregate is additionally constrained to be nonincreasing over time.
 
-Gradient reference states are omitted when the Gram matrix proves that no
-candidate in any earlier week can contribute to that reference. A reference
-state is added again at the first week where a nonzero covariance-gradient
-contraction is possible. This support pruning is exact; zero-support states
-are fixed at zero rather than approximated.
+Gradient reference states are created only for the retained Hessian prefix and
+are omitted when the Gram matrix proves that no candidate in any earlier week
+can contribute to that reference. A reference state is added again at the
+first week where a nonzero covariance-gradient contraction is possible. No
+gradient successor is created after the final retained Hessian transition.
+This prefix and support pruning is exact; zero-support states are fixed at zero
+rather than approximated.
 
 The candidate Gram matrix is sized by selectable rows rather than by the
 posterior parameter vector, and the current fitted covariance remains
-diagonal. The covariance MILP first solves the fixed-probability exact
-recursion and uses that plan to seed the selected binaries and the
-forward-evaluated probability, gradient-contraction, and Hessian-contraction
-states. The selected plan is then forward-evaluated again to verify the
-reported adjusted objective.
+diagonal. The covariance MILP is warm-started with a deterministic greedy
+feasible plan that selects the highest posterior-mean candidate probability
+each week while respecting market eligibility and team uniqueness. It seeds
+the selected binaries and the forward-evaluated probability,
+gradient-contraction, and retained Hessian-contraction states. The selected
+plan is then forward-evaluated again to verify the reported hybrid objective;
+it does not solve `:fixed_exact_milp` as a preliminary warm-start problem.
 
 `SurvivorSelectionConfig(timeout_seconds=...)` passes a HiGHS `time_limit`
 attribute to the default optimizer. If the limit is reached with a feasible

@@ -623,6 +623,22 @@ end
             )
         @test zero_plan.objective_value ≈ fixed_plan.objective_value
         @test zero_plan.selections.team == fixed_plan.selections.team
+        linear_plan =
+            SurvivorModel._optimize_survivor_expected_weeks_scalar_milp(
+                data,
+                state,
+                SurvivorSelectionConfig(
+                    objective=:exact_milp,
+                    minimum_favorite_spread=nothing,
+                    market_guard_weeks=0,
+                    through_week=2,
+                    hessian_weeks=0,
+                ),
+                discount_table,
+                inputs,
+            )
+        @test linear_plan.objective_value ≈ fixed_plan.objective_value
+        @test all(linear_plan.selections.parameter_variance_adjustment .== 0.0)
     end
 
     @testset "scalar recurrence bounds" begin
@@ -674,11 +690,27 @@ end
         )
         @test inputs.covariance_gradient_gram ≈
             [5.0 -3.0; -3.0 2.0]
+        prefix_references =
+            SurvivorModel._survivor_gradient_reference_indices(
+                [1, 2],
+                2,
+                inputs.covariance_gradient_gram;
+                maximum_reference_position=1,
+            )
+        @test prefix_references == [Int[]]
         bounds = SurvivorModel._survivor_scalar_bounds(
             inputs,
             [1, 2],
             2,
             2,
+        )
+        prefix_bounds = SurvivorModel._survivor_scalar_bounds(
+            inputs,
+            [1, 2],
+            2,
+            2;
+            curvature_weeks=1,
+            gradient_reference_indices=prefix_references,
         )
         values = SurvivorModel._survivor_scalar_forward_values(
             [1, 2],
@@ -686,12 +718,26 @@ end
             2,
             2,
         )
+        prefix_values = SurvivorModel._survivor_scalar_forward_values(
+            [1, 2],
+            inputs,
+            2,
+            2;
+            curvature_weeks=1,
+            gradient_reference_indices=prefix_references,
+        )
         @test all(values.probability .>= bounds.probability.lower)
         @test all(values.probability .<= bounds.probability.upper)
         @test all(values.gradient .>= bounds.gradient.lower)
         @test all(values.gradient .<= bounds.gradient.upper)
         @test all(values.hessian .>= bounds.hessian.lower)
         @test all(values.hessian .<= bounds.hessian.upper)
+        @test size(prefix_bounds.gradient.lower, 1) == 2
+        @test size(prefix_bounds.hessian.lower, 1) == 2
+        @test prefix_values.probability == values.probability
+        @test all(prefix_values.hessian[3:end, :] .== 0.0)
+        @test all(prefix_values.hessian[1:2, :] .>= prefix_bounds.hessian.lower)
+        @test all(prefix_values.hessian[1:2, :] .<= prefix_bounds.hessian.upper)
         @test SurvivorModel._survivor_other_interval(
             bounds.candidate_probability.lower,
             bounds.candidate_probability.upper,
@@ -770,6 +816,16 @@ end
             market_guard_weeks=0,
             through_week=2,
         )
+        greedy_data = DataFrame(data)
+        greedy_data.win_probability = [0.51, 0.99, 0.51, 0.99]
+        greedy_data.team = ["A", "B", "A", "C"]
+        greedy_indices = SurvivorModel._survivor_greedy_selected_indices(
+            greedy_data,
+            state,
+            config,
+            inputs,
+        )
+        @test greedy_indices == [1, 4]
         discount_table = SurvivorModel._survivor_discount_table(state, config)
         plan = SurvivorModel._optimize_survivor_expected_weeks_scalar_milp(
             data,
@@ -798,11 +854,74 @@ end
         @test plan.objective_value ≈ expected_objective
         @test nrow(plan.selections) == 2
         @test plan.selections.week == [1, 2]
+
+        prefix_config = SurvivorSelectionConfig(
+            objective=:exact_milp,
+            minimum_favorite_spread=nothing,
+            market_guard_weeks=0,
+            through_week=2,
+            hessian_weeks=1,
+        )
+        prefix_discount_table =
+            SurvivorModel._survivor_discount_table(state, prefix_config)
+        prefix_plan =
+            SurvivorModel._optimize_survivor_expected_weeks_scalar_milp(
+                data,
+                state,
+                prefix_config,
+                prefix_discount_table,
+                inputs,
+            )
+        prefix_selected_by_position =
+            SurvivorModel._survivor_fixed_selected_indices(
+                data,
+                prefix_plan.selections,
+                state,
+                2,
+            )
+        prefix_selected_values =
+            SurvivorModel._survivor_scalar_forward_values(
+                prefix_selected_by_position,
+                inputs,
+                2,
+                1;
+                curvature_weeks=1,
+                gradient_reference_indices=SurvivorModel._survivor_gradient_reference_indices(
+                    [1, 1, 2, 2],
+                    2,
+                    inputs.covariance_gradient_gram;
+                    maximum_reference_position=1,
+                ),
+            )
+        prefix_expected_objective = sum(
+            prefix_selected_values.probability[position + 1, 1]
+            for position in 1:2
+        ) + 0.5 * prefix_selected_values.hessian[2, 1]
+        @test prefix_plan.objective_value ≈ prefix_expected_objective
+        @test prefix_plan.selections.parameter_variance_adjustment[2] ≈ 0.0
+
+        clamped_plan = SurvivorModel._optimize_survivor_expected_weeks_scalar_milp(
+            data,
+            state,
+            SurvivorSelectionConfig(
+                objective=:exact_milp,
+                minimum_favorite_spread=nothing,
+                market_guard_weeks=0,
+                through_week=2,
+                hessian_weeks=19,
+            ),
+            discount_table,
+            inputs,
+        )
+        @test clamped_plan.objective_value ≈ plan.objective_value
     end
 
     @testset "selection configuration" begin
         @test SurvivorSelectionConfig().objective ===
             :exact_milp
+        @test SurvivorSelectionConfig().hessian_weeks == 3
+        @test SurvivorSelectionConfig(hessian_weeks=0).hessian_weeks == 0
+        @test SurvivorSelectionConfig(hessian_weeks=19).hessian_weeks == 19
         @test SurvivorSelectionConfig().timeout_seconds === nothing
         @test SurvivorSelectionConfig(timeout_seconds=12.5).timeout_seconds == 12.5
         @test SurvivorSelectionConfig(objective=:exact_milp).objective ===
@@ -837,6 +956,9 @@ end
         )
         @test_throws ArgumentError SurvivorSelectionConfig(
             timeout_seconds=Inf,
+        )
+        @test_throws ArgumentError SurvivorSelectionConfig(
+            hessian_weeks=-1,
         )
 
         @testset "timed feasible incumbent" begin

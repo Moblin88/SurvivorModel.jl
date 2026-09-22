@@ -51,6 +51,7 @@ end
             season=2023,
             initial_strikes=2,
             objective=:exact_milp,
+            hessian_weeks=3,
             timeout_seconds=nothing,
             timings=false,
             refresh_data=false,
@@ -71,6 +72,12 @@ end
             ["--season=2023", "--timeout=12.5"],
         ).timeout_seconds == 12.5
         @test SurvivorModel._parse_survivor_cli_args(
+            ["--season=2023", "--hessian-weeks", "6"],
+        ).hessian_weeks == 6
+        @test SurvivorModel._parse_survivor_cli_args(
+            ["--season=2023", "--hessian-weeks=6"],
+        ).hessian_weeks == 6
+        @test SurvivorModel._parse_survivor_cli_args(
             ["--season=2023", "--timings"],
         ).timings
         @test SurvivorModel._read_survivor_cli_picks(
@@ -84,6 +91,7 @@ end
         @test !occursin("micp", usage)
         @test occursin("--timings", usage)
         @test occursin("--timeout", usage)
+        @test occursin("--hessian-weeks", usage)
         @test SurvivorModel._parse_survivor_cli_args(
             ["--season", "2023", "--refresh-data"],
         ).refresh_data
@@ -104,6 +112,12 @@ end
         )
         @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
             ["--season", "2023", "--timeout", "2", "--timeout", "3"],
+        )
+        @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
+            ["--season", "2023", "--hessian-weeks", "-1"],
+        )
+        @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
+            ["--season", "2023", "--hessian-weeks", "2", "--hessian-weeks", "3"],
         )
         @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
             ["--strikes", "2"],

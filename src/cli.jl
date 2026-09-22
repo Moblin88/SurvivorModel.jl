@@ -8,8 +8,8 @@ end
 function _survivor_cli_usage()
     return """
     Usage:
-      survivor --season YEAR [--strikes N] [--objective NAME] [--timeout SECONDS] [--timings] < picks.txt
-      julia --project=. -m SurvivorModel --season YEAR [--strikes N] [--objective NAME] [--timeout SECONDS] [--timings] < picks.txt
+      survivor --season YEAR [--strikes N] [--objective NAME] [--hessian-weeks N] [--timeout SECONDS] [--timings] < picks.txt
+      julia --project=. -m SurvivorModel --season YEAR [--strikes N] [--objective NAME] [--hessian-weeks N] [--timeout SECONDS] [--timings] < picks.txt
 
     Input:
       One team abbreviation per nonblank line, starting with week 1.
@@ -22,6 +22,8 @@ function _survivor_cli_usage()
                           exact-milp; use milp for the
                           discounted approximation or
                           fixed-exact-milp for fixed probabilities).
+      --hessian-weeks N  Number of future weeks with Hessian adjustments
+                          for exact-milp (default: 3; 0 is linear-only).
       --timeout SECONDS  HiGHS MILP time limit in seconds (default: unlimited).
       --timings           Print phase timings to stderr.
       --refresh-data      Clear NFLData's raw cache and refresh summarized
@@ -55,6 +57,8 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
     strikes_specified = false
     objective = DEFAULT_SURVIVOR_OBJECTIVE
     objective_specified = false
+    hessian_weeks = 3
+    hessian_weeks_specified = false
     timeout_seconds = nothing
     timeout_specified = false
     timings = false
@@ -99,6 +103,7 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
         if argument == "--season" ||
             argument == "--strikes" ||
         argument == "--objective" ||
+        argument == "--hessian-weeks" ||
         argument == "--timeout"
             option = argument
             index += 1
@@ -114,6 +119,9 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
         elseif startswith(argument, "--objective=")
             option = "--objective"
             value = argument[length("--objective=") + 1:end]
+        elseif startswith(argument, "--hessian-weeks=")
+            option = "--hessian-weeks"
+            value = argument[length("--hessian-weeks=") + 1:end]
         elseif startswith(argument, "--timeout=")
             option = "--timeout"
             value = argument[length("--timeout=") + 1:end]
@@ -138,6 +146,13 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
                 throw(ArgumentError("--objective may only be specified once"))
             objective = _parse_survivor_cli_objective(value)
             objective_specified = true
+        elseif option == "--hessian-weeks"
+            hessian_weeks_specified &&
+                throw(ArgumentError("--hessian-weeks may only be specified once"))
+            hessian_weeks = _parse_survivor_cli_integer(value, option)
+            hessian_weeks_specified = true
+            hessian_weeks >= 0 ||
+                throw(ArgumentError("--hessian-weeks must be nonnegative"))
         elseif option == "--timeout"
             timeout_specified &&
                 throw(ArgumentError("--timeout may only be specified once"))
@@ -152,6 +167,7 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
         season=0,
         initial_strikes=2,
         objective=DEFAULT_SURVIVOR_OBJECTIVE,
+        hessian_weeks=3,
         timeout_seconds=nothing,
         timings=false,
         refresh_data=false,
@@ -160,11 +176,14 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
     season > 0 || throw(ArgumentError("--season must be positive"))
     initial_strikes >= 0 ||
         throw(ArgumentError("--strikes must be nonnegative"))
+    hessian_weeks >= 0 ||
+        throw(ArgumentError("--hessian-weeks must be nonnegative"))
     return (
         show_help=false,
         season=Int(season),
         initial_strikes=Int(initial_strikes),
         objective=objective,
+        hessian_weeks=Int(hessian_weeks),
         timeout_seconds=timeout_seconds,
         timings=timings,
         refresh_data=refresh_data,
@@ -389,6 +408,7 @@ function _run_survivor_cli(
         selection_config=SurvivorSelectionConfig(
             objective=options.objective,
             through_week=through_week,
+            hessian_weeks=options.hessian_weeks,
             timeout_seconds=options.timeout_seconds,
         ),
     )

@@ -279,15 +279,23 @@ number of completed weeks before elimination:
 selected-team market spread, and objective contribution; `plan.current_pick` is
 the row to use for the current week. The effective `plan.selection_config`
 records the objective, reach-discount policy, market guard, missing-line
-policy, and horizon.
+policy, horizon, Hessian-prefix length, and timeout.
 
 The context-based `:exact_milp` objective tracks the probability of being alive
 after each week at every loss count below the elimination threshold. It uses
-the posterior-mean win probability for each candidate and propagates scalar
-gradient and Hessian contractions needed for the second-order delta
-approximation of the complete expected-weeks objective:
+the posterior-mean win probability for every candidate and propagates scalar
+gradient and Hessian contractions needed for a configurable initial
+second-order prefix of the expected-weeks objective. With
+`hessian_weeks=K`, the objective is
 
-`F(mu) + 1/2 * trace(H_F(mu) * Sigma)`.
+`sum(P[w] for every planned week) + 1/2 * sum(H[w] for the first K weeks)`.
+
+The default is `hessian_weeks=3`; `0` uses only posterior-mean probability
+terms, and values beyond the available horizon are clamped to that horizon.
+The linear tail is not a different probability model: it continues the same
+posterior-mean recurrence and omits only the later Hessian corrections. When
+the prefix covers the full horizon, this is the usual
+`F(mu) + 1/2 * trace(H_F(mu) * Sigma)` approximation.
 
 If `p[w,l]` is the probability of reaching the start of week `w` with `l`
 losses, selecting candidate `t` in week `w` gives the successor
@@ -308,10 +316,17 @@ reference `k`. A second scalar state tracks
 `trace(Sigma * Hessian(p[w,l]))`; its recurrence includes the candidate
 Hessian contraction and the gradient cross term. Signed interval recurrences
 provide finite one-hot bounds for the probability, gradient, and Hessian
-states. The number of these scalar states depends on selectable candidates,
-not on the number of posterior parameter coordinates. This remains a
-second-order approximation to posterior uncertainty, not exact posterior
-integration.
+states. Gradient and Hessian states are created only for the retained
+Hessian prefix, while probability states continue through the full horizon.
+The number of these scalar states depends on selectable candidates, not on the
+number of posterior parameter coordinates. This remains a second-order
+approximation to posterior uncertainty, not exact posterior integration.
+
+The exact MILP is warm-started with a deterministic feasible greedy plan. For
+each week it selects the highest posterior-mean `base_probability` among
+eligible teams not already used, with stable candidate-order tie breaking.
+This warm start uses the same prefix objective as the final model and does not
+solve the separate `:fixed_exact_milp` formulation.
 
 ```julia
 plan = optimize_survivor_pool(
@@ -431,15 +446,17 @@ not omitted. Cache clearing is a maintenance operation; normal weekly runs
 should use `--refresh-data` instead.
 
 The default `:exact_milp` objective uses the expanded state-transition MILP
-with a second-order delta correction for shared posterior parameter
-uncertainty. The `:fixed_exact_milp` objective uses fixed candidate
-probabilities and computes expected completed weeks exactly. The optional
-`:milp` objective uses fixed reach discounts and candidate win probabilities as
-a tractable approximation. All modes select one team per week and use each
-team at most once.
+with a configurable initial Hessian correction for shared posterior parameter
+uncertainty and posterior-mean probability terms through the full horizon. The
+`:fixed_exact_milp` objective uses fixed candidate probabilities and computes
+expected completed weeks exactly. The optional `:milp` objective uses fixed
+reach discounts and candidate win probabilities as a tractable approximation.
+All modes select one team per week and use each team at most once.
 `SurvivorSelectionConfig` can change the objective, weekly survival
-probability, reach-discount policy, market guard, missing-line policy, and
-planning horizon. `timeout_seconds` optionally limits the default HiGHS solve
+probability, reach-discount policy, market guard, missing-line policy, planning
+horizon, and `hessian_weeks`. The latter defaults to three for `:exact_milp`,
+allows zero for a linear-only objective, and is clamped to the available
+horizon. `timeout_seconds` optionally limits the default HiGHS solve
 in seconds and defaults to unlimited. The default market policy protects
 the current and following week by requiring a selected team to be favored by at
 least `2.0` points; missing lines remain eligible. Positive `market_spread`

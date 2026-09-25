@@ -384,6 +384,7 @@ function _run_survivor_cli(
         Logging.with_logger(timing_logger) do
             @info "survivor phase complete" phase elapsed_seconds=duration
         end
+        flush(timing_output)
         return nothing
     end
 

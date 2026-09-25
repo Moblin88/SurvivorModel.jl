@@ -747,14 +747,6 @@ end
         @test all(prefix_values.hessian[3:end, :] .== 0.0)
         @test all(prefix_values.hessian[1:2, :] .>= prefix_bounds.hessian.lower)
         @test all(prefix_values.hessian[1:2, :] .<= prefix_bounds.hessian.upper)
-        @test SurvivorModel._survivor_other_interval(
-            bounds.candidate_probability.lower,
-            bounds.candidate_probability.upper,
-            [1],
-            1,
-            1,
-        ) === nothing
-
         single_bounds = SurvivorModel._survivor_scalar_bounds(
             SurvivorModel.SurvivorObjectiveInputs(
                 parameters,
@@ -766,6 +758,169 @@ end
         )
         @test single_bounds.candidate_probability.lower[1, 1] <= 0.8
         @test single_bounds.candidate_probability.upper[1, 1] >= 0.8
+    end
+
+    @testset "one-hot dummy product hull" begin
+        model = SurvivorModel.JuMP.Model(SurvivorModel.HiGHS.Optimizer)
+        SurvivorModel.JuMP.set_silent(model)
+        SurvivorModel.JuMP.@variable(model, 0 <= selected[1:2] <= 1)
+        SurvivorModel.JuMP.@variable(model, aggregate)
+        SurvivorModel.JuMP.@constraint(
+            model,
+            sum(selected[index] for index in 1:2) == 1,
+        )
+        SurvivorModel.JuMP.@constraint(model, selected[1] == 0.5)
+        SurvivorModel.JuMP.@constraint(model, selected[2] == 0.5)
+        @test SurvivorModel.JuMP.num_variables(model) == 3
+        @test SurvivorModel.JuMP.num_constraints(
+            model;
+            count_variable_in_set_constraints=false,
+        ) == 3
+
+        dummies = SurvivorModel._survivor_add_one_hot_dummies!(
+            model,
+            aggregate,
+            Dict(1 => 0.8, 2 => -0.6),
+            selected,
+            [0.0, -1.0],
+            [1.0, 0.0],
+            1:2,
+        )
+        @test SurvivorModel.JuMP.num_variables(model) == 5
+        @test SurvivorModel.JuMP.num_constraints(
+            model;
+            count_variable_in_set_constraints=false,
+        ) == 10
+        SurvivorModel.JuMP.@objective(model, Max, aggregate)
+        SurvivorModel.JuMP.optimize!(model)
+        @test SurvivorModel.JuMP.termination_status(model) ==
+            SurvivorModel.JuMP.MOI.OPTIMAL
+        @test SurvivorModel.JuMP.value(aggregate) ≈ 0.4
+        @test SurvivorModel.JuMP.value(dummies[1]) ≈ 0.5
+        @test SurvivorModel.JuMP.value(dummies[2]) ≈ -0.1
+
+        SurvivorModel.JuMP.set_objective_sense(
+            model,
+            SurvivorModel.JuMP.MOI.MIN_SENSE,
+        )
+        SurvivorModel.JuMP.optimize!(model)
+        @test SurvivorModel.JuMP.termination_status(model) ==
+            SurvivorModel.JuMP.MOI.OPTIMAL
+        @test SurvivorModel.JuMP.value(aggregate) ≈ -0.2
+        @test SurvivorModel.JuMP.value(dummies[1]) ≈ 0.3
+        @test SurvivorModel.JuMP.value(dummies[2]) ≈ -0.5
+
+        for selected_values in ((1.0, 0.0), (0.0, 1.0))
+            integer_model =
+                SurvivorModel.JuMP.Model(SurvivorModel.HiGHS.Optimizer)
+            SurvivorModel.JuMP.set_silent(integer_model)
+            SurvivorModel.JuMP.@variable(
+                integer_model,
+                0 <= integer_selected[1:2] <= 1,
+            )
+            SurvivorModel.JuMP.@variable(integer_model, integer_aggregate)
+            SurvivorModel.JuMP.@constraint(
+                integer_model,
+                sum(integer_selected[index] for index in 1:2) == 1,
+            )
+            for index in 1:2
+                SurvivorModel.JuMP.@constraint(
+                    integer_model,
+                    integer_selected[index] == selected_values[index],
+                )
+            end
+            integer_dummies = SurvivorModel._survivor_add_one_hot_dummies!(
+                integer_model,
+                integer_aggregate,
+                Dict(1 => 0.8, 2 => -0.6),
+                integer_selected,
+                [0.0, -1.0],
+                [1.0, 0.0],
+                1:2,
+            )
+            SurvivorModel.JuMP.@objective(
+                integer_model,
+                Max,
+                integer_aggregate,
+            )
+            SurvivorModel.JuMP.optimize!(integer_model)
+            @test SurvivorModel.JuMP.value(integer_aggregate) ≈
+                selected_values[1] * 0.8 +
+                selected_values[2] * -0.6
+            @test SurvivorModel.JuMP.value(integer_dummies[1]) ≈
+                selected_values[1] * 0.8
+            @test SurvivorModel.JuMP.value(integer_dummies[2]) ≈
+                selected_values[2] * -0.6
+        end
+    end
+
+    @testset "fixed-bound one-hot dummy substitution" begin
+        model = SurvivorModel.JuMP.Model(SurvivorModel.HiGHS.Optimizer)
+        SurvivorModel.JuMP.set_silent(model)
+        SurvivorModel.JuMP.@variable(model, 0 <= selected[1:3] <= 1)
+        SurvivorModel.JuMP.@variable(model, aggregate)
+        SurvivorModel.JuMP.@constraint(
+            model,
+            sum(selected[index] for index in 1:3) == 1,
+        )
+        for (index, selected_value) in enumerate((0.25, 0.25, 0.5))
+            SurvivorModel.JuMP.@constraint(
+                model,
+                selected[index] == selected_value,
+            )
+        end
+        dummies = SurvivorModel._survivor_add_one_hot_dummies!(
+            model,
+            aggregate,
+            Dict(1 => 0.5, 2 => -0.25, 3 => 0.0),
+            selected,
+            [0.5, -0.25, 0.0],
+            [0.5, -0.25, 0.0],
+            1:3,
+            dummy_start_values=Dict(
+                1 => 0.125,
+                2 => -0.0625,
+                3 => 0.0,
+            ),
+        )
+        @test SurvivorModel.JuMP.num_variables(model) == 4
+        @test SurvivorModel.JuMP.num_constraints(
+            model;
+            count_variable_in_set_constraints=false,
+        ) == 5
+
+        SurvivorModel.JuMP.@objective(model, Max, aggregate)
+        SurvivorModel.JuMP.optimize!(model)
+        @test SurvivorModel.JuMP.termination_status(model) ==
+            SurvivorModel.JuMP.MOI.OPTIMAL
+        @test SurvivorModel.JuMP.value(aggregate) ≈ 0.0625
+        @test SurvivorModel.JuMP.value(dummies[1]) ≈ 0.125
+        @test SurvivorModel.JuMP.value(dummies[2]) ≈ -0.0625
+        @test SurvivorModel.JuMP.value(dummies[3]) ≈ 0.0
+
+        near_bound_model =
+            SurvivorModel.JuMP.Model(SurvivorModel.HiGHS.Optimizer)
+        SurvivorModel.JuMP.set_silent(near_bound_model)
+        SurvivorModel.JuMP.@variable(
+            near_bound_model,
+            0 <= near_selected <= 1,
+        )
+        SurvivorModel.JuMP.@variable(near_bound_model, near_aggregate)
+        SurvivorModel.JuMP.@constraint(near_bound_model, near_selected == 0.5)
+        SurvivorModel._survivor_add_one_hot_dummies!(
+            near_bound_model,
+            near_aggregate,
+            Dict(1 => 1.0),
+            [near_selected],
+            [1.0],
+            [nextfloat(1.0)],
+            1:1,
+        )
+        @test SurvivorModel.JuMP.num_variables(near_bound_model) == 3
+        @test SurvivorModel.JuMP.num_constraints(
+            near_bound_model;
+            count_variable_in_set_constraints=false,
+        ) == 6
     end
 
     @testset "scalar one-hot gating" begin

@@ -302,10 +302,14 @@ losses, selecting candidate `t` in week `w` gives the successor
 `v[w,t] * p[w,l] + (1 - v[w,t]) * p[w,l - 1]`. The initial state is
 `p[0,0] = 1`, with other initial loss states and negative loss indices equal to
 zero. Candidate-specific successors are affine expressions, not separate
-team-specific state variables. One-hot selection constraints make the
-successor equality exact for the selected candidate and relax it for
-unselected candidates using the minimum and maximum intervals of the other
-selectable candidates in that week.
+team-specific state variables. For each candidate, the MILP creates a dummy
+`d[t] = selected[t] * candidate_successor[t]` and links the state successor to
+the sum of the candidate dummies. Each dummy uses the finite candidate
+recurrence bounds in the standard four-constraint bounded binary-product
+linearization, so it is zero when the candidate is not selected and equals its
+candidate recurrence when selected. This gives the LP relaxation the
+candidate-wise convex-hull formulation instead of relaxing a shared successor
+with other-candidate intervals.
 
 Posterior coordinates are shared by `(hazard kind, team, time bin)` across the
 whole horizon. The fitted posterior covariance is currently diagonal. The
@@ -315,8 +319,8 @@ MILP precomputes candidate gradient Gram constants
 reference `k`. A second scalar state tracks
 `trace(Sigma * Hessian(p[w,l]))`; its recurrence includes the candidate
 Hessian contraction and the gradient cross term. Signed interval recurrences
-provide finite one-hot bounds for the probability, gradient, and Hessian
-states. Gradient and Hessian states are created only for the retained
+provide finite bounds for the probability, gradient, and Hessian dummy
+products. Gradient and Hessian states are created only for the retained
 Hessian prefix, while probability states continue through the full horizon.
 The number of these scalar states depends on selectable candidates, not on the
 number of posterior parameter coordinates. This remains a second-order

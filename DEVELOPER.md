@@ -90,11 +90,12 @@ week `w` with exactly `l` losses. If candidate `t` is selected in week `w`,
 its successor is
 `v[w,t] * p[w,l] + (1 - v[w,t]) * p[w,l - 1]`, with `p[0,0] = 1` and negative
 loss indices equal to zero. Candidate-specific successors are represented
-directly in affine constraints rather than as separate team-specific state
-variables. When a candidate is selected, its equality is tight; when it is not
-selected, its bounds are relaxed using the minimum and maximum intervals of the
-other candidates in that week. This produces tighter one-hot gates than a
-generic `[0, 1]` big-M.
+by candidate-specific continuous dummies
+`d[t] = selected[t] * candidate_successor[t]`. Four bounded linear product
+constraints enforce each dummy, and the shared successor equals the sum of all
+dummies. Therefore each dummy is zero for an unselected candidate and equals
+its recurrence for the selected candidate, while the LP relaxation retains the
+candidate-wise convex-hull formulation.
 
 To include shared-team uncertainty without parameter-sized MILP state, the
 model precomputes the candidate gradient Gram constants
@@ -106,8 +107,8 @@ candidate reference `k`, followed by
 for `g` includes `K[t,k] * (p[w,l] - p[w,l - 1])`; the `h` recurrence includes
 the candidate Hessian contraction and
 `2 * (g[w,l,t] - g[w,l - 1,t])`. Signed lower and upper intervals for all
-three state families are propagated recursively and reused for the one-hot
-gates.
+three state families are propagated recursively and reused as bounds for the
+candidate dummy product constraints.
 
 The model also adds redundant aggregate recurrence cuts for
 `P[w] = sum(p[w,l])` over the full horizon and

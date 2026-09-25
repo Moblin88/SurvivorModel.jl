@@ -1096,53 +1096,85 @@ function _survivor_interval_difference(
     return first_lower - second_upper, first_upper - second_lower
 end
 
-function _survivor_other_interval(
-    lower::AbstractArray{<:Real},
-    upper::AbstractArray{<:Real},
-    indices,
-    excluded::Integer,
-    coordinates::Vararg{Int},
-)
-    other_indices = [index for index in indices if index != excluded]
-    isempty(other_indices) && return nothing
-    lower_value = minimum(
-        lower[index, coordinates...]
-        for index in other_indices
-    )
-    upper_value = maximum(
-        upper[index, coordinates...]
-        for index in other_indices
-    )
-    return Float64(lower_value), Float64(upper_value)
-end
-
-function _survivor_add_gated_recurrence!(
+function _survivor_add_one_hot_dummies!(
     model,
     aggregate,
-    recurrence,
+    recurrences,
     selected,
-    candidate_lower::Float64,
-    candidate_upper::Float64,
-    other_interval,
+    candidate_lower,
+    candidate_upper,
+    candidate_indices,
+    ;
+    dummy_start_values=nothing,
 )
-    candidate_lower <= candidate_upper ||
-        throw(ArgumentError("survivor candidate recurrence bounds must be ordered"))
-    if isnothing(other_interval)
-        @constraint(model, aggregate == recurrence)
-    else
-        other_lower, other_upper = other_interval
+    isempty(candidate_indices) &&
+        throw(ArgumentError("survivor one-hot dummies require candidates"))
+    dummies = Dict{Int,JuMP.AffExpr}()
+    for index in candidate_indices
+        haskey(recurrences, index) ||
+            throw(ArgumentError(
+                "survivor one-hot dummy recurrence is missing a candidate",
+            ))
+        lower = Float64(candidate_lower[index])
+        upper = Float64(candidate_upper[index])
+        lower <= upper && isfinite(lower) && isfinite(upper) ||
+            throw(ArgumentError(
+                "survivor one-hot dummy bounds must be finite and ordered",
+            ))
+        start_value = if dummy_start_values === nothing
+            nothing
+        else
+            haskey(dummy_start_values, index) ||
+                throw(ArgumentError(
+                    "survivor one-hot dummy start is missing a candidate",
+                ))
+            value = Float64(dummy_start_values[index])
+            isfinite(value) ||
+                throw(ArgumentError(
+                    "survivor one-hot dummy starts must be finite",
+                ))
+            value
+        end
+        if lower == upper
+            dummies[index] = iszero(lower) ?
+                JuMP.AffExpr(0.0) :
+                lower * selected[index]
+            continue
+        end
+        dummy = @variable(model)
+        set_lower_bound(dummy, min(0.0, lower))
+        set_upper_bound(dummy, max(0.0, upper))
+        recurrence = recurrences[index]
+        if !iszero(lower)
+            @constraint(
+                model,
+                dummy >= lower * selected[index],
+            )
+        end
+        if !iszero(upper)
+            @constraint(
+                model,
+                dummy <= upper * selected[index],
+            )
+        end
         @constraint(
             model,
-            aggregate - recurrence >=
-                (other_lower - candidate_upper) * (1.0 - selected),
+            dummy >= recurrence - upper * (1.0 - selected[index]),
         )
         @constraint(
             model,
-            aggregate - recurrence <=
-                (other_upper - candidate_lower) * (1.0 - selected),
+            dummy <= recurrence - lower * (1.0 - selected[index]),
         )
+        if start_value !== nothing
+            set_start_value(dummy, start_value)
+        end
+        dummies[index] = 1.0 * dummy
     end
-    return nothing
+    @constraint(
+        model,
+        aggregate == sum(dummies[index] for index in candidate_indices),
+    )
+    return dummies
 end
 
 function _survivor_scalar_bounds(
@@ -1816,6 +1848,20 @@ function _optimize_survivor_expected_weeks_scalar_milp(
         )
         for index in candidate_indices
     ]
+    warm_start = _survivor_scalar_warm_start(
+        data,
+        state,
+        config,
+        inputs,
+        number_of_weeks,
+        losses_to_elimination,
+        curvature_weeks,
+        gradient_reference_indices,
+    )
+    warm_start_used = !forbid_warm_start_first_pick && use_warm_start
+    warm_start_selected = warm_start_used ?
+        Set(warm_start.selected) :
+        Set{Int}()
     @variable(
         model,
         probability[1:(number_of_weeks + 1), state_indices],
@@ -1890,41 +1936,59 @@ function _optimize_survivor_expected_weeks_scalar_milp(
             previous_probability = loss_state == 1 ?
                 0.0 :
                 probability[position, loss_state - 1]
+            probability_recurrences = Dict{Int,Any}()
+            probability_dummy_starts = warm_start_used ?
+                Dict{Int,Float64}() :
+                nothing
             for index in indices
                 derivative = inputs.derivatives[index]
-                recurrence =
+                probability_recurrences[index] =
                     derivative.base_probability *
                     probability[position, loss_state] +
                     (1.0 - derivative.base_probability) *
                     previous_probability
-                other_interval = _survivor_other_interval(
-                    bounds.candidate_probability.lower,
-                    bounds.candidate_probability.upper,
-                    indices,
-                    index,
-                    loss_state,
-                )
-                _survivor_add_gated_recurrence!(
-                    model,
-                    probability[position + 1, loss_state],
-                    recurrence,
-                    selected[index],
-                    bounds.candidate_probability.lower[index, loss_state],
-                    bounds.candidate_probability.upper[index, loss_state],
-                    other_interval,
-                )
-                probability_difference =
-                    probability[position, loss_state] -
-                    previous_probability
-                if position < curvature_weeks
-                    next_references = gradient_reference_indices[position + 1]
-                    for reference in next_references
+                if warm_start_used
+                    probability_dummy_starts[index] =
+                        index in warm_start_selected ?
+                        derivative.base_probability *
+                        warm_start.probability[position, loss_state] +
+                        (1.0 - derivative.base_probability) *
+                        (
+                            loss_state == 1 ?
+                            0.0 :
+                            warm_start.probability[position, loss_state - 1]
+                        ) :
+                        0.0
+                end
+            end
+            _survivor_add_one_hot_dummies!(
+                model,
+                probability[position + 1, loss_state],
+                probability_recurrences,
+                selected,
+                bounds.candidate_probability.lower[:, loss_state],
+                bounds.candidate_probability.upper[:, loss_state],
+                indices,
+                dummy_start_values=probability_dummy_starts,
+            )
+            probability_difference =
+                probability[position, loss_state] -
+                previous_probability
+            if position < curvature_weeks
+                next_references = gradient_reference_indices[position + 1]
+                for reference in next_references
+                    next_slot = gradient_reference_slots[position + 1][reference]
+                    gradient_recurrences = Dict{Int,Any}()
+                    gradient_dummy_starts = warm_start_used ?
+                        Dict{Int,Float64}() :
+                        nothing
+                    for index in indices
+                        derivative = inputs.derivatives[index]
                         current_slot = get(
                             gradient_reference_slots[position],
                             reference,
                             nothing,
                         )
-                        next_slot = gradient_reference_slots[position + 1][reference]
                         current_gradient =
                             current_slot === nothing ?
                             0.0 :
@@ -1933,42 +1997,75 @@ function _optimize_survivor_expected_weeks_scalar_milp(
                             loss_state == 1 || current_slot === nothing ?
                             0.0 :
                             gradient[position][loss_state - 1, current_slot]
-                        recurrence =
+                        gradient_recurrences[index] =
                             derivative.base_probability *
                             current_gradient +
                             (1.0 - derivative.base_probability) *
                             previous_gradient +
                             inputs.covariance_gradient_gram[index, reference] *
                             probability_difference
-                        other_interval = _survivor_other_interval(
-                            bounds.candidate_gradient.lower,
-                            bounds.candidate_gradient.upper,
-                            indices,
-                            index,
-                            loss_state,
-                            reference,
-                        )
-                        _survivor_add_gated_recurrence!(
-                            model,
-                            gradient[position + 1][loss_state, next_slot],
-                            recurrence,
-                            selected[index],
-                            bounds.candidate_gradient.lower[
-                                index,
-                                loss_state,
-                                reference,
-                            ],
-                            bounds.candidate_gradient.upper[
-                                index,
-                                loss_state,
-                                reference,
-                            ],
-                            other_interval,
-                        )
+                        if warm_start_used
+                            gradient_dummy_starts[index] =
+                                index in warm_start_selected ?
+                                derivative.base_probability *
+                                (
+                                    current_slot === nothing ?
+                                    0.0 :
+                                    warm_start.gradient[
+                                        position,
+                                        loss_state,
+                                        reference,
+                                    ]
+                                ) +
+                                (1.0 - derivative.base_probability) *
+                                (
+                                    loss_state == 1 || current_slot === nothing ?
+                                    0.0 :
+                                    warm_start.gradient[
+                                        position,
+                                        loss_state - 1,
+                                        reference,
+                                    ]
+                                ) +
+                                inputs.covariance_gradient_gram[index, reference] *
+                                (
+                                    warm_start.probability[position, loss_state] -
+                                    (
+                                        loss_state == 1 ?
+                                        0.0 :
+                                        warm_start.probability[
+                                            position,
+                                            loss_state - 1,
+                                        ]
+                                    )
+                                ) :
+                                0.0
+                        end
                     end
+                    _survivor_add_one_hot_dummies!(
+                        model,
+                        gradient[position + 1][loss_state, next_slot],
+                        gradient_recurrences,
+                        selected,
+                        bounds.candidate_gradient.lower[
+                            :, loss_state, reference
+                        ],
+                        bounds.candidate_gradient.upper[
+                            :, loss_state, reference
+                        ],
+                        indices,
+                        dummy_start_values=gradient_dummy_starts,
+                    )
                 end
+            end
 
-                if position <= curvature_weeks
+            if position <= curvature_weeks
+                hessian_recurrences = Dict{Int,Any}()
+                hessian_dummy_starts = warm_start_used ?
+                    Dict{Int,Float64}() :
+                    nothing
+                for index in indices
+                    derivative = inputs.derivatives[index]
                     previous_hessian = loss_state == 1 ?
                         0.0 :
                         hessian[position, loss_state - 1]
@@ -1988,7 +2085,7 @@ function _optimize_survivor_expected_weeks_scalar_milp(
                             loss_state - 1,
                             current_gradient_slot,
                         ]
-                    recurrence =
+                    hessian_recurrences[index] =
                         derivative.base_probability *
                         hessian[position, loss_state] +
                         (1.0 - derivative.base_probability) *
@@ -2000,23 +2097,64 @@ function _optimize_survivor_expected_weeks_scalar_milp(
                             current_gradient -
                             previous_gradient_for_selected
                         )
-                    other_interval = _survivor_other_interval(
-                        bounds.candidate_hessian.lower,
-                        bounds.candidate_hessian.upper,
-                        indices,
-                        index,
-                        loss_state,
-                    )
-                    _survivor_add_gated_recurrence!(
-                        model,
-                        hessian[position + 1, loss_state],
-                        recurrence,
-                        selected[index],
-                        bounds.candidate_hessian.lower[index, loss_state],
-                        bounds.candidate_hessian.upper[index, loss_state],
-                        other_interval,
-                    )
+                    if warm_start_used
+                        hessian_dummy_starts[index] =
+                            index in warm_start_selected ?
+                            derivative.base_probability *
+                            warm_start.hessian[position, loss_state] +
+                            (1.0 - derivative.base_probability) *
+                            (
+                                loss_state == 1 ?
+                                0.0 :
+                                warm_start.hessian[position, loss_state - 1]
+                            ) +
+                            derivative.hessian_covariance *
+                            (
+                                warm_start.probability[position, loss_state] -
+                                (
+                                    loss_state == 1 ?
+                                    0.0 :
+                                    warm_start.probability[
+                                        position,
+                                        loss_state - 1,
+                                    ]
+                                )
+                            ) +
+                            2.0 *
+                            (
+                                (
+                                    current_gradient_slot === nothing ?
+                                    0.0 :
+                                    warm_start.gradient[
+                                        position,
+                                        loss_state,
+                                        index,
+                                    ]
+                                ) -
+                                (
+                                    loss_state == 1 ||
+                                            current_gradient_slot === nothing ?
+                                    0.0 :
+                                    warm_start.gradient[
+                                        position,
+                                        loss_state - 1,
+                                        index,
+                                    ]
+                                )
+                            ) :
+                            0.0
+                    end
                 end
+                _survivor_add_one_hot_dummies!(
+                    model,
+                    hessian[position + 1, loss_state],
+                    hessian_recurrences,
+                    selected,
+                    bounds.candidate_hessian.lower[:, loss_state],
+                    bounds.candidate_hessian.upper[:, loss_state],
+                    indices,
+                    dummy_start_values=hessian_dummy_starts,
+                )
             end
         end
 
@@ -2025,28 +2163,44 @@ function _optimize_survivor_expected_weeks_scalar_milp(
         next_probability_sum =
             sum(probability[position + 1, loss_state] for loss_state in state_indices)
         @constraint(model, next_probability_sum <= current_probability_sum)
+        probability_sum_recurrences = Dict{Int,Any}()
+        probability_sum_dummy_starts = warm_start_used ?
+            Dict{Int,Float64}() :
+            nothing
+        warm_current_probability_sum = warm_start_used ?
+            sum(
+                warm_start.probability[position, loss_state]
+                for loss_state in state_indices
+            ) :
+            0.0
+        warm_probability_terminal = warm_start_used ?
+            warm_start.probability[position, losses_to_elimination] :
+            0.0
         for index in indices
             derivative = inputs.derivatives[index]
             probability_terminal = probability[position, losses_to_elimination]
-            probability_recurrence =
+            probability_sum_recurrences[index] =
                 current_probability_sum -
                 (1.0 - derivative.base_probability) * probability_terminal
-            probability_other_interval = _survivor_other_interval(
-                candidate_probability_sum_lower,
-                candidate_probability_sum_upper,
-                indices,
-                index,
-            )
-            _survivor_add_gated_recurrence!(
-                model,
-                next_probability_sum,
-                probability_recurrence,
-                selected[index],
-                candidate_probability_sum_lower[index],
-                candidate_probability_sum_upper[index],
-                probability_other_interval,
-            )
+            if warm_start_used
+                probability_sum_dummy_starts[index] =
+                    index in warm_start_selected ?
+                    warm_current_probability_sum -
+                    (1.0 - derivative.base_probability) *
+                    warm_probability_terminal :
+                    0.0
+            end
         end
+        _survivor_add_one_hot_dummies!(
+            model,
+            next_probability_sum,
+            probability_sum_recurrences,
+            selected,
+            candidate_probability_sum_lower,
+            candidate_probability_sum_upper,
+            indices,
+            dummy_start_values=probability_sum_dummy_starts,
+        )
 
         if position <= curvature_weeks
             current_adjusted_sum = sum(
@@ -2059,6 +2213,23 @@ function _optimize_survivor_expected_weeks_scalar_milp(
                 0.5 * hessian[position + 1, loss_state]
                 for loss_state in state_indices
             )
+            adjusted_sum_recurrences = Dict{Int,Any}()
+            adjusted_sum_dummy_starts = warm_start_used ?
+                Dict{Int,Float64}() :
+                nothing
+            warm_current_adjusted_sum = warm_start_used ?
+                sum(
+                    warm_start.probability[position, loss_state] +
+                    0.5 * warm_start.hessian[position, loss_state]
+                    for loss_state in state_indices
+                ) :
+                0.0
+            warm_probability_terminal = warm_start_used ?
+                warm_start.probability[position, losses_to_elimination] :
+                0.0
+            warm_hessian_terminal = warm_start_used ?
+                warm_start.hessian[position, losses_to_elimination] :
+                0.0
             for index in indices
                 derivative = inputs.derivatives[index]
                 probability_terminal = probability[position, losses_to_elimination]
@@ -2074,41 +2245,53 @@ function _optimize_survivor_expected_weeks_scalar_milp(
                         losses_to_elimination,
                         current_gradient_slot,
                     ]
-                adjusted_recurrence =
+                adjusted_sum_recurrences[index] =
                     current_adjusted_sum -
                     (1.0 - derivative.base_probability) *
                     (probability_terminal + 0.5 * hessian_terminal) +
                     0.5 * derivative.hessian_covariance * probability_terminal +
                     terminal_gradient
-                adjusted_other_interval = _survivor_other_interval(
-                    candidate_adjusted_sum_lower,
-                    candidate_adjusted_sum_upper,
-                    indices,
-                    index,
-                )
-                _survivor_add_gated_recurrence!(
-                    model,
-                    next_adjusted_sum,
-                    adjusted_recurrence,
-                    selected[index],
-                    candidate_adjusted_sum_lower[index],
-                    candidate_adjusted_sum_upper[index],
-                    adjusted_other_interval,
-                )
+                if warm_start_used
+                    current_gradient_slot = get(
+                        gradient_reference_slots[position],
+                        index,
+                        nothing,
+                    )
+                    adjusted_sum_dummy_starts[index] =
+                        index in warm_start_selected ?
+                        warm_current_adjusted_sum -
+                        (1.0 - derivative.base_probability) *
+                        (
+                            warm_probability_terminal +
+                            0.5 * warm_hessian_terminal
+                        ) +
+                        0.5 * derivative.hessian_covariance *
+                        warm_probability_terminal +
+                        (
+                            current_gradient_slot === nothing ?
+                            0.0 :
+                            warm_start.gradient[
+                                position,
+                                losses_to_elimination,
+                                index,
+                            ]
+                        ) :
+                        0.0
+                end
             end
+            _survivor_add_one_hot_dummies!(
+                model,
+                next_adjusted_sum,
+                adjusted_sum_recurrences,
+                selected,
+                candidate_adjusted_sum_lower,
+                candidate_adjusted_sum_upper,
+                indices,
+                dummy_start_values=adjusted_sum_dummy_starts,
+            )
         end
     end
 
-    warm_start = _survivor_scalar_warm_start(
-        data,
-        state,
-        config,
-        inputs,
-        number_of_weeks,
-        losses_to_elimination,
-        curvature_weeks,
-        gradient_reference_indices,
-    )
     warm_start_objective = sum(
         warm_start.probability[position + 1, loss_state]
         for position in 1:number_of_weeks,
@@ -2119,7 +2302,6 @@ function _optimize_survivor_expected_weeks_scalar_milp(
         loss_state in state_indices;
         init=0.0,
     )
-    warm_start_used = !forbid_warm_start_first_pick && use_warm_start
     @debug "survivor MILP warm start" phase=phase objective=warm_start_objective used=warm_start_used
     forbidden_index = nothing
     if forbidden_first_pick_index !== nothing

@@ -486,6 +486,31 @@ losses in those prior weeks:
 `d[k] = sum(binomial(k, losses) * (1-q)^losses * q^(k-losses))` for
 `losses = 0:min(s - 1, k)`.
 
+### Docker image
+
+The Docker image installs the `survivor` app as its entrypoint. Build and run
+it like the CLI, passing options after the image name and picks on standard
+input:
+
+```sh
+docker build -t survivormodel .
+docker run --rm -i survivormodel --season 2026 < picks.txt
+```
+
+GitHub Actions builds the image for pull requests without publishing, then
+publishes the `linux/amd64` image to GHCR on pushes to `main` and `v*` tags:
+
+```sh
+docker pull ghcr.io/moblin88/survivormodel.jl:latest
+docker run --rm -i \
+  ghcr.io/moblin88/survivormodel.jl:latest \
+  --season 2026 < picks.txt
+```
+
+`latest` follows `main`; version tags and `sha-<commit>` tags are also
+published. After the first publish, make the GHCR package public in its
+settings if it is not already public.
+
 ### Developer benchmarks
 
 Solver comparisons, synthetic recovery, and real-data fitting benchmarks are

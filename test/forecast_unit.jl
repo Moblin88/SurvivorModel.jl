@@ -88,7 +88,6 @@ end
             schedule=schedule,
             historical_drives=historical,
             current_drives=current,
-            time_edges=[0, Inf],
         )
         forecast = forecast_win_probabilities(context)
         @test nrow(forecast) == 2
@@ -123,7 +122,6 @@ end
             schedule=schedule,
             historical_drives=historical,
             current_drives=current,
-            time_edges=[0, Inf],
         )
         probabilities = forecast_win_probabilities(context)
 
@@ -145,7 +143,6 @@ end
             historical_drives=historical,
             current_drives=current,
             prior=context.model.prior,
-            time_edges=[0, Inf],
         )
         reused_prior = forecast_win_probabilities(reused_prior_context)
         @test reused_prior.home_win_probability ≈
@@ -160,7 +157,6 @@ end
             historical_drives=historical,
             current_drives=current,
             prior=context.model.prior,
-            time_edges=[0, Inf],
             _normalized_schedule=true,
         )
         normalized_probabilities = forecast_win_probabilities(normalized_context)
@@ -182,7 +178,6 @@ end
                 schedule,
             ),
             prior=context.model.prior,
-            time_edges=[0, Inf],
             _normalized_schedule=true,
             _schedule_indexed_drives=true,
         )
@@ -200,7 +195,6 @@ end
             schedule=schedule,
             historical_drives=historical,
             current_drives=current,
-            time_edges=[0, Inf],
         )
         first_game = first(eachrow(context.games))
         cache = SurvivorModel._HazardLogMomentCache(context.model)
@@ -279,7 +273,6 @@ end
             schedule=schedule,
             historical_drives=historical,
             current_drives=current,
-            time_edges=[0, Inf],
         )
         without_future_forecast = forecast_win_probabilities(
             2023;
@@ -287,7 +280,6 @@ end
             schedule=schedule,
             historical_drives=historical,
             current_drives=without_future,
-            time_edges=[0, Inf],
         )
         @test with_future.home_win_probability ≈
             without_future_forecast.home_win_probability
@@ -301,7 +293,6 @@ end
             schedule=schedule,
             historical_drives=historical,
             current_drives=current,
-            time_edges=[0, Inf],
         )
         without_current = forecast_win_probabilities(
             2023;
@@ -309,7 +300,6 @@ end
             schedule=schedule,
             historical_drives=historical,
             current_drives=empty_current,
-            time_edges=[0, Inf],
         )
         @test with_current.home_win_probability ≈
             without_current.home_win_probability

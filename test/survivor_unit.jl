@@ -1,6 +1,5 @@
 using DataFrames
 using Dates
-using ForwardDiff
 using Test
 using SurvivorModel
 
@@ -218,7 +217,6 @@ end
             schedule=schedule,
             historical_drives=historical,
             current_drives=current,
-            time_edges=[0, Inf],
         )
         forecast = forecast_win_probabilities(
             context;
@@ -248,7 +246,6 @@ end
             schedule=schedule,
             historical_drives=historical,
             current_drives=current,
-            time_edges=[0, Inf],
         )
         candidates = DataFrame(
             game_id=["derivative_game"],
@@ -277,36 +274,36 @@ end
                 row,
                 inputs.parameters,
             )
-        probability_function = SurvivorModel._survivor_candidate_win_function(
-            context.model,
-            context.marks,
-            row;
+        home_derivatives = SurvivorModel._game_probability_derivatives(
+            local_mean,
+            context.model.prior,
+            context.marks;
             horizon=GAME_CLOCK_SECONDS,
         )
-        forward_gradient = ForwardDiff.gradient(
-            probability_function,
-            local_mean,
-        )
-        forward_hessian = ForwardDiff.hessian(
-            probability_function,
-            local_mean,
-        )
+        orientation = Bool(row.is_home) ? 1.0 : -1.0
         derivative = only(inputs.derivatives)
         expected_gradient = zeros(length(inputs.parameters.keys))
         for (local_index, global_index) in enumerate(global_indices)
-            expected_gradient[global_index] += forward_gradient[local_index]
+            expected_gradient[global_index] +=
+                orientation * home_derivatives.gradient[local_index]
         end
-        @test derivative.base_probability ≈ probability_function(local_mean)
+        expected_probability = Bool(row.is_home) ?
+            home_derivatives.probability :
+            1.0 - home_derivatives.probability
+        expected_hessian_covariance = orientation * sum(
+            home_derivatives.hessian[first_local, second_local] *
+                inputs.parameters.variance[global_indices[first_local]]
+            for first_local in eachindex(global_indices),
+                second_local in eachindex(global_indices)
+            if global_indices[first_local] == global_indices[second_local]
+        )
+        @test derivative.base_probability ≈ expected_probability
         @test derivative.gradient ≈ expected_gradient
         @test inputs.covariance_gradient_gram[1, 1] ≈ sum(
             expected_gradient[index]^2 * inputs.parameters.variance[index]
             for index in eachindex(expected_gradient)
         )
-        @test derivative.hessian_covariance ≈ sum(
-            forward_hessian[local_index, local_index] *
-            inputs.parameters.variance[global_index]
-            for (local_index, global_index) in enumerate(global_indices)
-        )
+        @test derivative.hessian_covariance ≈ expected_hessian_covariance
     end
 
     @testset "whole-plan scalar covariance recursion" begin
@@ -317,7 +314,6 @@ end
             schedule=schedule,
             historical_drives=historical,
             current_drives=current,
-            time_edges=[0, Inf],
         )
         candidates = DataFrame(
             game_id=["shared_game_1", "shared_game_2"],
@@ -347,7 +343,7 @@ end
         @test size(inputs.covariance_gradient_gram) == (nrow(data), nrow(data))
         @test all(isfinite, inputs.covariance_gradient_gram)
         defensive_a_index = findfirst(
-            ==((:defensive, "A", 1)),
+            ==((:defensive, "A")),
             inputs.parameters.keys,
         )
         @test defensive_a_index !== nothing
@@ -363,55 +359,27 @@ end
                 last(eachrow(data)),
                 inputs.parameters,
             )
-            @test first_indices[2] == defensive_a_index
-            @test second_indices[2] == defensive_a_index
+        @test first_indices[2] == defensive_a_index
+        @test second_indices[2] == defensive_a_index
 
-            covariance_plan =
-                SurvivorModel._optimize_survivor_expected_weeks_scalar_milp(
-                    data,
-                    state,
-                    config,
-                    inputs,
-                )
-        parameter_mean = inputs.parameters.log_mean
-        probability_functions = [
-            SurvivorModel._survivor_candidate_win_function(
-                context.model,
-                context.marks,
-                row;
-                horizon=GAME_CLOCK_SECONDS,
+        covariance_plan =
+            SurvivorModel._optimize_survivor_expected_weeks_scalar_milp(
+                data,
+                state,
+                config,
+                inputs,
             )
-            for row in eachrow(data)
-        ]
-        local_means = [first_local_mean, second_local_mean]
-        local_indices = [first_indices, second_indices]
-        objective_function = global_theta -> begin
-            probabilities = [
-                probability_functions[index](
-                    [
-                        global_theta[local_indices[index][local_position]] +
-                        (
-                            local_means[index][local_position] -
-                            parameter_mean[local_indices[index][local_position]]
-                        )
-                        for local_position in eachindex(local_indices[index])
-                    ],
-                )
-                for index in eachindex(probability_functions)
-            ]
-            probabilities[1] + probabilities[1] * probabilities[2]
-        end
-        objective_hessian = ForwardDiff.hessian(
-            objective_function,
-            parameter_mean,
+        first_derivatives, second_derivatives = inputs.derivatives
+        base_objective = first_derivatives.base_probability *
+            (1.0 + second_derivatives.base_probability)
+        objective_covariance = (
+            (1.0 + second_derivatives.base_probability) *
+                first_derivatives.hessian_covariance +
+            first_derivatives.base_probability *
+                second_derivatives.hessian_covariance +
+            2.0 * inputs.covariance_gradient_gram[1, 2]
         )
-        expected_objective =
-            objective_function(parameter_mean) +
-            0.5 * sum(
-                objective_hessian[index, index] *
-                inputs.parameters.variance[index]
-                for index in eachindex(parameter_mean)
-            )
+        expected_objective = base_objective + 0.5 * objective_covariance
         @test covariance_plan.objective_value ≈ expected_objective
         @test sum(covariance_plan.selections.objective_contribution) ≈
             covariance_plan.objective_value
@@ -442,7 +410,7 @@ end
                 config,
                 zero_inputs,
             )
-        @test zero_plan.objective_value ≈ objective_function(parameter_mean)
+        @test zero_plan.objective_value ≈ base_objective
         constant_plan =
             SurvivorModel._optimize_survivor_expected_weeks_scalar_milp(
                 data,
@@ -464,7 +432,7 @@ end
                 ),
                 inputs,
             )
-        @test linear_plan.objective_value ≈ objective_function(parameter_mean)
+        @test linear_plan.objective_value ≈ base_objective
         @test all(linear_plan.selections.parameter_variance_adjustment .== 0.0)
     end
 
@@ -490,8 +458,8 @@ end
         @test sparse_gradient_references == [Int[], [3]]
 
         keys = [
-            (:td, "A", 1),
-            (:td, "B", 1),
+            (:td, "A"),
+            (:td, "B"),
         ]
         parameters = SurvivorModel.SurvivorParameterSystem(
             keys,
@@ -743,8 +711,8 @@ end
 
     @testset "scalar one-hot gating" begin
         keys = [
-            (:td, "A", 1),
-            (:td, "B", 1),
+            (:td, "A"),
+            (:td, "B"),
         ]
         parameters = SurvivorModel.SurvivorParameterSystem(
             keys,

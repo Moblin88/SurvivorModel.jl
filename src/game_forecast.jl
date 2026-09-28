@@ -218,7 +218,6 @@ end
         historical_drives=nothing,
         current_drives=nothing,
         max_seasons=DEFAULT_HISTORICAL_SEASONS,
-        time_edges=DEFAULT_TIME_EDGES,
         method=DEFAULT_PRIOR_FIT_METHOD,
         prior=nothing,
     ) -> RegularSeasonForecastContext
@@ -238,8 +237,7 @@ function fit_regular_season_forecast(
     historical_drives::Union{Nothing,AbstractDataFrame}=nothing,
     current_drives::Union{Nothing,AbstractDataFrame}=nothing,
     max_seasons::Int=DEFAULT_HISTORICAL_SEASONS,
-    time_edges=DEFAULT_TIME_EDGES,
-    method::EMLBFGSFit=DEFAULT_PRIOR_FIT_METHOD,
+    method::WeibullEmpiricalBayesFit=DEFAULT_PRIOR_FIT_METHOD,
     prior::Union{Nothing,HazardPrior}=nothing,
     _normalized_schedule::Bool=false,
     _schedule_indexed_drives::Bool=false,
@@ -279,13 +277,12 @@ function fit_regular_season_forecast(
 
     fitted_prior = prior === nothing ? fit_empirical_bayes_prior(
         historical;
-        time_edges=time_edges,
         max_seasons=max_seasons,
         current_season=season,
         method=method,
     ) : prior
-    model = fit_hazard_model(cutoff; prior=fitted_prior, time_edges=time_edges)
-    marks = fit_score_marks(training; time_edges=time_edges)
+    model = fit_hazard_model(cutoff; prior=fitted_prior)
+    marks = fit_score_marks(training)
     games = target_schedule[target_schedule.week .>= as_of_week, :]
 
     return RegularSeasonForecastContext(
@@ -403,8 +400,7 @@ function forecast_win_probabilities(
     current_drives::Union{Nothing,AbstractDataFrame}=nothing,
     include_completed::Bool=true,
     max_seasons::Int=DEFAULT_HISTORICAL_SEASONS,
-    time_edges=DEFAULT_TIME_EDGES,
-    method::EMLBFGSFit=DEFAULT_PRIOR_FIT_METHOD,
+    method::WeibullEmpiricalBayesFit=DEFAULT_PRIOR_FIT_METHOD,
     horizon::Real=GAME_CLOCK_SECONDS,
     full_schedule::Bool=false,
 )
@@ -415,7 +411,6 @@ function forecast_win_probabilities(
         historical_drives=historical_drives,
         current_drives=current_drives,
         max_seasons=max_seasons,
-        time_edges=time_edges,
         method=method,
     )
     return forecast_win_probabilities(
@@ -474,6 +469,10 @@ function _game_metrics_from_moments(
     away_moments::DriveMoments;
     horizon::Real=GAME_CLOCK_SECONDS,
 )
+    horizon_seconds = Float64(horizon)
+    isfinite(horizon_seconds) && horizon_seconds > 0.0 ||
+        throw(ArgumentError("horizon must be finite and positive"))
+    horizon_minutes = horizon_seconds / SECONDS_PER_MINUTE
     mean_Tc = home_moments.mean_T + away_moments.mean_T
     var_Tc = home_moments.var_T + away_moments.var_T
     mean_Rc = home_moments.mean_S - away_moments.mean_S
@@ -481,9 +480,11 @@ function _game_metrics_from_moments(
     cov_TcRc = home_moments.cov_TS - away_moments.cov_TS
 
     rate = mean_Rc / mean_Tc
-    mean_spread = horizon * rate
+    mean_spread = horizon_minutes * rate
     var_rate = (var_Rc - 2 * rate * cov_TcRc + rate^2 * var_Tc) / mean_Tc
-    spread_variance = horizon * var_rate
+    spread_variance = horizon_minutes * var_rate
+    isfinite(spread_variance) && spread_variance > 0.0 ||
+        throw(ArgumentError("game spread variance must be finite and positive"))
     win_probability = (
         1 + SpecialFunctions.erf(mean_spread / sqrt(2 * spread_variance))
     ) / 2
@@ -497,33 +498,115 @@ end
 
 function _game_metrics_from_theta(
     theta::AbstractVector{<:Real},
-    edges::AbstractVector{<:Real},
+    prior::HazardPrior,
     marks::ScoreMarks;
     horizon::Real=GAME_CLOCK_SECONDS,
 )
-    n_bins = length(edges) - 1
-    expected_length = 4 * n_bins
-    length(theta) == expected_length ||
-        throw(ArgumentError("theta must contain four hazard blocks per time bin"))
-
-    home_td = exp.(theta[1:n_bins])
-    away_defensive = exp.(theta[(n_bins + 1):(2 * n_bins)])
-    away_td = exp.(theta[(2 * n_bins + 1):(3 * n_bins)])
-    home_defensive = exp.(theta[(3 * n_bins + 1):(4 * n_bins)])
-
-    home_moments = _drive_moments_from_hazards(
-        edges,
+    length(theta) == 4 ||
+        throw(ArgumentError("theta must contain four team-cause log rates"))
+    home_moments = _drive_moments_from_weibull(
+        exp(theta[1]),
+        prior.td_shape,
+        exp(theta[2]),
+        prior.defensive_shape,
         marks,
-        home_td,
-        away_defensive,
     )
-    away_moments = _drive_moments_from_hazards(
-        edges,
+    away_moments = _drive_moments_from_weibull(
+        exp(theta[3]),
+        prior.td_shape,
+        exp(theta[4]),
+        prior.defensive_shape,
         marks,
-        away_td,
-        home_defensive,
     )
     return _game_metrics_from_moments(home_moments, away_moments; horizon=horizon)
+end
+
+function _game_metrics_from_integrals(
+    integrals::AbstractVector{<:Real},
+    marks::ScoreMarks;
+    horizon::Real=GAME_CLOCK_SECONDS,
+)
+    length(integrals) == 12 ||
+        throw(ArgumentError("game integrals must contain two six-value cause blocks"))
+    home_values = _drive_moment_values(view(integrals, 1:6), marks)
+    away_values = _drive_moment_values(view(integrals, 7:12), marks)
+    home_moments = DriveMoments(home_values...)
+    away_moments = DriveMoments(away_values...)
+    return _game_metrics_from_moments(home_moments, away_moments; horizon=horizon)
+end
+
+function _game_probability_derivatives(
+    theta::AbstractVector{<:Real},
+    prior::HazardPrior,
+    marks::ScoreMarks;
+    horizon::Real=GAME_CLOCK_SECONDS,
+)
+    length(theta) == 4 ||
+        throw(ArgumentError("theta must contain four team-cause log rates"))
+    all(isfinite, theta) ||
+        throw(ArgumentError("theta log rates must be finite"))
+    home_integrals = _weibull_race_integrals(
+        exp(theta[1]),
+        prior.td_shape,
+        exp(theta[2]),
+        prior.defensive_shape,
+    )
+    away_integrals = _weibull_race_integrals(
+        exp(theta[3]),
+        prior.td_shape,
+        exp(theta[4]),
+        prior.defensive_shape,
+    )
+    integrals = vcat(home_integrals.values, away_integrals.values)
+    function_value = values ->
+        _game_metrics_from_integrals(values, marks; horizon=horizon).win_probability
+    probability = function_value(integrals)
+    integral_gradient = ForwardDiff.gradient(function_value, integrals)
+    integral_hessian = ForwardDiff.hessian(function_value, integrals)
+
+    jacobian = zeros(Float64, 12, 4)
+    integral_hessians = zeros(Float64, 12, 4, 4)
+    for value_index in 1:6, first_parameter in 1:2
+        jacobian[value_index, first_parameter] =
+            home_integrals.jacobian[value_index, first_parameter]
+        jacobian[value_index + 6, first_parameter + 2] =
+            away_integrals.jacobian[value_index, first_parameter]
+        for second_parameter in 1:2
+            integral_hessians[value_index, first_parameter, second_parameter] =
+                home_integrals.hessians[
+                    value_index,
+                    first_parameter,
+                    second_parameter,
+                ]
+            integral_hessians[
+                value_index + 6,
+                first_parameter + 2,
+                second_parameter + 2,
+            ] = away_integrals.hessians[
+                value_index,
+                first_parameter,
+                second_parameter,
+            ]
+        end
+    end
+    gradient = transpose(jacobian) * integral_gradient
+    hessian = transpose(jacobian) * integral_hessian * jacobian
+    for value_index in 1:12
+        hessian .+= integral_gradient[value_index] .* view(
+            integral_hessians,
+            value_index,
+            :,
+            :,
+        )
+    end
+    hessian = (hessian + transpose(hessian)) / 2
+    isfinite(probability) && all(isfinite, gradient) && all(isfinite, hessian) ||
+        throw(ArgumentError("Weibull game-probability derivatives are not finite"))
+    return (
+        probability=Float64(probability),
+        gradient=Float64.(gradient),
+        hessian=Float64.(hessian),
+    )
 end
 
 function _trace_product(
@@ -538,33 +621,20 @@ function _trace_product(
     )
 end
 
-function _second_order_expectation(
-    function_value,
-    theta_mean::Vector{Float64},
-    covariance::Matrix{Float64},
-)
-    hessian = ForwardDiff.hessian(function_value, theta_mean)
-    return function_value(theta_mean) + 0.5 * _trace_product(hessian, covariance)
-end
-
 function _expected_game_win_probability(
     theta::HazardTheta,
-    edges::AbstractVector{<:Real},
+    prior::HazardPrior,
     marks::ScoreMarks;
     horizon::Real=GAME_CLOCK_SECONDS,
 )
-    win_function = theta_vector ->
-        _game_metrics_from_theta(
-            theta_vector,
-            edges,
-            marks;
-            horizon=horizon,
-        ).win_probability
-    approximation = _second_order_expectation(
-        win_function,
+    derivatives = _game_probability_derivatives(
         theta.log_mean,
-        theta.covariance,
+        prior,
+        marks;
+        horizon=horizon,
     )
+    approximation = derivatives.probability +
+        0.5 * _trace_product(derivatives.hessian, theta.covariance)
     isfinite(approximation) ||
         throw(ArgumentError("posterior win probability is not finite"))
     # The Hessian approximation can leave [0, 1] under high posterior
@@ -588,7 +658,7 @@ function _expected_game_win_probability_with_cache(
     )
     return _expected_game_win_probability(
         theta,
-        model.time_edges,
+        model.prior,
         marks;
         horizon=horizon,
     )
@@ -616,7 +686,7 @@ function expected_game_win_probability(
     theta = hazard_theta(model, home_team, away_team)
     return _expected_game_win_probability(
         theta,
-        model.time_edges,
+        model.prior,
         marks;
         horizon=horizon,
     )

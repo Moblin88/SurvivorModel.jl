@@ -29,8 +29,8 @@ loss indices equal to zero. Candidate-specific successors use dummies
 constraints enforce each dummy, and the shared successor equals their sum.
 This retains the candidate-wise convex-hull formulation in the LP relaxation.
 
-Posterior coordinates are shared by `(hazard kind, team, time bin)` across the
-horizon. The fitted covariance is diagonal. The model precomputes candidate
+Posterior coordinates are shared by `(hazard kind, team)` across the horizon.
+The fitted covariance is diagonal. The model precomputes candidate
 gradient Gram constants
 `K[t,k] = gradient(v[t])' * Sigma * gradient(v[k])` and tracks
 `gradient(p[w,l])' * Sigma * gradient(v[k])` for each selectable reference

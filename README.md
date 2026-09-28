@@ -3,16 +3,20 @@
 [![Build Status](https://github.com/Moblin88/SurvivorModel.jl/actions/workflows/CI.yml/badge.svg?branch=main)](https://github.com/Moblin88/SurvivorModel.jl/actions/workflows/CI.yml?query=branch%3Amain)
 [![Coverage](https://codecov.io/gh/Moblin88/SurvivorModel.jl/branch/main/graph/badge.svg)](https://codecov.io/gh/Moblin88/SurvivorModel.jl)
 
-SurvivorModel models each drive as a piecewise-constant race between two
-independent outcomes:
+SurvivorModel models each drive as a race between two independent Weibull
+event processes:
 
 - an offensive touchdown (`:td`);
 - a defensive event (`:defensive`), covering every non-touchdown drive-ending
   result.
 
-`End of half` drives are censored observations. Hazards depend on elapsed drive
-time, not field position. The default time bins are 0-2, 2-4, 4-6, and 6+
-minutes, and callers can supply explicit time edges.
+`End of half` drives are right-censored observations. Hazards depend on
+elapsed drive time, not field position. Each outcome has one Weibull shape
+shared across teams, while each team has a separate cumulative-hazard rate:
+`H(t) = rho * t^k` and `h(t) = rho * k * t^(k - 1)`. Drive durations and
+elapsed-time arguments are measured in minutes. Since source drive times have
+one-second precision, a zero-second observed event duration is treated as a
+one-second duration.
 
 ## Empirical-Bayes workflow
 
@@ -28,92 +32,66 @@ current = load_drive_pbp(2024)
 prior = fit_empirical_bayes_prior(historical; current_season=2024)
 model = fit_hazard_model(current; prior=prior)
 
-td_rate = hazard_rate(model, :td, "KC", 2)
-defensive_rate = hazard_rate(model, :defensive, "SF", 2)
+td_rate = hazard_rate(model, :td, "KC", 2.0)
+defensive_rate = hazard_rate(model, :defensive, "SF", 2.0)
 
-# Home-adjusted rates use the fitted global multipliers.
-home_td_rate = hazard_rate(model, :td, "KC", 2; home=true)
-home_defensive_rate = hazard_rate(model, :defensive, "SF", 2; home=true)
+# Home-adjusted instantaneous hazards use the fitted global multipliers.
+home_td_rate = hazard_rate(model, :td, "KC", 2.0; home=true)
+home_defensive_rate = hazard_rate(model, :defensive, "SF", 2.0; home=true)
 ```
 
-`fit_empirical_bayes_prior` estimates separate stationary Gamma parameters for
-each outcome and elapsed-time bin. It also estimates one global home
-multiplier and one season-to-season persistence probability for each outcome.
-The persistence probability is shared across the bins of that outcome's hazard
-curve.
+`fit_empirical_bayes_prior` fits separate Weibull shapes and Gamma
+hyperparameters for touchdown and defensive-event rates. The Gamma prior is
+on the cumulative-hazard coefficient `rho = scale^(-k)`, which is conjugate
+under transformed exposure. One global home multiplier and one season-reset
+probability are fit for each outcome.
 
-Historical hyperparameters are fit with the event-process marginal likelihood,
-not with exposure-normalized factorial moments. For each observed risk
-interval, the likelihood retains the competing-risk contribution
-`λᴛ^Nᴛ λᴅ^Nᴅ exp[-(λᴛ + λᴅ)E]`. Home exposure is scaled by the fitted
-outcome-specific multiplier, and home events contribute the corresponding
-multiplier factor. The latent team/bin rate is integrated through the
-season-to-season reset transition, so a historical fit uses the full finite
-Gamma-mixture model rather than treating seasons as independent Gamma draws.
+For each cause, every drive contributes transformed risk exposure
+`T^k`; home exposure is multiplied by the fitted home factor. An observed
+event increments only its cause's event count, while a censored drive adds
+exposure to both causes. Conditional on a Gamma component with shape `alpha`
+and rate `beta`, the posterior is `Gamma(alpha + N, beta + E)`. The
+historical likelihood also includes the Weibull event-time terms
+`N * log(k) + (k - 1) * sum(log(T_event))` and the home-event multiplier.
+Team rates are integrated out, and the seasonal reset filter carries the
+resulting finite Gamma mixtures rather than treating seasons as independent
+draws.
 
-For a selected history of `N` seasons, the likelihood sums over every
-contiguous reset/persistence partition of those seasons. The implementation
-evaluates that sum with an exact forward dynamic program rather than
-enumerating the `2^(N-1)` paths. The three-season case is equivalent to the
-four familiar paths: all seasons redraw, either adjacent pair persists, or all
-three seasons persist. Each segment is evaluated from aggregated counts and
-effective exposures, so the historical fit does not revisit individual drive
-rows during optimization.
+Each mixture component represents a possible last reset season. With `N`
+historical seasons, a target-season prior contains at most `N + 1` components.
+The mixture is available from `hazard_posterior`; `hazard_rate` returns the
+posterior-mean instantaneous hazard at a requested elapsed time. Inspect
+fitted shapes with `weibull_shape(prior, :td)` or
+`weibull_shape(prior, :defensive)`, home factors with
+`home_multiplier(prior, :td)` or `home_multiplier(prior, :defensive)`, and
+reset probabilities with `hazard_persistence`. Shapes, league hyperparameters,
+home multipliers, and reset probabilities remain fixed when current-season
+drives are added.
 
-The historical fit uses an EM/ECME decomposition rather than one simultaneous
-high-dimensional search. The E-step uses a forward/backward segment filter to
-compute posterior group probabilities, expected persistent links, and
-posterior moments of the shared Gamma rates. The conditional Gamma updates
-then solve each time bin independently given the shared `rho` and home
-multiplier, while the shared parameters are updated in a two-dimensional
-conditional likelihood step. The exact filter uses quadratic work and linear
-state per team/bin cell in the number of supplied seasons, so `max_seasons`
-can request longer histories without a package-imposed three-season cap.
-Public fitting and forecasting APIs use a five-season historical window by
-default; pass `max_seasons` explicitly to choose a different trailing window.
-
-Historical fitting uses the EM/conditional-LBFGS method. It is the sole
-supported fitter for both library callers and the weekly CLI.
-
-The Gamma marginal derivative path caches the special-function values at each
-bin's base shape and uses exact integer-count recurrences for `loggamma` and
-digamma for small aggregated counts. Zero-count groups therefore avoid a
-second special-function evaluation, while larger counts fall back to direct
-`SpecialFunctions` calls. No approximate special-function backend is used, so
-the optimizer retains the exact likelihood-gradient semantics.
-
-The likelihood is evaluated separately for touchdowns and defensive events
-because it factorizes conditional on the observed risk intervals. This still
-accounts for competing-process exposure: short defensive risk windows and
-longer offensive risk windows enter the joint likelihood through their
-observed integrated hazards. The fit stops with an error if the historical
-data contain no usable risk intervals or if the EM/conditional optimization
-fails; it does not silently substitute the weak default prior. Inspect
+The historical fit uses the most recent five seasons by default; pass
+`max_seasons` to choose a different trailing window. Failed fits and histories
+without observed events for either cause raise errors rather than silently
+substituting a default prior. Inspect
 `likelihood_fit_diagnostics(prior, :td)` or
 `likelihood_fit_diagnostics(prior, :defensive)` for the maximized likelihood,
-fit status, iteration counts, conditional objective evaluations, and boundary
-flags.
+convergence, iteration and evaluation counts, and boundary parameters.
 
-The team-specific season-opening prior is a finite Gamma mixture produced by a
-probabilistic reset filter. Each component represents a possible last reset
-season; with `N` historical seasons, the target-season prior contains at most
-`N + 1` components. The exact mixture is available from
-`hazard_posterior`, while `hazard_rate` returns its posterior mean. Inspect the
-home multipliers with `home_multiplier(prior, :td)` and
-`home_multiplier(prior, :defensive)`, and inspect persistence with
-`hazard_persistence(prior, :td)` or `hazard_persistence(prior, :defensive)`.
-The league parameters and home multipliers remain fixed when current-season
-drives are added.
+Competing-Weibull probabilities and drive-time moments are evaluated with
+one-dimensional numerical integration via QuadGK. Score-spread moments are
+estimated separately for each drive-ending cause, assuming score change and
+drive time are independent conditional on cause. The renewal game forecast
+combines those outcome/time moments; rate gradients and Hessians are computed
+by integrating their derivative integrands alongside the moments.
 
 ```julia
 update_hazard_model!(model, newly_available_drives)
-posterior = hazard_posterior(model, :td, "KC", 2)
+posterior = hazard_posterior(model, :td, "KC")
 ```
 
 `posterior.weights`, `posterior.components`, and `posterior.source_seasons`
 describe the exact finite Gamma mixture. New drives update every component
-with the same Gamma-Poisson conjugate rule and reweight the components by their
-predictive likelihood.
+with the same transformed-exposure conjugate rule and reweight the components
+by their predictive likelihood.
 
 ## Regular-season forecasts
 
@@ -232,9 +210,9 @@ candidate recurrence when selected. This gives the LP relaxation the
 candidate-wise convex-hull formulation instead of relaxing a shared successor
 with other-candidate intervals.
 
-Posterior coordinates are shared by `(hazard kind, team, time bin)` across the
-whole horizon. The fitted posterior covariance is currently diagonal. The
-MILP precomputes candidate gradient Gram constants
+Posterior coordinates are shared by `(hazard kind, team)` across the whole
+horizon. The fitted posterior covariance is currently diagonal. The MILP
+precomputes candidate gradient Gram constants
 `K[t,k] = gradient(v[t])' * Sigma * gradient(v[k])` and tracks
 `gradient(p[w,l])' * Sigma * gradient(v[k])` for each selectable candidate
 reference `k`. A second scalar state tracks
@@ -328,8 +306,8 @@ survivor --refresh-data --season 2026 < picks.txt
 ```
 
 Historical empirical-Bayes priors are stored in the package's Scratch.jl
-space and keyed by season, historical-window length, time-bin configuration,
-and a fingerprint of the historical drive data used for the fit.
+space and keyed by model-cache schema, season, historical-window length, and
+a fingerprint of the historical drive data used for the fit.
 If that data changes, the cached prior is recomputed. current-season drives and the survivor optimization are refreshed on each
 invocation. An opening-week forecast can run before NFLData publishes
 target-season PBP and uses historical drives only. Once prior picks imply week

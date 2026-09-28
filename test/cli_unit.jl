@@ -250,14 +250,12 @@ end
             )
             @test second.cache_hit
             @test second.path == first.path
-            @test second.prior.time_edges == first.prior.time_edges
+            @test second.prior.td_shape == first.prior.td_shape
+            @test second.prior.defensive_shape == first.prior.defensive_shape
             @test second.data_fingerprint == first.data_fingerprint
 
             changed_historical = copy(historical)
-            changed_historical.drive_result[1] =
-                changed_historical.drive_result[1] == "Touchdown" ?
-                "Turnover" :
-                "Touchdown"
+            changed_historical.time_of_possession[1] += Second(1)
             changed = SurvivorModel._cached_historical_prior(
                 changed_historical;
                 current_season=2023,

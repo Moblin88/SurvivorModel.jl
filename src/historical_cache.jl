@@ -1,10 +1,9 @@
-const HISTORICAL_PRIOR_CACHE_SCHEMA = 3
+const HISTORICAL_PRIOR_CACHE_SCHEMA = 4
 
 struct HistoricalPriorCacheEntry
     schema_version::Int
     season::Int
     max_seasons::Int
-    time_edges::Vector{Float64}
     data_fingerprint::String
     prior::HazardPrior
 end
@@ -21,17 +20,14 @@ function _historical_prior_cache_path(
     cache_directory::AbstractString,
     season::Integer,
     max_seasons::Integer,
-    time_edges::AbstractVector{<:Real},
     data_fingerprint::AbstractString,
 )
-    edge_token = join(_cache_path_token.(Float64.(time_edges)), "_")
     filename = join(
         (
             "historical_prior",
             "v$(HISTORICAL_PRIOR_CACHE_SCHEMA)",
             "season$(Int(season))",
             "window$(Int(max_seasons))",
-            "edges$(edge_token)",
             "data$(_cache_path_token(data_fingerprint))",
         ),
         "_",
@@ -43,17 +39,13 @@ function _historical_prior_cache_entry_matches(
     entry,
     season::Integer,
     max_seasons::Integer,
-    time_edges::AbstractVector{<:Real},
     data_fingerprint::AbstractString,
 )
     entry isa HistoricalPriorCacheEntry || return false
-    expected_edges = Float64.(time_edges)
     entry.schema_version == HISTORICAL_PRIOR_CACHE_SCHEMA || return false
     entry.season == Int(season) || return false
     entry.max_seasons == Int(max_seasons) || return false
-    entry.time_edges == expected_edges || return false
     entry.data_fingerprint == data_fingerprint || return false
-    entry.prior.time_edges == expected_edges || return false
     return true
 end
 
@@ -61,7 +53,6 @@ function _read_historical_prior_cache(
     path::AbstractString,
     season::Integer,
     max_seasons::Integer,
-    time_edges::AbstractVector{<:Real},
     data_fingerprint::AbstractString,
 )
     isfile(path) || return nothing
@@ -83,7 +74,6 @@ function _read_historical_prior_cache(
         entry,
         season,
         max_seasons,
-        time_edges,
         data_fingerprint,
     ) || return nothing
     return entry.prior
@@ -114,20 +104,11 @@ that each forecast invocation observes newly available drives.
 function _cached_historical_prior(
     historical_drives::AbstractDataFrame;
     current_season::Integer,
-    time_edges=DEFAULT_TIME_EDGES,
     max_seasons::Int=DEFAULT_HISTORICAL_SEASONS,
-    method::EMLBFGSFit=DEFAULT_PRIOR_FIT_METHOD,
+    method::WeibullEmpiricalBayesFit=DEFAULT_PRIOR_FIT_METHOD,
     cache_directory::Union{Nothing,AbstractString}=nothing,
 )
     max_seasons > 0 || throw(ArgumentError("max_seasons must be positive"))
-    edges = Float64.(collect(time_edges))
-    length(edges) >= 2 ||
-        throw(ArgumentError("time_edges must contain at least two values"))
-    all(isfinite, edges[1:(end - 1)]) ||
-        throw(ArgumentError("finite time edges are required before the final edge"))
-    isinf(edges[end]) || throw(ArgumentError("the final time edge must be Inf"))
-    all(diff(edges[1:(end - 1)]) .> 0.0) ||
-        throw(ArgumentError("time_edges must be strictly increasing"))
     data_fingerprint = _dataframe_fingerprint(historical_drives)
 
     directory = cache_directory === nothing ?
@@ -138,14 +119,12 @@ function _cached_historical_prior(
         directory,
         current_season,
         max_seasons,
-        edges,
         data_fingerprint,
     )
     cached_prior = _read_historical_prior_cache(
         path,
         current_season,
         max_seasons,
-        edges,
         data_fingerprint,
     )
     cached_prior !== nothing &&
@@ -158,7 +137,6 @@ function _cached_historical_prior(
 
     prior = fit_empirical_bayes_prior(
         historical_drives;
-        time_edges=edges,
         max_seasons=max_seasons,
         current_season=current_season,
         method=method,
@@ -167,7 +145,6 @@ function _cached_historical_prior(
         HISTORICAL_PRIOR_CACHE_SCHEMA,
         Int(current_season),
         Int(max_seasons),
-        edges,
         data_fingerprint,
         prior,
     )

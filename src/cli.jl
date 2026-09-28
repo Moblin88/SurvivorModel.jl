@@ -396,7 +396,6 @@ function _run_survivor_cli(
     cached_prior = _cached_historical_prior(
         historical;
         current_season=options.season,
-        time_edges=DEFAULT_TIME_EDGES,
         max_seasons=max_seasons,
         cache_directory=cache_directory,
     )

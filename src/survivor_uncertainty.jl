@@ -1,4 +1,4 @@
-const SurvivorParameterKey = Tuple{Symbol,String,Int}
+const SurvivorParameterKey = Tuple{Symbol,String}
 
 struct SurvivorParameterSystem
     keys::Vector{SurvivorParameterKey}
@@ -59,19 +59,12 @@ function _survivor_matchup_parameter_requests(
     home_team,
     away_team,
 )
-    requests = Tuple{Symbol,String,Bool}[]
-    n_bins = length(model.time_edges) - 1
-    for (kind, team, home) in (
+    return (
         (:td, String(home_team), true),
         (:defensive, String(away_team), false),
         (:td, String(away_team), false),
         (:defensive, String(home_team), true),
     )
-        for _ in 1:n_bins
-            push!(requests, (kind, team, home))
-        end
-    end
-    return requests
 end
 
 function _survivor_candidate_matchup(row)
@@ -87,7 +80,6 @@ function _survivor_parameter_system(
 )
     keys = SurvivorParameterKey[]
     seen = Set{SurvivorParameterKey}()
-    n_bins = length(model.time_edges) - 1
     for row in eachrow(data)
         home_team, away_team = _survivor_candidate_matchup(row)
         requests = _survivor_matchup_parameter_requests(
@@ -95,9 +87,8 @@ function _survivor_parameter_system(
             home_team,
             away_team,
         )
-        for (request_index, (kind, team, _)) in enumerate(requests)
-            time_bin = mod1(request_index, n_bins)
-            key = (kind, team, time_bin)
+        for (kind, team, _) in requests
+            key = (kind, team)
             key in seen && continue
             push!(seen, key)
             push!(keys, key)
@@ -107,12 +98,11 @@ function _survivor_parameter_system(
     indices = Dict(key => index for (index, key) in enumerate(keys))
     log_mean = Float64[]
     variance = Float64[]
-    for (kind, team, time_bin) in keys
+    for (kind, team) in keys
         moments = _hazard_log_moments(
             model,
             kind,
             team,
-            time_bin;
             cache=cache,
         )
         isfinite(moments[1]) && isfinite(moments[2]) ||
@@ -136,12 +126,10 @@ function _survivor_candidate_local_parameters(
         home_team,
         away_team,
     )
-    n_bins = length(model.time_edges) - 1
     local_mean = Float64[]
     global_indices = Int[]
-    for (request_index, (kind, team, home)) in enumerate(requests)
-        time_bin = mod1(request_index, n_bins)
-        key = (kind, team, time_bin)
+    for (kind, team, home) in requests
+        key = (kind, team)
         index = parameters.indices[key]
         multiplier = home_multiplier(model.prior, kind)
         push!(
@@ -151,38 +139,6 @@ function _survivor_candidate_local_parameters(
         push!(global_indices, index)
     end
     return local_mean, global_indices
-end
-
-function _survivor_candidate_win_function(
-    model::HazardModel,
-    marks::ScoreMarks,
-    row;
-    horizon::Real,
-)
-    is_home = Bool(row.is_home)
-    home_probability_function = _survivor_matchup_win_function(
-        model,
-        marks;
-        horizon=horizon,
-    )
-    return theta -> begin
-        home_probability = home_probability_function(theta)
-        return is_home ? home_probability : 1.0 - home_probability
-    end
-end
-
-function _survivor_matchup_win_function(
-    model::HazardModel,
-    marks::ScoreMarks,
-    ;
-    horizon::Real,
-)
-    return theta -> _game_metrics_from_theta(
-        theta,
-        model.time_edges,
-        marks;
-        horizon=horizon,
-    ).win_probability
 end
 
 function _survivor_matchup_derivatives(
@@ -197,29 +153,32 @@ function _survivor_matchup_derivatives(
         row,
         parameters,
     )
-    probability_function = _survivor_matchup_win_function(
-        model,
-        marks,
+    derivatives = _game_probability_derivatives(
+        local_mean,
+        model.prior,
+        marks;
         horizon=horizon,
     )
-    base_probability = probability_function(local_mean)
+    base_probability = derivatives.probability
     isfinite(base_probability) &&
         0.0 <= base_probability <= 1.0 ||
         throw(ArgumentError("survivor base win probabilities must be in [0, 1]"))
 
     n_parameters = length(parameters.keys)
     gradient = zeros(Float64, n_parameters)
-    local_gradient = ForwardDiff.gradient(probability_function, local_mean)
-    local_hessian = ForwardDiff.hessian(probability_function, local_mean)
+    local_gradient = derivatives.gradient
+    local_hessian = derivatives.hessian
     for (local_index, global_index) in enumerate(global_indices)
         gradient[global_index] += local_gradient[local_index]
     end
     all(isfinite, gradient) ||
         throw(ArgumentError("survivor candidate gradients must be finite"))
     hessian_covariance = sum(
-        local_hessian[local_index, local_index] *
-        parameters.variance[global_index]
-        for (local_index, global_index) in enumerate(global_indices)
+        local_hessian[first_local, second_local] *
+            parameters.variance[global_indices[first_local]]
+        for first_local in eachindex(global_indices),
+            second_local in eachindex(global_indices)
+        if global_indices[first_local] == global_indices[second_local]
     )
     isfinite(hessian_covariance) ||
         throw(ArgumentError("survivor Hessian covariance contraction is not finite"))

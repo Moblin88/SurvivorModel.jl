@@ -2013,8 +2013,7 @@ function optimize_survivor_pool(
     historical_drives::Union{Nothing,AbstractDataFrame}=nothing,
     current_drives::Union{Nothing,AbstractDataFrame}=nothing,
     max_seasons::Int=DEFAULT_HISTORICAL_SEASONS,
-    time_edges=DEFAULT_TIME_EDGES,
-    method::EMLBFGSFit=DEFAULT_PRIOR_FIT_METHOD,
+    method::WeibullEmpiricalBayesFit=DEFAULT_PRIOR_FIT_METHOD,
     include_completed::Bool=false,
     horizon::Real=GAME_CLOCK_SECONDS,
     optimizer=nothing,
@@ -2032,7 +2031,6 @@ function optimize_survivor_pool(
         historical_drives=historical_drives,
         current_drives=current_drives,
         max_seasons=max_seasons,
-        time_edges=time_edges,
         method=method,
     )
     return optimize_survivor_pool(

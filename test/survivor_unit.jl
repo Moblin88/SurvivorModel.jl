@@ -69,60 +69,7 @@ function _market_guard_candidates()
     )
 end
 
-function _survivor_expected_weeks_bruteforce(
-    probabilities::AbstractVector{<:Real},
-    losses_to_elimination::Integer,
-)
-    total = Ref(0.0)
-    number_of_weeks = length(probabilities)
-    visit = function(week, losses, probability)
-        if week > number_of_weeks
-            total[] += number_of_weeks * probability
-            return
-        end
-        win_probability = Float64(probabilities[week])
-        visit(week + 1, losses, probability * win_probability)
-        loss_probability = probability * (1.0 - win_probability)
-        if losses + 1 >= losses_to_elimination
-            total[] += (week - 1) * loss_probability
-        else
-            visit(week + 1, losses + 1, loss_probability)
-        end
-    end
-    visit(1, 0, 1.0)
-    return total[]
-end
-
 @testset "survivor pool optimization" begin
-    @testset "reach discounts" begin
-        @test survivor_reach_discounts(
-            4;
-            weekly_survival_probability=0.65,
-            strikes_remaining=0,
-        ) ≈ [1.0, 0.65, 0.4225, 0.274625]
-        @test survivor_reach_discounts(
-            5;
-            weekly_survival_probability=0.65,
-            strikes_remaining=1,
-        ) ≈ [1.0, 0.65, 0.4225, 0.274625, 0.17850625]
-        @test survivor_reach_discounts(
-            4;
-            weekly_survival_probability=0.65,
-            strikes_remaining=2,
-        ) ≈ [1.0, 1.0, 0.8775, 0.71825]
-        @test survivor_reach_discounts(
-            2,
-            4;
-            weekly_survival_probability=0.65,
-            strikes_remaining=1,
-        ) ≈ [1.0, 0.65, 0.4225]
-        @test survivor_reach_discounts(0) == Float64[]
-        @test_throws ArgumentError survivor_reach_discounts(
-            2;
-            weekly_survival_probability=1.1,
-        )
-    end
-
     @testset "candidate expansion and filtering" begin
         forecast = _survivor_forecast_fixture()
         candidates = build_survivor_candidates(forecast)
@@ -132,41 +79,6 @@ end
             candidates.win_probability .>=
             DEFAULT_SURVIVOR_MIN_MODEL_WIN_PROBABILITY,
         )
-        direct_candidates = DataFrame(
-            game_id=["direct", "direct"],
-            week=[1, 1],
-            team=["Underdog", "Favorite"],
-            opponent=["X", "Y"],
-            is_home=[false, true],
-            win_probability=[0.49, 0.51],
-        )
-        direct_plan = optimize_survivor_pool(
-            direct_candidates,
-            SurvivorPoolState(2025, 1; strikes_remaining=0);
-            selection_config=SurvivorSelectionConfig(
-                objective=:fixed_exact_milp,
-                through_week=1,
-            ),
-        )
-        @test direct_plan.current_pick.team == ["Favorite"]
-        @test_throws ArgumentError optimize_survivor_pool(
-            direct_candidates,
-            SurvivorPoolState(2025, 1; strikes_remaining=0);
-            selection_config=SurvivorSelectionConfig(
-                objective=:exact_milp,
-                through_week=1,
-            ),
-        )
-        @test_throws ArgumentError optimize_survivor_pool(
-            direct_candidates,
-            SurvivorPoolState(2025, 1; strikes_remaining=0);
-            selection_config=SurvivorSelectionConfig(
-                objective=:fixed_exact_milp,
-                prove_first_pick=true,
-                through_week=1,
-            ),
-        )
-
         @test candidates.win_probability[
             (candidates.week .== 1) .& (candidates.team .== "B")
         ][1] == 0.8
@@ -209,113 +121,44 @@ end
         ][1] == 3.0
     end
 
-    @testset "binary assignment and current pick" begin
-        state = SurvivorPoolState(2025, 1; strikes_remaining=0)
-        plan = optimize_survivor_pool(
-            build_survivor_candidates(_survivor_forecast_fixture()),
-            state;
-            selection_config=SurvivorSelectionConfig(
-                objective=:fixed_exact_milp,
-                through_week=2,
-                weekly_survival_probability=0.65,
-            ),
-        )
-        @test plan.selections.week == [1, 2]
-        @test plan.selections.team == ["B", "A"]
-        @test plan.current_pick.team == ["B"]
-        @test length(unique(plan.selections.team)) == 2
-        @test plan.discounts.discount ≈ [1.0, 0.65]
-        @test plan.objective_value ≈ 0.8 + 0.8 * 0.95
-        @test plan.objective_value ≈ sum(plan.selections.objective_contribution)
-    end
-
-    @testset "exact expected-weeks objective" begin
-        candidates = DataFrame(
-            game_id=["week1", "week1", "week2", "week2"],
-            week=[1, 1, 2, 2],
-            team=["A", "B", "C", "D"],
-            opponent=["X", "Y", "Z", "W"],
-            is_home=[false, true, false, true],
-            win_probability=[0.6, 0.8, 0.9, 0.7],
-        )
-        config = SurvivorSelectionConfig(
-            objective=:fixed_exact_milp,
-            minimum_favorite_spread=nothing,
-            market_guard_weeks=0,
-            through_week=2,
-        )
-        two_loss_allowance_plan = optimize_survivor_pool(
-            candidates,
-            SurvivorPoolState(2025, 1; strikes_remaining=2);
-            selection_config=config,
-        )
-        @test nrow(two_loss_allowance_plan.selections) == 2
-        @test two_loss_allowance_plan.selections.team == ["B", "C"]
-        @test two_loss_allowance_plan.objective_value ≈
-            _survivor_expected_weeks_bruteforce([0.8, 0.9], 2)
-        @test two_loss_allowance_plan.objective_value ≈
-            sum(two_loss_allowance_plan.selections.objective_contribution)
-        @test two_loss_allowance_plan.selections.survival_probability ≈ [1.0, 0.98]
-        @test two_loss_allowance_plan.selections.elimination_probability ≈ [0.0, 0.02]
-
-        one_loss_allowance_plan = optimize_survivor_pool(
-            candidates,
-            SurvivorPoolState(2025, 1; strikes_remaining=1);
-            selection_config=config,
-        )
-        @test one_loss_allowance_plan.selections.team == ["B", "C"]
-        @test one_loss_allowance_plan.objective_value ≈
-            _survivor_expected_weeks_bruteforce([0.8, 0.9], 1)
-        @test one_loss_allowance_plan.selections.survival_probability ≈ [0.8, 0.72]
-
-        constant_plan = optimize_survivor_pool(
-            candidates,
-            SurvivorPoolState(2025, 1; strikes_remaining=3);
-            selection_config=config,
-        )
-        @test constant_plan.objective_value ≈ 2.0
-        @test all(constant_plan.selections.survival_probability .== 1.0)
-    end
-
-    @testset "expected-weeks probability validation" begin
-        endpoint_candidates = DataFrame(
-            game_id=["endpoint", "endpoint"],
-            week=[1, 1],
-            team=["A", "B"],
-            opponent=["C", "D"],
-            is_home=[true, false],
-            win_probability=[1.0, 0.8],
-        )
-        exact_endpoint_plan = optimize_survivor_pool(
-            endpoint_candidates,
-            SurvivorPoolState(2025, 1; strikes_remaining=1);
-            selection_config=SurvivorSelectionConfig(
-                objective=:fixed_exact_milp,
-                minimum_favorite_spread=nothing,
-                market_guard_weeks=0,
-                through_week=1,
-            ),
-        )
-        @test exact_endpoint_plan.current_pick.team == ["A"]
-        @test exact_endpoint_plan.objective_value ≈ 1.0
-    end
-
     @testset "near-term market favorite guard" begin
+        candidates = _market_guard_candidates()
         state = SurvivorPoolState(2025, 1; strikes_remaining=0)
-        plan = optimize_survivor_pool(
-            _market_guard_candidates(),
-            state;
-            selection_config=SurvivorSelectionConfig(
-                objective=:fixed_exact_milp,
-                through_week=3,
-                weekly_survival_probability=0.65,
-            ),
+        data = SurvivorModel._normalize_survivor_candidates(
+            candidates,
+            state,
+            3,
         )
-        @test plan.selections.team == ["B", "D", "E"]
-        @test plan.selections.market_spread == [2.0, 3.0, -10.0]
-        @test plan.current_pick.team == ["B"]
+        eligibility = SurvivorModel._survivor_market_guard_mask(
+            data,
+            state,
+            SurvivorSelectionConfig(through_week=3),
+        )
+        @test eligibility == [false, true, false, true, true, true]
         @test DEFAULT_SURVIVOR_MIN_FAVORITE_SPREAD == 2.0
         @test DEFAULT_SURVIVOR_MIN_MODEL_WIN_PROBABILITY == 0.5
+        model = SurvivorModel.JuMP.Model(SurvivorModel.HiGHS.Optimizer)
+        SurvivorModel.JuMP.set_silent(model)
+        SurvivorModel.JuMP.@variable(model, selected[1:nrow(data)], Bin)
+        SurvivorModel._add_survivor_assignment_constraints!(
+            model,
+            data,
+            state,
+            SurvivorSelectionConfig(through_week=3),
+            selected,
+        )
+        SurvivorModel.JuMP.@objective(
+            model,
+            Max,
+            sum(data.win_probability[index] * selected[index] for index in 1:nrow(data)),
+        )
+        SurvivorModel.JuMP.optimize!(model)
+        market_guard_plan = sort(
+            data[findall(SurvivorModel.JuMP.value.(selected) .> 0.5), :],
+            [:week, :team],
+        )
+        @test market_guard_plan.team == ["B", "D", "E"]
+        @test market_guard_plan.market_spread == [2.0, 3.0, -10.0]
 
         missing_line = DataFrame(
             game_id=["missing_line", "missing_line"],
@@ -324,34 +167,26 @@ end
             opponent=["C", "D"],
             is_home=[true, false],
             win_probability=[0.95, 0.8],
-            market_spread=Union{Missing,Float64}[missing, 1.0],
+            market_spread=Union{Missing,Float64}[missing, 2.5],
         )
-        missing_line_plan = optimize_survivor_pool(
+        missing_line_data = SurvivorModel._normalize_survivor_candidates(
             missing_line,
-            SurvivorPoolState(2025, 1; strikes_remaining=0);
-            selection_config=SurvivorSelectionConfig(
-                objective=:fixed_exact_milp,
+            SurvivorPoolState(2025, 1; strikes_remaining=0),
+            1,
+        )
+        @test SurvivorModel._survivor_market_guard_mask(
+            missing_line_data,
+            state,
+            SurvivorSelectionConfig(through_week=1),
+        ) == [true, true]
+        @test SurvivorModel._survivor_market_guard_mask(
+            missing_line_data,
+            state,
+            SurvivorSelectionConfig(
+                missing_market_policy=:exclude,
                 through_week=1,
             ),
-        )
-        @test missing_line_plan.current_pick.team == ["A"]
-
-        @test_throws ArgumentError optimize_survivor_pool(
-            DataFrame(
-                game_id=["infeasible", "infeasible"],
-                week=[1, 1],
-                team=["A", "B"],
-                opponent=["C", "D"],
-                is_home=[true, false],
-                win_probability=[0.95, 0.8],
-                market_spread=[1.0, 1.5],
-            ),
-            SurvivorPoolState(2025, 1; strikes_remaining=0);
-            selection_config=SurvivorSelectionConfig(
-                objective=:fixed_exact_milp,
-                through_week=1,
-            ),
-        )
+        ) == [false, true]
     end
 
     @testset "state validation and infeasible inputs" begin
@@ -367,14 +202,11 @@ end
         )
 
         candidates = build_survivor_candidates(_survivor_forecast_fixture())
-        state = SurvivorPoolState(2025, 1; picks_made=Dict(), strikes_remaining=0)
-        @test_throws ArgumentError optimize_survivor_pool(
+        state = SurvivorPoolState(2025, 1; strikes_remaining=0)
+        @test_throws ArgumentError SurvivorModel._normalize_survivor_candidates(
             candidates,
-            state;
-            selection_config=SurvivorSelectionConfig(
-                objective=:fixed_exact_milp,
-                through_week=3,
-            ),
+            state,
+            3,
         )
     end
 
@@ -502,7 +334,6 @@ end
             2,
         )
         config = SurvivorSelectionConfig(
-            objective=:exact_milp,
             minimum_favorite_spread=nothing,
             market_guard_weeks=0,
             through_week=2,
@@ -532,18 +363,16 @@ end
                 last(eachrow(data)),
                 inputs.parameters,
             )
-        @test first_indices[2] == defensive_a_index
-        @test second_indices[2] == defensive_a_index
+            @test first_indices[2] == defensive_a_index
+            @test second_indices[2] == defensive_a_index
 
-        discount_table = SurvivorModel._survivor_discount_table(state, config)
-        covariance_plan =
-            SurvivorModel._optimize_survivor_expected_weeks_scalar_milp(
-                data,
-                state,
-                config,
-                discount_table,
-                inputs,
-            )
+            covariance_plan =
+                SurvivorModel._optimize_survivor_expected_weeks_scalar_milp(
+                    data,
+                    state,
+                    config,
+                    inputs,
+                )
         parameter_mean = inputs.parameters.log_mean
         probability_functions = [
             SurvivorModel._survivor_candidate_win_function(
@@ -611,42 +440,31 @@ end
                 data,
                 state,
                 config,
-                discount_table,
                 zero_inputs,
             )
-        fixed_data = DataFrame(data)
-        fixed_data.win_probability = [
-            derivative.base_probability for derivative in inputs.derivatives
-        ]
-        fixed_plan =
-            SurvivorModel._optimize_survivor_expected_weeks_fixed_milp(
-                fixed_data,
-                state,
-                SurvivorSelectionConfig(
-                    objective=:fixed_exact_milp,
-                    minimum_favorite_spread=nothing,
-                    market_guard_weeks=0,
-                    through_week=2,
-                ),
-                discount_table,
+        @test zero_plan.objective_value ≈ objective_function(parameter_mean)
+        constant_plan =
+            SurvivorModel._optimize_survivor_expected_weeks_scalar_milp(
+                data,
+                SurvivorPoolState(2023, 1; strikes_remaining=3),
+                config,
+                zero_inputs,
             )
-        @test zero_plan.objective_value ≈ fixed_plan.objective_value
-        @test zero_plan.selections.team == fixed_plan.selections.team
+        @test constant_plan.objective_value == 2.0
+        @test all(constant_plan.selections.survival_probability .== 1.0)
         linear_plan =
             SurvivorModel._optimize_survivor_expected_weeks_scalar_milp(
                 data,
                 state,
                 SurvivorSelectionConfig(
-                    objective=:exact_milp,
                     minimum_favorite_spread=nothing,
                     market_guard_weeks=0,
                     through_week=2,
                     hessian_weeks=0,
                 ),
-                discount_table,
                 inputs,
             )
-        @test linear_plan.objective_value ≈ fixed_plan.objective_value
+        @test linear_plan.objective_value ≈ objective_function(parameter_mean)
         @test all(linear_plan.selections.parameter_variance_adjustment .== 0.0)
     end
 
@@ -975,7 +793,6 @@ end
             2,
         )
         config = SurvivorSelectionConfig(
-            objective=:exact_milp,
             minimum_favorite_spread=nothing,
             market_guard_weeks=0,
             through_week=2,
@@ -990,12 +807,10 @@ end
             inputs,
         )
         @test greedy_indices == [1, 4]
-        discount_table = SurvivorModel._survivor_discount_table(state, config)
         plan = SurvivorModel._optimize_survivor_expected_weeks_scalar_milp(
             data,
             state,
             config,
-            discount_table,
             inputs,
         )
         expected_objective = maximum(
@@ -1020,20 +835,16 @@ end
         @test plan.selections.week == [1, 2]
 
         prefix_config = SurvivorSelectionConfig(
-            objective=:exact_milp,
             minimum_favorite_spread=nothing,
             market_guard_weeks=0,
             through_week=2,
             hessian_weeks=1,
         )
-        prefix_discount_table =
-            SurvivorModel._survivor_discount_table(state, prefix_config)
         prefix_plan =
             SurvivorModel._optimize_survivor_expected_weeks_scalar_milp(
                 data,
                 state,
                 prefix_config,
-                prefix_discount_table,
                 inputs,
             )
         prefix_selected_by_position =
@@ -1068,134 +879,30 @@ end
             data,
             state,
             SurvivorSelectionConfig(
-                objective=:exact_milp,
                 minimum_favorite_spread=nothing,
                 market_guard_weeks=0,
                 through_week=2,
                 hessian_weeks=19,
             ),
-            discount_table,
             inputs,
         )
         @test clamped_plan.objective_value ≈ plan.objective_value
 
-        proof_inputs = SurvivorModel.SurvivorObjectiveInputs(
-            parameters,
-            [
-                SurvivorModel.SurvivorCandidateDerivatives(
-                    0.95,
-                    [0.0, 0.0],
-                    0.2,
-                ),
-                SurvivorModel.SurvivorCandidateDerivatives(
-                    0.60,
-                    [0.0, 0.0],
-                    -0.1,
-                ),
-                SurvivorModel.SurvivorCandidateDerivatives(
-                    0.90,
-                    [0.0, 0.0],
-                    0.3,
-                ),
-                SurvivorModel.SurvivorCandidateDerivatives(
-                    0.70,
-                    [0.0, 0.0],
-                    -0.05,
-                ),
-            ],
-        )
-        first_selection = sort(data[[1, 3], :], [:week, :team])
-        alternate_selection = sort(data[[2, 3], :], [:week, :team])
-        first_evaluation = SurvivorModel._survivor_full_scalar_objective(
-            data,
-            state,
-            proof_inputs,
-            first_selection,
-        )
-        alternate_evaluation = SurvivorModel._survivor_full_scalar_objective(
-            data,
-            state,
-            proof_inputs,
-            alternate_selection,
-        )
-        @test first_evaluation.objective > alternate_evaluation.objective
-        @test any(abs.(first_evaluation.values.hessian[2:end, :]) .> 0.0)
-        infeasible_proof =
-            SurvivorModel._optimize_survivor_expected_weeks_scalar_milp(
-                data,
-                state,
-                config,
-                discount_table,
-                proof_inputs;
-                use_warm_start=false,
-                curvature_weeks_override=2,
-                objective_lower_bound=first_evaluation.objective,
-                forbidden_first_pick_index=1,
-                proof_mode=true,
-                phase=:first_pick_proof,
-                return_solver_diagnostics=true,
-            )
-        @test infeasible_proof.proof_status === :infeasible
-        feasible_proof =
-            SurvivorModel._optimize_survivor_expected_weeks_scalar_milp(
-                data,
-                state,
-                config,
-                discount_table,
-                proof_inputs;
-                use_warm_start=false,
-                curvature_weeks_override=2,
-                objective_lower_bound=alternate_evaluation.objective,
-                forbidden_first_pick_index=1,
-                proof_mode=true,
-                phase=:first_pick_proof,
-                return_solver_diagnostics=true,
-            )
-        @test feasible_proof.proof_status === :feasible
-        @test only(feasible_proof.proof_first_pick).index == 2
-        fake_plan = SurvivorPoolPlan(
-            state,
-            alternate_selection,
-            alternate_selection[alternate_selection.week .== 1, :],
-            discount_table,
-            alternate_evaluation.objective,
-            config,
-        )
-        @test_throws ArgumentError SurvivorModel._survivor_prove_first_pick(
-            data,
-            state,
-            config,
-            discount_table,
-            proof_inputs,
-            fake_plan,
-        )
     end
 
     @testset "selection configuration" begin
-        @test SurvivorSelectionConfig().objective ===
-            :exact_milp
         @test SurvivorSelectionConfig().hessian_weeks == 3
         @test SurvivorSelectionConfig(hessian_weeks=0).hessian_weeks == 0
         @test SurvivorSelectionConfig(hessian_weeks=19).hessian_weeks == 19
-        @test !SurvivorSelectionConfig().prove_first_pick
-        @test SurvivorSelectionConfig(prove_first_pick=true).prove_first_pick
         @test SurvivorSelectionConfig().timeout_seconds === nothing
         @test SurvivorSelectionConfig(timeout_seconds=12.5).timeout_seconds == 12.5
-        @test SurvivorSelectionConfig(objective=:exact_milp).objective ===
-            :exact_milp
-        @test SurvivorSelectionConfig(objective=:fixed_exact_milp).objective ===
-            :fixed_exact_milp
         no_guard_config = SurvivorSelectionConfig(
-            objective=:milp,
             minimum_favorite_spread=nothing,
             missing_market_policy=:exclude,
             market_guard_weeks=0,
             through_week=3,
         )
         @test no_guard_config.minimum_favorite_spread === nothing
-        @test_throws ArgumentError SurvivorSelectionConfig(
-            objective=:unknown,
-        )
         @test_throws ArgumentError SurvivorSelectionConfig(
             missing_market_policy=:unknown,
         )
@@ -1268,37 +975,5 @@ end
             @test diagnostics.node_count !== nothing
         end
 
-        missing_line = DataFrame(
-            game_id=["missing_line", "missing_line"],
-            week=[1, 1],
-            team=["A", "B"],
-            opponent=["C", "D"],
-            is_home=[true, false],
-            win_probability=[0.95, 0.8],
-            market_spread=Union{Missing,Float64}[missing, 1.0],
-        )
-        @test_throws ArgumentError optimize_survivor_pool(
-            missing_line,
-            SurvivorPoolState(2025, 1; strikes_remaining=0);
-            selection_config=SurvivorSelectionConfig(
-                objective=:fixed_exact_milp,
-                through_week=1,
-                missing_market_policy=:exclude,
-            ),
-        )
-
-        no_guard_plan = optimize_survivor_pool(
-            missing_line,
-            SurvivorPoolState(2025, 1; strikes_remaining=0);
-            selection_config=SurvivorSelectionConfig(
-                objective=:fixed_exact_milp,
-                minimum_favorite_spread=nothing,
-                market_guard_weeks=0,
-                through_week=1,
-            ),
-        )
-        @test no_guard_plan.selection_config.minimum_favorite_spread === nothing
-        @test no_guard_plan.current_pick.team == ["A"]
-        @test isfinite(no_guard_plan.objective_value)
     end
 end

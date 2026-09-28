@@ -72,18 +72,15 @@ can request longer histories without a package-imposed three-season cap.
 Public fitting and forecasting APIs use a five-season historical window by
 default; pass `max_seasons` explicitly to choose a different trailing window.
 
-Production fitting uses `EMLBFGSFit()` by default. The other solver
-implementations remain available only to the developer benchmark and recovery
-tools; they are not part of the weekly application API. Use the default unless
-you are explicitly comparing solver behavior on synthetic or historical data.
+Historical fitting uses the EM/conditional-LBFGS method. It is the sole
+supported fitter for both library callers and the weekly CLI.
 
 The Gamma marginal derivative path caches the special-function values at each
-bin's base shape and uses the exact integer-count recurrences for
-`loggamma`, digamma, and trigamma for small aggregated counts. Zero-count
-groups therefore avoid a second special-function evaluation, while larger
-counts fall back to direct `SpecialFunctions` calls. No approximate special
-function backend is used by default, so the optimizer retains the exact
-likelihood and curvature semantics.
+bin's base shape and uses exact integer-count recurrences for `loggamma` and
+digamma for small aggregated counts. Zero-count groups therefore avoid a
+second special-function evaluation, while larger counts fall back to direct
+`SpecialFunctions` calls. No approximate special-function backend is used, so
+the optimizer retains the exact likelihood-gradient semantics.
 
 The likelihood is evaluated separately for touchdowns and defensive events
 because it factorizes conditional on the observed risk intervals. This still
@@ -118,11 +115,6 @@ describe the exact finite Gamma mixture. New drives update every component
 with the same Gamma-Poisson conjugate rule and reweight the components by their
 predictive likelihood.
 
-Renewal simulation, synthetic recovery, and solver-comparison workflows are
-developer/research tools. They remain available through the dedicated
-benchmark tooling but are intentionally omitted from the weekly application
-workflow.
-
 ## Regular-season forecasts
 
 Use the schedule-backed forecast API to produce a frozen pre-week forecast for
@@ -146,8 +138,8 @@ The model uses regular-season drives from prior seasons for the
 empirical-Bayes prior and target-season drives through week 9 for the
 week-10 snapshot. Later target-season results are not used, so the same call
 works for historical evaluation and for a currently unfolding season. The
-probability-only output does not evaluate spread or predictive-variance
-metrics and is the canonical weekly forecast surface:
+forecast output contains schedule/results fields and home/away win
+probabilities:
 
 ```julia
 results = regular_season_results(2024; from_week=10)
@@ -155,7 +147,7 @@ results = regular_season_results(2024; from_week=10)
 
 When generating several weekly snapshots for the same target season, fit the
 historical prior once and pass it to each call as `prior=...`. This avoids
-repeating the empirical-Bayes moment fit while retaining
+repeating the empirical-Bayes likelihood fit while retaining
 the week-specific current-season update:
 
 ```julia
@@ -174,64 +166,8 @@ or fit a model. `load_schedule()` can be used to fetch or normalize the
 underlying schedule separately. At the matchup level,
 `expected_game_win_probability` provides a direct probability calculation.
 
-The posterior rate returned by `hazard_rate` is the finite-mixture posterior
-mean. Spread forecasting, score-mark calculations, renewal simulation, and
-predictive-interval diagnostics remain available as qualified research
-interfaces but are not required for the weekly survivor run.
-
-## Historical calibration
-
-Evaluate fixed pre-week snapshots against completed schedule results with
-`evaluate_calibration`. If no seasons are supplied, it selects the most recent
-completed regular seasons in the schedule:
-
-```julia
-report = evaluate_calibration(;
-    cutoff_weeks=(1, 5, 10, 15),
-    recent_seasons=3,
-)
-
-report.summary
-report.reliability
-report.games
-```
-
-Each snapshot is fit using only drives before its cutoff week and scores games
-from that week through the end of the season. `report.summary` contains Brier
-score, log loss, mean predicted probability, observed home-win rate, and their
-calibration gap. Ties are represented as `0.5` in all of these calculations;
-games without a schedule result are excluded from scoring. Reliability rows use
-fixed probability bins and include the number of games, observed rate, and
-calibration gap for each bin.
-
-The standard report is intentionally limited to the probability metrics used
-by survivor selection. Spread error, spread reliability, and predictive
-interval diagnostics remain available through the qualified research
-interface:
-
-```julia
-research = SurvivorModel.evaluate_calibration_research(;
-    cutoff_weeks=(1, 5, 10, 15),
-    recent_seasons=3,
-)
-
-research.spread_summary
-research.spread_reliability
-research.spread_coverage
-```
-
-The deterministic calibration tests run with the normal test suite. To produce
-the opt-in report from live NFLData schedules and play-by-play:
-
-```sh
-SURVIVORMODEL_RUN_CALIBRATION=true julia --project=. test/calibration_live.jl
-```
-
-The live report is diagnostic and does not impose an arbitrary model-quality
-threshold on CI.
-
-The default package test suite uses deterministic fixtures. To run the live
-drive-data and fitted-model sanity checks against NFLData as well:
+The default package test suite uses deterministic fixtures. To run the
+optional drive-data smoke test against NFLData as well:
 
 ```sh
 SURVIVORMODEL_RUN_LIVE_SANITY=true julia --project=. -e 'using Pkg; Pkg.test()'
@@ -250,7 +186,6 @@ plan = optimize_survivor_pool(
     picks_made=Dict{Int,String}(),
     strikes_remaining=2,
     selection_config=SurvivorSelectionConfig(
-        weekly_survival_probability=0.65,
         through_week=18,
         timeout_seconds=600.0,
     ),
@@ -265,25 +200,18 @@ The default `:exact_milp` optimizer expands each unplayed forecast game into
 model-favorite candidates with win probability at least `0.5`, excludes teams
 in `picks_made`, and solves one binary assignment model with JuMP and HiGHS.
 It selects exactly one team for every week in the requested horizon and allows
-each team to be selected at most once. The objectives target a larger expected
-number of completed weeks before elimination:
+each team to be selected at most once. The covariance-aware finite-state
+formulation maximizes expected completed weeks before elimination.
 
-- `:milp` uses fixed reach discounts and a linear candidate-level
-  approximation.
-- `:fixed_exact_milp` uses the exact finite-state probability recursion for
-  fixed candidate probabilities.
-- `:exact_milp` uses the covariance-aware finite-state recursion described
-  below. It is the default for fitted forecast contexts.
+`plan.selections` includes each selected team's win probability, selected-team
+market spread, survival and elimination probabilities, parameter-variance
+adjustment, and objective contribution. `plan.current_pick` is the row to use
+for the current week. `plan.selection_config` records the eligibility
+policies, horizon, Hessian-prefix length, and timeout.
 
-`plan.selections` includes each selected team's win probability, reach discount,
-selected-team market spread, and objective contribution; `plan.current_pick` is
-the row to use for the current week. The effective `plan.selection_config`
-records the objective, reach-discount policy, market guard, missing-line
-policy, horizon, Hessian-prefix length, and timeout.
-
-The context-based `:exact_milp` objective tracks the probability of being alive
-after each week at every loss count below the elimination threshold. It uses
-the posterior-mean win probability for every candidate and propagates scalar
+The optimizer tracks the probability of being alive after each week at every
+loss count below the elimination threshold. It uses the posterior-mean win
+probability for every candidate and propagates scalar
 gradient and Hessian contractions needed for a configurable initial
 second-order prefix of the expected-weeks objective. With
 `hessian_weeks=K`, the objective is
@@ -329,53 +257,19 @@ approximation to posterior uncertainty, not exact posterior integration.
 The exact MILP is warm-started with a deterministic feasible greedy plan. For
 each week it selects the highest posterior-mean `base_probability` among
 eligible teams not already used, with stable candidate-order tie breaking.
-This warm start uses the same prefix objective as the final model and does not
-solve the separate `:fixed_exact_milp` formulation.
-
-Set `prove_first_pick=true` to run an optional first-pick proof after the
-configured-prefix solve. The selected plan is forward-evaluated with Hessian
-terms through the full horizon, then a full-Hessian feasibility MILP forbids
-that first pick and requires an objective at least as large as the evaluated
-full-horizon score. Only a proven infeasible alternate-first-pick model
-returns the plan; a feasible, timed-out, or otherwise unresolved proof raises
-an error. The proof reuses `timeout_seconds` and is also available from the
-CLI as `--prove-first-pick`.
 
 ```julia
 plan = optimize_survivor_pool(
     context;
     strikes_remaining=2,
     selection_config=SurvivorSelectionConfig(
-        objective=:exact_milp,
         through_week=18,
     ),
 )
 ```
 
-The selected rows for this objective include the posterior-mean
-`survival_probability`, its `parameter_variance_adjustment`, the
-`variance_adjusted_survival_probability`, and the adjusted
-`objective_contribution`. `:fixed_exact_milp` is available when callers inject
-a candidate table without fitted posterior metadata:
-
-```julia
-plan = optimize_survivor_pool(
-    candidates,
-    state;
-    selection_config=SurvivorSelectionConfig(
-        objective=:fixed_exact_milp,
-        through_week=18,
-    ),
-)
-```
-
-The fixed-probability formulation accepts endpoint probabilities of `0.0` and
-`1.0` and computes its expected-weeks objective exactly. Both exact modes use
-the same strike semantics:
 `strikes_remaining=s` means the `s`-th future loss eliminates the pool, while
-zero means the next loss eliminates it. The selected rows for the exact
-objectives also include `survival_probability`, `elimination_probability`, and
-the per-week objective contribution.
+zero means the next loss eliminates it.
 
 ### Survivor command-line app
 
@@ -399,14 +293,6 @@ Then run it from any directory:
 
 ```sh
 survivor --season 2026 < picks.txt
-```
-
-Pass `--objective milp` to use the discounted approximation; the default is
-`exact-milp`. `fixed-exact-milp` selects the fixed-probability compatibility
-formulation:
-
-```sh
-survivor --season 2026 --objective milp < picks.txt
 ```
 
 Pass `--timeout SECONDS` to limit the default HiGHS MILP solve. If HiGHS
@@ -450,7 +336,7 @@ survivor --refresh-data --season 2026 < picks.txt
 
 Historical empirical-Bayes priors are stored in the package's Scratch.jl
 space and keyed by season, historical-window length, time-bin configuration,
-fit method, and a fingerprint of the historical drive data used for the fit.
+and a fingerprint of the historical drive data used for the fit.
 If that data changes, the cached prior is recomputed. current-season drives and the survivor optimization are refreshed on each
 invocation. An opening-week forecast can run before NFLData publishes
 target-season PBP and uses historical drives only. Once prior picks imply week
@@ -460,31 +346,15 @@ uncompleted, the CLI automatically clears NFLData's cache and retries the
 schedule validation once. `--refresh-data` remains available when an explicit
 full data refresh is desired.
 
-The default `:exact_milp` objective uses the expanded state-transition MILP
-with a configurable initial Hessian correction for shared posterior parameter
-uncertainty and posterior-mean probability terms through the full horizon. The
-`:fixed_exact_milp` objective uses fixed candidate probabilities and computes
-expected completed weeks exactly. The optional `:milp` objective uses fixed
-reach discounts and candidate win probabilities as a tractable approximation.
-All modes select one team per week and use each team at most once.
-`SurvivorSelectionConfig` can change the objective, weekly survival
-probability, reach-discount policy, market guard, missing-line policy, planning
-horizon, and `hessian_weeks`. The latter defaults to three for `:exact_milp`,
-allows zero for a linear-only objective, and is clamped to the available
-horizon. `prove_first_pick` enables the optional full-Hessian alternate-first-
-pick proof and defaults to false. `timeout_seconds` optionally limits both the
-main and proof HiGHS solves in seconds and defaults to unlimited. The default
-market policy protects
-the current and following week by requiring a selected team to be favored by at
-least `2.0` points; missing lines remain eligible. Positive `market_spread`
-values mean the selected team is favored.
-
-With fixed weekly survival probability `q`, zero or one remaining strike uses
-`d[k] = q^k`, where `k` is the number of prior planned weeks. With `s >= 2`
-remaining strikes, the discount is the probability of having fewer than `s`
-losses in those prior weeks:
-`d[k] = sum(binomial(k, losses) * (1-q)^losses * q^(k-losses))` for
-`losses = 0:min(s - 1, k)`.
+The weekly planner uses the covariance-aware expected-weeks MILP described
+above. `SurvivorSelectionConfig` controls the market guard, missing-line
+policy, planning horizon, `hessian_weeks`, and `timeout_seconds`.
+`hessian_weeks` defaults to three, allows zero for posterior-mean probability
+terms only, and is clamped to the available horizon. `timeout_seconds` limits
+the HiGHS solve and defaults to unlimited. The default market policy protects
+the current and following week by requiring a selected team to be favored by
+at least `2.0` points; missing lines remain eligible. Positive
+`market_spread` values mean the selected team is favored.
 
 ### Docker image
 
@@ -519,51 +389,8 @@ docker run --rm -i \
 `latest` follows `main`; version tags and `sha-<commit>` tags are also
 published.
 
-### Developer benchmarks
-
-Solver comparisons, synthetic recovery, and real-data fitting benchmarks are
-developer workflows rather than weekly survivor features. Run them directly
-with `tools/fit_benchmark.jl`; see that tool's `--help` output for supported
-scenarios and options.
-
 After each week, refresh the forecast context with the new `as_of_week`,
 record the team picked in `picks_made`, update `strikes_remaining`, and call
 `optimize_survivor_pool` again. The optimizer itself performs one forecast
-pass and one solve; it does not iteratively recompute discounts from the
-selected teams' probabilities. For deterministic evaluation or custom
-forecasts, call `build_survivor_candidates` and pass its result to
-`optimize_survivor_pool(candidates, state)`.
-
-To replay the strategy against completed historical seasons, run the opt-in
-survivor harness:
-
-```sh
-SURVIVORMODEL_RUN_SURVIVOR=true julia --project=. test/survivor_live.jl
-```
-
-By default it evaluates the three most recent completed regular seasons with
-one and two initial strikes and `weekly_survival_probability = 0.65`. It
-refits the forecast context before each week using only drives before that
-week, reuses the same weekly forecast for both strike scenarios, applies
-historical wins and losses (ties count as losses), and prints a summary with
-the last week survived, elimination week/reason, wins, losses, and picks. It
-also compares the MILP strategy with a greedy baseline that selects the
-largest available selected-team published spread each week while avoiding
-previously picked teams. The greedy baseline does not plan around future team
-reuse or use model win probabilities; games without a published spread are
-not eligible for its pick.
-Override the inputs with environment variables such as:
-
-```sh
-SURVIVORMODEL_RUN_SURVIVOR=true \
-SURVIVORMODEL_SURVIVOR_SEASONS=2021,2022,2023,2024 \
-SURVIVORMODEL_SURVIVOR_WEEKLY_SURVIVAL=0.65 \
-julia --project=. test/survivor_live.jl
-```
-
-Use `SURVIVORMODEL_SURVIVOR_RECENT_SEASONS` when selecting the latest completed
-seasons, and `SURVIVORMODEL_SURVIVOR_MAX_SEASONS` to change the historical
-training window. The harness is opt-in because it downloads live
-schedules and play-by-play data and reruns one pre-week forecast per
-regular-season week (17 weeks for seasons through 2020 and 18 weeks from
-2021 onward).
+pass and one solve. `build_survivor_candidates(context)` is also available to
+inspect eligible teams and their forecast probabilities.

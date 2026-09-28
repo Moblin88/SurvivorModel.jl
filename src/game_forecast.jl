@@ -226,8 +226,8 @@ end
 Fit a frozen model using regular-season data available before `as_of_week`.
 Historical seasons provide the empirical-Bayes prior; target-season drives
 from weeks before the cutoff provide the current-season update. The returned
-context can be reused to request probabilities, spreads, or the full metric
-table without reloading data or refitting the model. A prior fitted for the
+context can be reused for win-probability forecasts without reloading data or
+refitting the model. A prior fitted for the
 same target season can be supplied when evaluating multiple weekly snapshots
 to avoid repeating the historical empirical-Bayes fit.
 """
@@ -239,7 +239,7 @@ function fit_regular_season_forecast(
     current_drives::Union{Nothing,AbstractDataFrame}=nothing,
     max_seasons::Int=DEFAULT_HISTORICAL_SEASONS,
     time_edges=DEFAULT_TIME_EDGES,
-    method::PriorFitMethod=DEFAULT_PRIOR_FIT_METHOD,
+    method::EMLBFGSFit=DEFAULT_PRIOR_FIT_METHOD,
     prior::Union{Nothing,HazardPrior}=nothing,
     _normalized_schedule::Bool=false,
     _schedule_indexed_drives::Bool=false,
@@ -404,7 +404,7 @@ function forecast_win_probabilities(
     include_completed::Bool=true,
     max_seasons::Int=DEFAULT_HISTORICAL_SEASONS,
     time_edges=DEFAULT_TIME_EDGES,
-    method::PriorFitMethod=DEFAULT_PRIOR_FIT_METHOD,
+    method::EMLBFGSFit=DEFAULT_PRIOR_FIT_METHOD,
     horizon::Real=GAME_CLOCK_SECONDS,
     full_schedule::Bool=false,
 )
@@ -419,89 +419,6 @@ function forecast_win_probabilities(
         method=method,
     )
     return forecast_win_probabilities(
-        context;
-        include_completed=include_completed,
-        horizon=horizon,
-        full_schedule=full_schedule,
-    )
-end
-
-"""
-    forecast_spreads(
-        context::RegularSeasonForecastContext;
-        include_completed=true,
-        horizon=GAME_CLOCK_SECONDS,
-        full_schedule=false,
-    ) -> DataFrame
-
-Return expected spread and predictive spread variance for the forecast games
-without evaluating the posterior expected win probability.
-"""
-function forecast_spreads(
-    context::RegularSeasonForecastContext;
-    include_completed::Bool=true,
-    horizon::Real=GAME_CLOCK_SECONDS,
-    full_schedule::Bool=false,
-)
-    games = _selected_forecast_games(context; include_completed=include_completed)
-    forecast = _forecast_output(games; full_schedule=full_schedule)
-    expected_spreads = Float64[]
-    predictive_variances = Float64[]
-    cache = _HazardLogMomentCache(context.model)
-
-    for row in eachrow(games)
-        metrics = _expected_game_spread_metrics_with_cache(
-            context.model,
-            context.marks,
-            row.home_team,
-            row.away_team,
-            cache;
-            horizon=horizon,
-        )
-        push!(expected_spreads, metrics.expected_spread)
-        push!(predictive_variances, metrics.predictive_spread_variance)
-    end
-
-    forecast.expected_spread = expected_spreads
-    forecast.predictive_spread_variance = predictive_variances
-    forecast.game_completed = .!ismissing.(games.result)
-    return forecast
-end
-
-"""
-    forecast_spreads(
-        season;
-        as_of_week,
-        ...
-    ) -> DataFrame
-
-Fit a forecast context and return expected spread metrics. Reuse
-`fit_regular_season_forecast` directly when requesting multiple output views.
-"""
-function forecast_spreads(
-    season::Integer;
-    as_of_week::Integer,
-    schedule::Union{Nothing,AbstractDataFrame}=nothing,
-    historical_drives::Union{Nothing,AbstractDataFrame}=nothing,
-    current_drives::Union{Nothing,AbstractDataFrame}=nothing,
-    include_completed::Bool=true,
-    max_seasons::Int=DEFAULT_HISTORICAL_SEASONS,
-    time_edges=DEFAULT_TIME_EDGES,
-    method::PriorFitMethod=DEFAULT_PRIOR_FIT_METHOD,
-    horizon::Real=GAME_CLOCK_SECONDS,
-    full_schedule::Bool=false,
-)
-    context = fit_regular_season_forecast(
-        season;
-        as_of_week=as_of_week,
-        schedule=schedule,
-        historical_drives=historical_drives,
-        current_drives=current_drives,
-        max_seasons=max_seasons,
-        time_edges=time_edges,
-        method=method,
-    )
-    return forecast_spreads(
         context;
         include_completed=include_completed,
         horizon=horizon,
@@ -546,97 +463,6 @@ function regular_season_results(
     results = _forecast_output(games; full_schedule=full_schedule)
     results.game_completed = .!ismissing.(games.result)
     return results
-end
-
-"""
-    forecast_regular_season(
-        season;
-        as_of_week,
-        schedule=nothing,
-        historical_drives=nothing,
-        current_drives=nothing,
-        include_completed=true,
-        max_seasons=DEFAULT_HISTORICAL_SEASONS,
-        time_edges=DEFAULT_TIME_EDGES,
-        horizon=GAME_CLOCK_SECONDS,
-    ) -> DataFrame
-
-Fit a frozen model and return the full backward-compatible schedule and metric
-table for every regular-season game from `as_of_week` through week 18.
-"""
-function forecast_regular_season(
-    season::Integer;
-    as_of_week::Integer,
-    schedule::Union{Nothing,AbstractDataFrame}=nothing,
-    historical_drives::Union{Nothing,AbstractDataFrame}=nothing,
-    current_drives::Union{Nothing,AbstractDataFrame}=nothing,
-    include_completed::Bool=true,
-    max_seasons::Int=DEFAULT_HISTORICAL_SEASONS,
-    time_edges=DEFAULT_TIME_EDGES,
-    method::PriorFitMethod=DEFAULT_PRIOR_FIT_METHOD,
-    horizon::Real=GAME_CLOCK_SECONDS,
-)
-    context = fit_regular_season_forecast(
-        season;
-        as_of_week=as_of_week,
-        schedule=schedule,
-        historical_drives=historical_drives,
-        current_drives=current_drives,
-        max_seasons=max_seasons,
-        time_edges=time_edges,
-        method=method,
-    )
-    return forecast_regular_season(
-        context;
-        include_completed=include_completed,
-        horizon=horizon,
-    )
-end
-
-"""
-    forecast_regular_season(
-        context::RegularSeasonForecastContext;
-        include_completed=true,
-        horizon=GAME_CLOCK_SECONDS,
-    ) -> DataFrame
-
-Return the full schedule and metric table from a fitted forecast context.
-"""
-function forecast_regular_season(
-    context::RegularSeasonForecastContext;
-    include_completed::Bool=true,
-    horizon::Real=GAME_CLOCK_SECONDS,
-)
-    games = _selected_forecast_games(context; include_completed=include_completed)
-    forecast = _forecast_output(games; full_schedule=true)
-
-    home_probabilities = Float64[]
-    away_probabilities = Float64[]
-    expected_spreads = Float64[]
-    predictive_variances = Float64[]
-    cache = _HazardLogMomentCache(context.model)
-    for row in eachrow(games)
-        metrics = _expected_game_metrics_with_cache(
-            context.model,
-            context.marks,
-            row.home_team,
-            row.away_team,
-            cache;
-            horizon=horizon,
-        )
-        home_probability = _validate_win_probability(metrics.expected_win_probability)
-        push!(home_probabilities, home_probability)
-        push!(away_probabilities, 1.0 - home_probability)
-        push!(expected_spreads, metrics.expected_spread)
-        push!(predictive_variances, metrics.predictive_spread_variance)
-    end
-
-    forecast.home_win_probability = home_probabilities
-    forecast.away_win_probability = away_probabilities
-    forecast.expected_spread = expected_spreads
-    forecast.predictive_spread_variance = predictive_variances
-    forecast.game_completed = .!ismissing.(games.result)
-    return forecast
 end
 
 # ----------------------------------------------------------------------
@@ -700,49 +526,6 @@ function _game_metrics_from_theta(
     return _game_metrics_from_moments(home_moments, away_moments; horizon=horizon)
 end
 
-"""
-    game_spread_distribution(home_moments, away_moments; horizon=GAME_CLOCK_SECONDS)
-        -> Distributions.Normal
-
-Approximate the final home-minus-away score spread using the renewal-reward
-central limit theorem.
-"""
-function game_spread_distribution(
-    home_moments::DriveMoments,
-    away_moments::DriveMoments;
-    horizon::Real=GAME_CLOCK_SECONDS,
-)
-    metrics = _game_metrics_from_moments(
-        home_moments,
-        away_moments;
-        horizon=horizon,
-    )
-    return Normal(metrics.mean_spread, sqrt(metrics.spread_variance))
-end
-
-"""
-    ExpectedGameMetrics
-
-Posterior expected game metrics after propagating matchup hazard uncertainty.
-`predictive_spread_variance` includes both conditional game variance and
-between-hazard-posterior variance in the conditional spread mean.
-"""
-struct ExpectedGameMetrics
-    expected_spread::Float64
-    expected_win_probability::Float64
-    predictive_spread_variance::Float64
-end
-
-"""
-    ExpectedGameSpreadMetrics
-
-Posterior expected spread and predictive spread variance for a matchup.
-"""
-struct ExpectedGameSpreadMetrics
-    expected_spread::Float64
-    predictive_spread_variance::Float64
-end
-
 function _trace_product(
     left::AbstractMatrix{<:Real},
     right::AbstractMatrix{<:Real},
@@ -752,18 +535,6 @@ function _trace_product(
     return sum(
         left[i, j] * right[j, i]
         for i in axes(left, 1), j in axes(left, 2)
-    )
-end
-
-function _quadratic_form(
-    gradient::AbstractVector{<:Real},
-    covariance::AbstractMatrix{<:Real},
-)
-    size(covariance) == (length(gradient), length(gradient)) ||
-        throw(ArgumentError("covariance dimensions must match gradient length"))
-    return sum(
-        gradient[i] * covariance[i, j] * gradient[j]
-        for i in eachindex(gradient), j in eachindex(gradient)
     )
 end
 
@@ -801,51 +572,6 @@ function _expected_game_win_probability(
     return clamp(approximation, 0.0, 1.0)
 end
 
-function _expected_game_spread_metrics(
-    theta::HazardTheta,
-    edges::AbstractVector{<:Real},
-    marks::ScoreMarks;
-    horizon::Real=GAME_CLOCK_SECONDS,
-)
-    spread_function = theta_vector ->
-        _game_metrics_from_theta(
-            theta_vector,
-            edges,
-            marks;
-            horizon=horizon,
-        ).mean_spread
-    variance_function = theta_vector ->
-        _game_metrics_from_theta(
-            theta_vector,
-            edges,
-            marks;
-            horizon=horizon,
-        ).spread_variance
-
-    expected_spread = _second_order_expectation(
-        spread_function,
-        theta.log_mean,
-        theta.covariance,
-    )
-    expected_conditional_variance = _second_order_expectation(
-        variance_function,
-        theta.log_mean,
-        theta.covariance,
-    )
-    spread_gradient = ForwardDiff.gradient(spread_function, theta.log_mean)
-    parameter_spread_variance = _quadratic_form(
-        spread_gradient,
-        theta.covariance,
-    )
-    predictive_spread_variance =
-        expected_conditional_variance + parameter_spread_variance
-
-    return ExpectedGameSpreadMetrics(
-        expected_spread,
-        predictive_spread_variance,
-    )
-end
-
 function _expected_game_win_probability_with_cache(
     model::HazardModel,
     marks::ScoreMarks,
@@ -868,62 +594,6 @@ function _expected_game_win_probability_with_cache(
     )
 end
 
-function _expected_game_spread_metrics_with_cache(
-    model::HazardModel,
-    marks::ScoreMarks,
-    home_team,
-    away_team,
-    cache::_HazardLogMomentCache;
-    horizon::Real=GAME_CLOCK_SECONDS,
-)
-    theta = _hazard_theta_with_cache(
-        model,
-        home_team,
-        away_team,
-        cache,
-    )
-    return _expected_game_spread_metrics(
-        theta,
-        model.time_edges,
-        marks;
-        horizon=horizon,
-    )
-end
-
-function _expected_game_metrics_with_cache(
-    model::HazardModel,
-    marks::ScoreMarks,
-    home_team,
-    away_team,
-    cache::_HazardLogMomentCache;
-    horizon::Real=GAME_CLOCK_SECONDS,
-)
-    theta = _hazard_theta_with_cache(
-        model,
-        home_team,
-        away_team,
-        cache,
-    )
-    expected_win_probability = _expected_game_win_probability(
-        theta,
-        model.time_edges,
-        marks;
-        horizon=horizon,
-    )
-    spread_metrics = _expected_game_spread_metrics(
-        theta,
-        model.time_edges,
-        marks;
-        horizon=horizon,
-    )
-
-    return ExpectedGameMetrics(
-        spread_metrics.expected_spread,
-        expected_win_probability,
-        spread_metrics.predictive_spread_variance,
-    )
-end
-
 """
     expected_game_win_probability(
         model,
@@ -933,8 +603,8 @@ end
         horizon=GAME_CLOCK_SECONDS,
     ) -> Float64
 
-Approximate the posterior expected home win probability without evaluating
-spread or predictive-variance metrics.
+Approximate the posterior expected home win probability from the fitted
+hazard posterior and score marks.
 """
 function expected_game_win_probability(
     model::HazardModel,
@@ -949,78 +619,5 @@ function expected_game_win_probability(
         model.time_edges,
         marks;
         horizon=horizon,
-    )
-end
-
-"""
-    expected_game_spread_metrics(
-        model,
-        marks,
-        home_team,
-        away_team;
-        horizon=GAME_CLOCK_SECONDS,
-    ) -> ExpectedGameSpreadMetrics
-
-Compute posterior expected spread and predictive spread variance without
-evaluating the posterior expected win probability.
-"""
-function expected_game_spread_metrics(
-    model::HazardModel,
-    marks::ScoreMarks,
-    home_team,
-    away_team;
-    horizon::Real=GAME_CLOCK_SECONDS,
-)
-    theta = hazard_theta(model, home_team, away_team)
-    return _expected_game_spread_metrics(
-        theta,
-        model.time_edges,
-        marks;
-        horizon=horizon,
-    )
-end
-
-"""
-    expected_game_metrics(
-        model,
-        marks,
-        home_team,
-        away_team;
-        horizon=GAME_CLOCK_SECONDS,
-    ) -> ExpectedGameMetrics
-
-Approximate posterior expected spread and home win probability using a
-second-order delta method over the matchup's log-hazard posterior. The
-posterior-predictive spread variance uses the law of total variance, with a
-second-order approximation for expected conditional variance and a
-first-order approximation for the variance of the conditional spread mean.
-Score marks, empirical-Bayes hyperparameters, and fitted home multipliers are
-treated as fixed.
-"""
-function expected_game_metrics(
-    model::HazardModel,
-    marks::ScoreMarks,
-    home_team,
-    away_team    ;
-    horizon::Real=GAME_CLOCK_SECONDS,
-)
-    theta = hazard_theta(model, home_team, away_team)
-    expected_win_probability = _expected_game_win_probability(
-        theta,
-        model.time_edges,
-        marks;
-        horizon=horizon,
-    )
-    spread_metrics = _expected_game_spread_metrics(
-        theta,
-        model.time_edges,
-        marks;
-        horizon=horizon,
-    )
-
-    return ExpectedGameMetrics(
-        spread_metrics.expected_spread,
-        expected_win_probability,
-        spread_metrics.predictive_spread_variance,
     )
 end

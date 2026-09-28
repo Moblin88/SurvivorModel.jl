@@ -8,8 +8,8 @@ end
 function _survivor_cli_usage()
     return """
     Usage:
-      survivor --season YEAR [--strikes N] [--objective NAME] [--hessian-weeks N] [--prove-first-pick] [--timeout SECONDS] [--timings] < picks.txt
-      julia --project=. -m SurvivorModel --season YEAR [--strikes N] [--objective NAME] [--hessian-weeks N] [--prove-first-pick] [--timeout SECONDS] [--timings] < picks.txt
+      survivor --season YEAR [--strikes N] [--hessian-weeks N] [--timeout SECONDS] [--timings] < picks.txt
+      julia --project=. -m SurvivorModel --season YEAR [--strikes N] [--hessian-weeks N] [--timeout SECONDS] [--timings] < picks.txt
 
     Input:
       One team abbreviation per nonblank line, starting with week 1.
@@ -18,14 +18,8 @@ function _survivor_cli_usage()
     Options:
       --season YEAR       Target season (required).
       --strikes N         Initial strike count (default: 2).
-      --objective NAME    Selection objective (default:
-                          exact-milp; use milp for the
-                          discounted approximation or
-                          fixed-exact-milp for fixed probabilities).
       --hessian-weeks N  Number of future weeks with Hessian adjustments
                           for exact-milp (default: 3; 0 is linear-only).
-      --prove-first-pick Run an optional full-Hessian proof that no alternate
-                          first pick reaches the selected plan's full score.
       --timeout SECONDS  HiGHS MILP time limit in seconds (default: unlimited).
       --timings           Print phase timings to stderr.
       --refresh-data      Clear NFLData's raw cache and refresh summarized
@@ -48,21 +42,12 @@ function _parse_survivor_cli_real(value::AbstractString, option::AbstractString)
     throw(ArgumentError("$option requires a finite positive number of seconds"))
 end
 
-function _parse_survivor_cli_objective(value::AbstractString)
-    normalized = lowercase(replace(strip(value), '-' => '_'))
-    return _canonical_survivor_objective(Symbol(normalized))
-end
-
 function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
     season = nothing
     initial_strikes = 2
     strikes_specified = false
-    objective = DEFAULT_SURVIVOR_OBJECTIVE
-    objective_specified = false
     hessian_weeks = 3
     hessian_weeks_specified = false
-    prove_first_pick = false
-    prove_first_pick_specified = false
     timeout_seconds = nothing
     timeout_specified = false
     timings = false
@@ -101,22 +86,12 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
             index += 1
             continue
         end
-        if argument == "--prove-first-pick"
-            prove_first_pick_specified &&
-                throw(ArgumentError("--prove-first-pick may only be specified once"))
-            prove_first_pick = true
-            prove_first_pick_specified = true
-            index += 1
-            continue
-        end
-
         option = nothing
         value = nothing
         if argument == "--season" ||
             argument == "--strikes" ||
-        argument == "--objective" ||
-        argument == "--hessian-weeks" ||
-        argument == "--timeout"
+            argument == "--hessian-weeks" ||
+            argument == "--timeout"
             option = argument
             index += 1
             index <= length(args) ||
@@ -128,9 +103,6 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
         elseif startswith(argument, "--strikes=")
             option = "--strikes"
             value = argument[length("--strikes=") + 1:end]
-        elseif startswith(argument, "--objective=")
-            option = "--objective"
-            value = argument[length("--objective=") + 1:end]
         elseif startswith(argument, "--hessian-weeks=")
             option = "--hessian-weeks"
             value = argument[length("--hessian-weeks=") + 1:end]
@@ -153,11 +125,6 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
                 throw(ArgumentError("--strikes may only be specified once"))
             initial_strikes = parsed
             strikes_specified = true
-        elseif option == "--objective"
-            objective_specified &&
-                throw(ArgumentError("--objective may only be specified once"))
-            objective = _parse_survivor_cli_objective(value)
-            objective_specified = true
         elseif option == "--hessian-weeks"
             hessian_weeks_specified &&
                 throw(ArgumentError("--hessian-weeks may only be specified once"))
@@ -178,9 +145,7 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
         show_help=true,
         season=0,
         initial_strikes=2,
-        objective=DEFAULT_SURVIVOR_OBJECTIVE,
         hessian_weeks=3,
-        prove_first_pick=false,
         timeout_seconds=nothing,
         timings=false,
         refresh_data=false,
@@ -195,9 +160,7 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
         show_help=false,
         season=Int(season),
         initial_strikes=Int(initial_strikes),
-        objective=objective,
         hessian_weeks=Int(hessian_weeks),
-        prove_first_pick=prove_first_pick,
         timeout_seconds=timeout_seconds,
         timings=timings,
         refresh_data=refresh_data,
@@ -367,7 +330,6 @@ function _run_survivor_cli(
     historical_drives=nothing,
     current_drives=nothing,
     cache_directory::Union{Nothing,AbstractString}=nothing,
-    method::PriorFitMethod=DEFAULT_PRIOR_FIT_METHOD,
     max_seasons::Int=DEFAULT_HISTORICAL_SEASONS,
     through_week::Int=18,
     timing_output::IO=stderr,
@@ -436,7 +398,6 @@ function _run_survivor_cli(
         current_season=options.season,
         time_edges=DEFAULT_TIME_EDGES,
         max_seasons=max_seasons,
-        method=method,
         cache_directory=cache_directory,
     )
     record_timing(:prior)
@@ -447,7 +408,6 @@ function _run_survivor_cli(
         historical_drives=historical,
         current_drives=current,
         max_seasons=max_seasons,
-        method=method,
         prior=cached_prior.prior,
         _normalized_schedule=true,
         _schedule_indexed_drives=true,
@@ -460,10 +420,8 @@ function _run_survivor_cli(
         strikes_remaining=state.strikes_remaining,
         include_completed=true,
         selection_config=SurvivorSelectionConfig(
-            objective=options.objective,
             through_week=through_week,
             hessian_weeks=options.hessian_weeks,
-            prove_first_pick=options.prove_first_pick,
             timeout_seconds=options.timeout_seconds,
         ),
     )

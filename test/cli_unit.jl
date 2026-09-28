@@ -50,9 +50,7 @@ end
             show_help=false,
             season=2023,
             initial_strikes=2,
-            objective=:exact_milp,
             hessian_weeks=3,
-            prove_first_pick=false,
             timeout_seconds=nothing,
             timings=false,
             refresh_data=false,
@@ -60,12 +58,6 @@ end
         @test SurvivorModel._parse_survivor_cli_args(
             ["--season=2023", "--strikes=4"],
         ).initial_strikes == 4
-        @test SurvivorModel._parse_survivor_cli_args(
-            ["--season=2023", "--objective", "exact-milp"],
-        ).objective == :exact_milp
-        @test SurvivorModel._parse_survivor_cli_args(
-            ["--season=2023", "--objective", "fixed-exact-milp"],
-        ).objective == :fixed_exact_milp
         @test SurvivorModel._parse_survivor_cli_args(
             ["--season=2023", "--timeout", "12.5"],
         ).timeout_seconds == 12.5
@@ -78,9 +70,6 @@ end
         @test SurvivorModel._parse_survivor_cli_args(
             ["--season=2023", "--hessian-weeks=6"],
         ).hessian_weeks == 6
-        @test SurvivorModel._parse_survivor_cli_args(
-            ["--season=2023", "--prove-first-pick"],
-        ).prove_first_pick
         @test SurvivorModel._parse_survivor_cli_args(
             ["--season=2023", "--timings"],
         ).timings
@@ -96,7 +85,8 @@ end
         @test occursin("--timings", usage)
         @test occursin("--timeout", usage)
         @test occursin("--hessian-weeks", usage)
-        @test occursin("--prove-first-pick", usage)
+        @test !occursin("--objective", usage)
+        @test !occursin("--prove-first-pick", usage)
         @test SurvivorModel._parse_survivor_cli_args(
             ["--season", "2023", "--refresh-data"],
         ).refresh_data
@@ -125,26 +115,13 @@ end
             ["--season", "2023", "--hessian-weeks", "2", "--hessian-weeks", "3"],
         )
         @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
-            ["--season", "2023", "--prove-first-pick", "--prove-first-pick"],
-        )
-        @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
             ["--strikes", "2"],
         )
         @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
-            ["--season", "2023", "--objective", "unknown"],
+            ["--season", "2023", "--objective", "fixed-exact-milp"],
         )
         @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
-            ["--season", "2023", "--objective", "discounted_expected_wins"],
-        )
-        @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
-            ["--season", "2023", "--objective", "expected_weeks_before_elimination"],
-        )
-        @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
-            ["--season", "2023", "--objective", "micp"],
-        )
-        @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
-            ["--season", "2023", "--objective", "milp",
-             "--objective", "exact-milp"],
+            ["--season", "2023", "--prove-first-pick"],
         )
         @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
             ["--benchmark", "--season", "2023"],
@@ -161,78 +138,6 @@ end
         @test_throws ArgumentError SurvivorModel._read_survivor_cli_picks(
             IOBuffer("KC SF\n"),
         )
-    end
-
-    @testset "synthetic fitting benchmark API" begin
-        synthetic_drives = SurvivorModel.synthetic_fit_benchmark_drives(
-            drives_per_team=10,
-        )
-        benchmark = SurvivorModel.fit_benchmark(
-            synthetic_drives;
-            current_season=2024,
-            repeats=1,
-            methods=(SurvivorModel.MomentFit(),),
-        )
-        @test nrow(benchmark) == 1
-        @test length(unique(synthetic_drives.defteam)) > 1
-        @test only(benchmark.method) == "moment"
-    end
-
-    @testset "synthetic recovery benchmark API" begin
-        @test SurvivorModel.FIT_RECOVERY_GAMES_PER_TEAM == 17
-        @test SurvivorModel.FIT_RECOVERY_APPROX_DRIVES_PER_TEAM_GAME == 11
-        simulation = SurvivorModel.synthetic_fit_recovery_drives(
-            games_per_team=8,
-            seed=17,
-        )
-        @test length(simulation.truth.seasons) == 3
-        @test length(simulation.truth.teams) == 32
-        @test length(simulation.truth.td_hyperparameters) == 3
-        @test nrow(simulation.schedule) == 3 * 8 * 16
-        @test nrow(simulation.games) == nrow(simulation.schedule)
-        @test all(simulation.games.drive_count .> 0)
-        benchmark = SurvivorModel.fit_recovery_benchmark(
-            simulation.drives,
-            simulation.truth;
-            current_season=2024,
-            repeats=1,
-            methods=(SurvivorModel.MomentFit(),),
-        )
-        @test nrow(benchmark.summary) == 1
-        @test !isempty(benchmark.recovery_quality)
-    end
-
-    @testset "longer synthetic recovery history" begin
-        simulation = SurvivorModel.synthetic_fit_recovery_drives(
-            seasons=2019:2023,
-            games_per_team=1,
-            seed=23,
-        )
-        @test simulation.truth.seasons == collect(2019:2023)
-        @test nrow(simulation.schedule) == 5 * 1 * 16
-
-        benchmark = SurvivorModel.fit_recovery_benchmark(
-            simulation.drives,
-            simulation.truth;
-            max_seasons=5,
-            current_season=2024,
-            repeats=1,
-            methods=(SurvivorModel.MomentFit(),),
-        )
-        @test nrow(benchmark.summary) == 1
-        @test only(benchmark.summary.converged)
-        @test !isempty(benchmark.recovery_quality)
-    end
-
-    @testset "developer benchmark tool" begin
-        project_directory = dirname(@__DIR__)
-        tool_path = joinpath(project_directory, "tools", "fit_benchmark.jl")
-        help = read(
-            `$(Base.julia_cmd()) --project=$project_directory $tool_path --help`,
-            String,
-        )
-        @test occursin("tools/fit_benchmark.jl", help)
-        @test occursin("--scenario NAME", help)
     end
 
     @testset "schedule-derived survivor state" begin
@@ -333,7 +238,6 @@ end
             first = SurvivorModel._cached_historical_prior(
                 historical;
                 current_season=2023,
-                method=SurvivorModel.MomentFit(),
                 cache_directory=cache_directory,
             )
             @test !first.cache_hit
@@ -342,7 +246,6 @@ end
             second = SurvivorModel._cached_historical_prior(
                 historical;
                 current_season=2023,
-                method=SurvivorModel.MomentFit(),
                 cache_directory=cache_directory,
             )
             @test second.cache_hit
@@ -358,7 +261,6 @@ end
             changed = SurvivorModel._cached_historical_prior(
                 changed_historical;
                 current_season=2023,
-                method=SurvivorModel.MomentFit(),
                 cache_directory=cache_directory,
             )
             @test !changed.cache_hit
@@ -371,7 +273,6 @@ end
             @test_throws ArgumentError SurvivorModel._cached_historical_prior(
                 historical;
                 current_season=2023,
-                method=SurvivorModel.MomentFit(),
                 cache_directory=cache_directory,
             )
         end
@@ -421,7 +322,6 @@ end
                 historical_drives=historical,
                 current_drives=current,
                 cache_directory=cache_directory,
-                method=SurvivorModel.MomentFit(),
                 through_week=2,
             )
             @test exit_code == 0
@@ -460,7 +360,6 @@ end
                 historical_drives=historical,
                 current_drives=current,
                 cache_directory=cache_directory,
-                method=SurvivorModel.MomentFit(),
                 through_week=2,
             )
             @test exit_code == 0
@@ -479,7 +378,6 @@ end
                 historical_drives=historical,
                 current_drives=current,
                 cache_directory=cache_directory,
-                method=SurvivorModel.MomentFit(),
                 through_week=2,
             )
             @test exit_code == 0

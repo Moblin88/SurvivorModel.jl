@@ -2,8 +2,7 @@ using SurvivorModel
 using DataFrames
 using Dates
 using Test
-import SurvivorModel: DirectLBFGSFit, forecast_spreads, forecast_regular_season
-import SurvivorModel: hazard_theta, expected_game_metrics
+import SurvivorModel: hazard_theta
 
 function _forecast_fixture()
     schedule = DataFrame(
@@ -83,7 +82,7 @@ end
     end
 
     @testset "fixed pre-week cutoff and output filtering" begin
-        forecast = forecast_regular_season(
+        context = fit_regular_season_forecast(
             2023;
             as_of_week=2,
             schedule=schedule,
@@ -91,6 +90,7 @@ end
             current_drives=current,
             time_edges=[0, Inf],
         )
+        forecast = forecast_win_probabilities(context)
         @test nrow(forecast) == 2
         @test all(forecast.game_type .== "REG")
         @test all(forecast.week .>= 2)
@@ -106,24 +106,17 @@ end
             forecast.home_win_probability .+
             forecast.away_win_probability .≈ 1.0,
         )
-        @test all(isfinite, forecast.expected_spread)
-        @test all(isfinite, forecast.predictive_spread_variance)
 
-        unplayed = forecast_regular_season(
-            2023;
-            as_of_week=2,
-            schedule=schedule,
-            historical_drives=historical,
-            current_drives=current,
+        unplayed = forecast_win_probabilities(
+            context;
             include_completed=false,
-            time_edges=[0, Inf],
         )
         @test nrow(unplayed) == 1
         @test only(unplayed.game_id) == "2023_03_AWAY_HOME"
         @test only(unplayed.game_completed) == false
     end
 
-    @testset "reusable context and split outputs" begin
+    @testset "reusable context and probability forecasts" begin
         context = fit_regular_season_forecast(
             2023;
             as_of_week=2,
@@ -132,34 +125,7 @@ end
             current_drives=current,
             time_edges=[0, Inf],
         )
-        typed_context = fit_regular_season_forecast(
-            2023;
-            as_of_week=2,
-            schedule=schedule,
-            historical_drives=historical,
-            current_drives=current,
-            time_edges=[0, Inf],
-            method=DirectLBFGSFit(),
-        )
-        @test likelihood_fit_diagnostics(
-            typed_context.model.prior,
-            :td,
-        ).converged
         probabilities = forecast_win_probabilities(context)
-        spreads = forecast_spreads(context)
-        full = forecast_regular_season(context)
-
-        @test probabilities.home_win_probability ≈
-            full.home_win_probability
-        @test probabilities.away_win_probability ≈
-            full.away_win_probability
-        @test !(:expected_spread in propertynames(probabilities))
-        @test !(:predictive_spread_variance in propertynames(probabilities))
-        @test !(:home_win_probability in propertynames(spreads))
-        @test !(:away_win_probability in propertynames(spreads))
-        @test spreads.expected_spread ≈ full.expected_spread
-        @test spreads.predictive_spread_variance ≈
-            full.predictive_spread_variance
 
         first_game = first(eachrow(context.games))
         direct_probability = expected_game_win_probability(
@@ -169,14 +135,8 @@ end
             first_game.away_team;
             horizon=60.0,
         )
-        metrics = expected_game_metrics(
-            context.model,
-            context.marks,
-            first_game.home_team,
-            first_game.away_team;
-            horizon=60.0,
-        )
-        @test direct_probability ≈ metrics.expected_win_probability
+        @test direct_probability ≈
+            forecast_win_probabilities(context; horizon=60.0).home_win_probability[1]
 
         reused_prior_context = fit_regular_season_forecast(
             2023;
@@ -274,20 +234,16 @@ end
         @test length(cache.posteriors) == 4
         @test length(cache.log_moments) == 4
 
-        forecast = forecast_regular_season(context)
+        forecast = forecast_win_probabilities(context)
         for (index, row) in enumerate(eachrow(context.games))
-            direct_metrics = expected_game_metrics(
+            direct_probability = expected_game_win_probability(
                 context.model,
                 context.marks,
                 row.home_team,
                 row.away_team,
             )
             @test forecast.home_win_probability[index] ≈
-                direct_metrics.expected_win_probability
-            @test forecast.expected_spread[index] ≈
-                direct_metrics.expected_spread
-            @test forecast.predictive_spread_variance[index] ≈
-                direct_metrics.predictive_spread_variance
+                direct_probability
         end
     end
 
@@ -317,7 +273,7 @@ end
 
     @testset "future target-season drives do not leak" begin
         without_future = current[1:2, :]
-        with_future = forecast_regular_season(
+        with_future = forecast_win_probabilities(
             2023;
             as_of_week=2,
             schedule=schedule,
@@ -325,7 +281,7 @@ end
             current_drives=current,
             time_edges=[0, Inf],
         )
-        without_future_forecast = forecast_regular_season(
+        without_future_forecast = forecast_win_probabilities(
             2023;
             as_of_week=2,
             schedule=schedule,
@@ -335,13 +291,11 @@ end
         )
         @test with_future.home_win_probability ≈
             without_future_forecast.home_win_probability
-        @test with_future.expected_spread ≈
-            without_future_forecast.expected_spread
     end
 
     @testset "week one uses historical data only" begin
         empty_current = current[1:0, :]
-        with_current = forecast_regular_season(
+        with_current = forecast_win_probabilities(
             2023;
             as_of_week=1,
             schedule=schedule,
@@ -349,7 +303,7 @@ end
             current_drives=current,
             time_edges=[0, Inf],
         )
-        without_current = forecast_regular_season(
+        without_current = forecast_win_probabilities(
             2023;
             as_of_week=1,
             schedule=schedule,
@@ -384,14 +338,14 @@ end
     end
 
     @testset "input validation" begin
-        @test_throws ArgumentError forecast_regular_season(
+        @test_throws ArgumentError forecast_win_probabilities(
             2023;
             as_of_week=0,
             schedule=schedule,
             historical_drives=historical,
             current_drives=current,
         )
-        @test_throws ArgumentError forecast_regular_season(
+        @test_throws ArgumentError forecast_win_probabilities(
             2024;
             as_of_week=1,
             schedule=schedule,

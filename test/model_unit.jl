@@ -5,12 +5,7 @@ using Distributions
 using Random
 using Statistics
 using Test
-import SurvivorModel: EMECMEFit, EMLBFGSFit, DirectLBFGSFit, DirectBFGSFit
-import SurvivorModel: MomentFit, MomentLBFGSFit, HybridFit, BlockNewtonFit
-import SurvivorModel: SchurNewtonFit, ScoreMarks, DriveMoments
-import SurvivorModel: ExpectedGameMetrics, fit_score_marks, drive_moments
-import SurvivorModel: hazard_theta, game_spread_distribution
-import SurvivorModel: expected_game_metrics
+import SurvivorModel: ScoreMarks, fit_score_marks, hazard_theta
 
 @testset "model unit tests" begin
     @testset "_classify_event" begin
@@ -222,9 +217,9 @@ import SurvivorModel: expected_game_metrics
             8,
             base_values,
         )
+        @test length(shifted_values) == 2
         @test shifted_values[1] ≈ SurvivorModel.SpecialFunctions.loggamma(10.5)
         @test shifted_values[2] ≈ SurvivorModel.SpecialFunctions.digamma(10.5)
-        @test shifted_values[3] ≈ SurvivorModel.SpecialFunctions.trigamma(10.5)
         differences = SurvivorModel._gamma_shape_difference_values(
             2.5,
             8,
@@ -236,9 +231,7 @@ import SurvivorModel: expected_game_metrics
         @test differences[2] ≈
             SurvivorModel.SpecialFunctions.digamma(10.5) -
             SurvivorModel.SpecialFunctions.digamma(2.5)
-        @test differences[3] ≈
-            SurvivorModel.SpecialFunctions.trigamma(10.5) -
-            SurvivorModel.SpecialFunctions.trigamma(2.5)
+        @test length(differences) == 2
         @test SurvivorModel._gamma_shape_shifted_special_values(
             2.5,
             0,
@@ -294,341 +287,6 @@ import SurvivorModel: expected_game_metrics
             ) / (2.0 * step)
             @test result.gradient[index] ≈ finite_difference atol=2.0e-6
         end
-    end
-
-    @testset "event-process likelihood Hessian" begin
-        gamma_values = [log(0.35), log(2.5), 1.7]
-        gamma_result = SurvivorModel._log_gamma_event_marginal_with_hessian(
-            SurvivorModel.GammaParams(
-                exp(gamma_values[2]),
-                exp(gamma_values[2] - gamma_values[1]),
-            ),
-            3,
-            gamma_values[3],
-        )
-        gamma_gradient = values -> begin
-            component = SurvivorModel.GammaParams(
-                exp(values[2]),
-                exp(values[2] - values[1]),
-            )
-            SurvivorModel._log_gamma_event_marginal_with_hessian(
-                component,
-                3,
-                values[3],
-            ).gradient
-        end
-        finite_gamma_hessian = zeros(3, 3)
-        for index in 1:3
-            step = 1.0e-5
-            lower = copy(gamma_values)
-            upper = copy(gamma_values)
-            lower[index] -= step
-            upper[index] += step
-            finite_gamma_hessian[:, index] =
-                (gamma_gradient(upper) - gamma_gradient(lower)) /
-                (2.0 * step)
-        end
-        @test gamma_result.hessian ≈ finite_gamma_hessian atol=2.0e-7
-        @test gamma_result.hessian ≈ transpose(gamma_result.hessian)
-
-        cell = (
-            time_bin=1,
-            counts=(1.0, 0.0, 2.0),
-            home_counts=(0.0, 1.0, 0.0),
-            away_exposures=(3.0, 4.0, 5.0),
-            home_exposures=(1.0, 2.0, 1.0),
-        )
-        values = [
-            log(0.35),
-            log(2.5),
-            log(0.4 / 0.6),
-            log(1.3),
-        ]
-        hyperparameters, home_multiplier, persistence =
-            SurvivorModel._unpack_reset_parameters(values, 1)
-        result = SurvivorModel._reset_event_log_likelihood_with_hessian(
-            [cell],
-            hyperparameters,
-            home_multiplier,
-            persistence,
-        )
-        gradient_function = values -> begin
-            parameters, home, reset_probability =
-                SurvivorModel._unpack_reset_parameters(values, 1)
-            SurvivorModel._reset_event_log_likelihood_with_gradient(
-                [cell],
-                parameters,
-                home,
-                reset_probability,
-            ).gradient
-        end
-        finite_hessian = zeros(4, 4)
-        for index in 1:4
-            step = 1.0e-5
-            lower = copy(values)
-            upper = copy(values)
-            lower[index] -= step
-            upper[index] += step
-            finite_hessian[:, index] =
-                (gradient_function(upper) - gradient_function(lower)) /
-                (2.0 * step)
-        end
-        @test result.hessian ≈ finite_hessian atol=2.0e-7
-        @test result.hessian ≈ transpose(result.hessian) atol=2.0e-12
-
-        one_season_cell = (
-            time_bin=1,
-            counts=(1.0,),
-            home_counts=(0.0,),
-            away_exposures=(3.0,),
-            home_exposures=(1.0,),
-        )
-        one_season = SurvivorModel._reset_cell_log_likelihood_with_hessian(
-            one_season_cell,
-            hyperparameters[1],
-            home_multiplier,
-            persistence,
-        )
-        @test one_season.gradient[3] ≈ 0.0 atol=1.0e-12
-        @test maximum(abs.(one_season.hessian[3, :])) <= 1.0e-12
-    end
-
-    @testset "Schur-complement Newton direction" begin
-        hessian = zeros(6, 6)
-        for index in 1:6
-            hessian[index, index] = -2.0
-        end
-        hessian[1, 5] = hessian[5, 1] = -0.1
-        hessian[2, 6] = hessian[6, 2] = -0.2
-        hessian[3, 5] = hessian[5, 3] = 0.15
-        gradient = [0.2, -0.1, 0.15, -0.2, 0.1, -0.05]
-        direction = SurvivorModel._reset_schur_newton_direction(
-            hessian,
-            gradient,
-            zeros(6),
-            fill(-10.0, 6),
-            fill(10.0, 6),
-            2,
-            true,
-            0.0,
-        )
-        @test direction !== nothing
-        @test maximum(abs.(hessian * direction.direction + gradient)) <=
-            1.0e-10
-        @test direction.directional_derivative > 0.0
-    end
-
-    @testset "low-rank Cholesky Schur updates" begin
-        base = [4.0 0.5; 0.5 3.0]
-        vectors = [0.2 0.0; 0.1 0.3]
-        factor = SurvivorModel._reset_positive_definite_factor(base)
-        updated = SurvivorModel._reset_lowrank_downdate(factor, vectors)
-        @test updated !== nothing
-        @test Matrix(updated) ≈
-            base - vectors * transpose(vectors) atol=1.0e-12
-    end
-
-    @testset "pooled reset moment identity" begin
-        moments = (
-            away_mean=1.0,
-            home_mean=2.0,
-            away_factorial=1.25,
-            home_factorial=5.0,
-            same_season_product=2.5,
-            sequential_away_away=1.1,
-            sequential_away_home=2.2,
-            sequential_home_away=2.2,
-            sequential_home_home=4.4,
-            n_away_mean=1,
-            n_home_mean=1,
-            n_away_factorial=1,
-            n_home_factorial=1,
-            n_same_season_product=1,
-            n_sequential_away_away=1,
-            n_sequential_away_home=1,
-            n_sequential_home_away=1,
-            n_sequential_home_home=1,
-        )
-        means, variances, fitted_home_multiplier, fitted_persistence =
-            SurvivorModel._reset_moment_parameters(
-                [(time_bin=1, moments=moments)],
-            )
-
-        @test means ≈ [1.0]
-        @test variances ≈ [0.25]
-        @test fitted_home_multiplier ≈ 2.0
-        @test fitted_persistence ≈ 0.4
-
-        @test SurvivorModel._shared_moment_count((10, 10, 40)) == 10.0
-    end
-
-    @testset "season-centered cross moments" begin
-        base_moments = (
-            away_mean=1.5,
-            home_mean=1.5,
-            away_factorial=2.5,
-            home_factorial=2.5,
-            same_season_product=2.5,
-            sequential_away_away=2.1,
-            sequential_away_home=2.1,
-            sequential_home_away=2.1,
-            sequential_home_home=2.1,
-            n_away_mean=1,
-            n_home_mean=1,
-            n_away_factorial=1,
-            n_home_factorial=1,
-            n_same_season_product=1,
-            n_sequential_away_away=1,
-            n_sequential_away_home=1,
-            n_sequential_home_away=1,
-            n_sequential_home_home=1,
-        )
-        season_moments = [
-            (
-                season=2021,
-                moments=merge(
-                    base_moments,
-                    (away_mean=1.0, home_mean=1.0),
-                ),
-            ),
-            (
-                season=2022,
-                moments=merge(
-                    base_moments,
-                    (away_mean=2.0, home_mean=2.0),
-                ),
-            ),
-        ]
-        transition_moments = [
-            (
-                previous_season=2021,
-                current_season=2022,
-                moments=base_moments,
-            ),
-        ]
-        _, _, _, fitted_persistence = SurvivorModel._reset_moment_parameters(
-            [(
-                time_bin=1,
-                moments=base_moments,
-                season_moments=season_moments,
-                transition_moments=transition_moments,
-            )],
-        )
-
-        @test fitted_persistence ≈ 0.4
-
-        finite_sample_moments = merge(
-            base_moments,
-            (
-                sequential_away_away=2.09,
-                sequential_away_home=2.09,
-                sequential_home_away=2.09,
-                sequential_home_home=2.09,
-                n_sequential_away_away=10,
-                n_sequential_away_home=10,
-                n_sequential_home_away=10,
-                n_sequential_home_home=10,
-            ),
-        )
-        _, _, _, corrected_persistence =
-            SurvivorModel._reset_moment_parameters(
-                [(
-                    time_bin=1,
-                    moments=base_moments,
-                    season_moments=season_moments,
-                    transition_moments=[(
-                        previous_season=2021,
-                        current_season=2022,
-                        moments=finite_sample_moments,
-                    )],
-                )],
-            )
-        @test corrected_persistence ≈ 0.4
-    end
-
-    @testset "synthetic reset moment recovery" begin
-        Random.seed!(29)
-        seasons = 2021:2023
-        teams = ["T$(index)" for index in 1:120]
-        byseason = Dict{Int,SurvivorModel.HazardSufficientStats}()
-        mean_rate = 0.01
-        shape = 4.0
-        rate = shape / mean_rate
-        persistence = 0.7
-        home_multiplier = 1.5
-        previous_rates = Dict{String,Float64}()
-
-        for season in seasons
-            stats = SurvivorModel.HazardSufficientStats()
-            for team in teams
-                latent_rate = if haskey(previous_rates, team) &&
-                    rand() < persistence
-                    previous_rates[team]
-                else
-                    rand(Gamma(shape, 1 / rate))
-                end
-                previous_rates[team] = latent_rate
-
-                key = (team, 1)
-                exposure = 10_000.0
-                away_count = rand(Poisson(latent_rate * exposure))
-                home_count = rand(
-                    Poisson(latent_rate * home_multiplier * exposure),
-                )
-                stats.td.away_exposure[key] = exposure
-                stats.td.home_exposure[key] = exposure
-                stats.td.away_counts[key] = away_count
-                stats.td.home_counts[key] = home_count
-                stats.td.exposure[key] = 2 * exposure
-                stats.td.counts[key] = away_count + home_count
-            end
-            byseason[season] = stats
-        end
-
-        moment_blocks = SurvivorModel._reset_moment_blocks(
-            byseason,
-            collect(seasons),
-            :td,
-            1,
-        )
-        moment_fit = SurvivorModel._reset_iterated_moment_parameters(
-            moment_blocks,
-        )
-        @test moment_fit.converged
-        @test moment_fit.iterations > 0
-        @test moment_fit.means[1] ≈ mean_rate rtol=0.35
-        @test moment_fit.home_multiplier ≈ home_multiplier rtol=0.25
-        @test 0.0 <= moment_fit.persistence <= 1.0
-        @test all(variance -> variance > 0.0, moment_fit.variances)
-
-        low_persistence_variance = SurvivorModel._reset_moment_pair_variance(
-            mean_rate,
-            moment_fit.variances[1],
-            0.0,
-            10_000.0,
-            10_000.0,
-        )
-        high_persistence_variance = SurvivorModel._reset_moment_pair_variance(
-            mean_rate,
-            moment_fit.variances[1],
-            1.0,
-            10_000.0,
-            10_000.0,
-        )
-        @test low_persistence_variance != high_persistence_variance
-
-        fitted, fitted_home_multiplier, fitted_persistence =
-            SurvivorModel._fit_reset_outcome_parameters(
-                byseason,
-                collect(seasons),
-                [0.0, Inf],
-                :td,
-            )
-        fitted_mean = fitted[1].shape / fitted[1].rate
-        @test fitted_mean ≈ mean_rate rtol=0.2
-        @test fitted[1].shape ≈ shape rtol=0.3
-        @test fitted_home_multiplier ≈ home_multiplier rtol=0.15
-        @test fitted_persistence ≈ persistence rtol=0.2
     end
 
     @testset "probabilistic reset prior and moments" begin
@@ -786,115 +444,6 @@ import SurvivorModel: expected_game_metrics
         @test recent_prior.historical_seasons == [2022, 2023]
     end
 
-    @testset "alternative historical likelihood solvers" begin
-        rows = DataFrame(
-            game_id=String[],
-            fixed_drive=Int[],
-            posteam=String[],
-            defteam=String[],
-            posteam_home=Bool[],
-            defteam_home=Bool[],
-            drive_result=String[],
-            time_of_possession=Second[],
-            home_spread_change=Float64[],
-        )
-        for season in 2021:2023
-            for team in ["A", "B"]
-                for index in 1:30
-                    posteam_home = iseven(index + season)
-                    touchdown = mod(index + season + length(team), 5) <= 1
-                    push!(
-                        rows,
-                        (
-                            "$(season)_$(team)_$(index)",
-                            1,
-                            team,
-                            "DEFENSE",
-                            posteam_home,
-                            !posteam_home,
-                            touchdown ? "Touchdown" : "Punt",
-                            Second(60),
-                            touchdown && posteam_home ? 7.0 : 0.0,
-                        ),
-                    )
-                end
-            end
-        end
-
-        baseline = fit_empirical_bayes_prior(
-            rows;
-            time_edges=[0, Inf],
-            current_season=2024,
-            method=EMECMEFit(),
-        )
-        baseline_likelihood = likelihood_fit_diagnostics(
-            baseline,
-            :td,
-        ).log_likelihood
-        for method in (
-            EMLBFGSFit(),
-            DirectLBFGSFit(),
-            DirectBFGSFit(),
-            MomentLBFGSFit(),
-            HybridFit(),
-            BlockNewtonFit(),
-            SchurNewtonFit(),
-        )
-            prior = fit_empirical_bayes_prior(
-                rows;
-                time_edges=[0, Inf],
-                current_season=2024,
-                method=method,
-            )
-            diagnostics = likelihood_fit_diagnostics(prior, :td)
-            @test diagnostics.converged
-            @test isfinite(diagnostics.log_likelihood)
-            @test diagnostics.log_likelihood >= baseline_likelihood - 1.0e-2
-        end
-        moment_prior = fit_empirical_bayes_prior(
-            rows;
-            time_edges=[0, Inf],
-            current_season=2024,
-            method=MomentFit(),
-        )
-        moment_diagnostics = likelihood_fit_diagnostics(moment_prior, :td)
-        @test moment_diagnostics.converged
-        @test moment_diagnostics.status === :moment
-        @test moment_diagnostics.iterations > 0
-        @test isfinite(moment_diagnostics.log_likelihood)
-        @test all(
-            parameter -> parameter.shape > 0 && parameter.rate > 0,
-            moment_prior.td_hyperparameters,
-        )
-        @test 0.0 <= hazard_persistence(moment_prior, :td) <= 1.0
-
-        instrumented = fit_empirical_bayes_prior(
-            rows;
-            time_edges=[0, Inf],
-            current_season=2024,
-            method=BlockNewtonFit(),
-            _return_solver_metrics=true,
-        )
-        @test instrumented.solver_metrics.td.solver === :block_newton
-        @test instrumented.solver_metrics.td.hessian_evaluations > 0
-        @test instrumented.solver_metrics.td.schur_corrections >= 0
-        @test_throws TypeError fit_empirical_bayes_prior(
-            rows;
-            time_edges=[0, Inf],
-            method=:unknown,
-        )
-
-        model = fit_hazard_model(
-            rows[1:0, :];
-            historical_drives=rows,
-            time_edges=[0, Inf],
-            method=DirectLBFGSFit(),
-        )
-        @test isfinite(
-            likelihood_fit_diagnostics(model.prior, :td).log_likelihood,
-        )
-    end
-
     @testset "empirical-Bayes home multipliers" begin
         Random.seed!(11)
         rows = DataFrame(
@@ -952,23 +501,6 @@ import SurvivorModel: expected_game_metrics
         defensive_home = hazard_rate(model, :defensive, "DEFENSE", 1; home=true)
         @test defensive_home / defensive_away ≈ prior.defensive_home_multiplier
 
-        marks = fit_score_marks(rows)
-        home_moments = drive_moments(
-            model,
-            marks,
-            "OFFENSE",
-            "DEFENSE";
-            posteam_home=true,
-        )
-        away_moments = drive_moments(
-            model,
-            marks,
-            "OFFENSE",
-            "DEFENSE";
-            posteam_home=false,
-        )
-        @test home_moments.p_td > away_moments.p_td
-
         td_multiplier = model.prior.td_home_multiplier
         defensive_multiplier = model.prior.defensive_home_multiplier
         update_hazard_model!(model, rows[21:40, :])
@@ -1001,26 +533,6 @@ import SurvivorModel: expected_game_metrics
         @test marks.var_td_by_bin == [0.0, 0.0]
         @test marks.mean_defensive_by_bin == [0.0, 2.0]
         @test marks.var_defensive_by_bin == [0.0, 0.0]
-    end
-
-    @testset "two-outcome drive moments" begin
-        drives = vcat(_make_drives(), _make_drives(), _make_drives())
-        model = fit_hazard_model(drives; time_edges=[0, 120, 240, Inf])
-        marks = fit_score_marks(drives)
-        moments = drive_moments(
-            model,
-            marks,
-            "HOME",
-            "AWAY";
-            posteam_home=true,
-        )
-
-        @test 0 < moments.p_td < 1
-        @test 0 < moments.p_defensive < 1
-        @test moments.p_td + moments.p_defensive ≈ 1.0
-        @test moments.mean_T > 0
-        @test moments.var_T > 0
-        @test moments.var_S >= 0
     end
 
     @testset "matchup log-hazard theta" begin
@@ -1056,11 +568,11 @@ import SurvivorModel: expected_game_metrics
         )
     end
 
-    @testset "uncertainty-aware game metrics" begin
+    @testset "posterior win probability" begin
         drives = vcat(_make_drives(), _make_drives(), _make_drives())
         model = fit_hazard_model(drives; time_edges=[0, 120, 240, Inf])
         marks = fit_score_marks(drives)
-        metrics = expected_game_metrics(
+        probability = expected_game_win_probability(
             model,
             marks,
             "HOME",
@@ -1068,31 +580,28 @@ import SurvivorModel: expected_game_metrics
             horizon=60.0,
         )
 
-        @test metrics isa ExpectedGameMetrics
-        @test isfinite(metrics.expected_spread)
-        @test 0 < metrics.expected_win_probability < 1
-        @test metrics.predictive_spread_variance > 0
+        @test isfinite(probability)
+        @test 0 < probability < 1
 
         empty_model = fit_hazard_model(
             drives[1:0, :];
             time_edges=[0, Inf],
         )
-        symmetric = expected_game_metrics(
+        symmetric = expected_game_win_probability(
             empty_model,
             ScoreMarks(7.0, 0.0, 0.0, 0.0),
             "HOME",
             "AWAY";
             horizon=60.0,
         )
-        @test symmetric.expected_spread ≈ 0.0 atol=1e-10
-        @test symmetric.expected_win_probability ≈ 0.5 atol=1e-10
+        @test symmetric ≈ 0.5 atol=1e-10
     end
 
-    @testset "second-order metrics versus posterior simulation" begin
+    @testset "second-order win probability versus posterior simulation" begin
         drives = vcat([_make_drives() for _ in 1:30]...)
         model = fit_hazard_model(drives; time_edges=[0, Inf])
         marks = fit_score_marks(drives)
-        metrics = expected_game_metrics(
+        probability = expected_game_win_probability(
             model,
             marks,
             "HOME",
@@ -1114,7 +623,6 @@ import SurvivorModel: expected_game_metrics
             ]
             for posterior in posteriors
         ]
-        spread_samples = zeros(n_samples)
         win_samples = zeros(n_samples)
         for i in 1:n_samples
             theta_sample = [log(samples[j][i]) for j in eachindex(samples)]
@@ -1124,59 +632,25 @@ import SurvivorModel: expected_game_metrics
                 marks;
                 horizon=60.0,
             )
-            spread_samples[i] = sample_metrics.mean_spread
             win_samples[i] = sample_metrics.win_probability
         end
 
-        @test mean(spread_samples) ≈ metrics.expected_spread atol=0.05
-        @test mean(win_samples) ≈ metrics.expected_win_probability atol=0.03
+        @test mean(win_samples) ≈ probability atol=0.03
     end
 
     @testset "two-outcome synthetic race" begin
-        Random.seed!(1234)
         lambda_td, lambda_defensive = 0.01, 0.015
-        n = 50_000
-        times = Vector{Float64}(undef, n)
-        results = Vector{String}(undef, n)
-        for i in 1:n
-            td_time = randexp() / lambda_td
-            defensive_time = randexp() / lambda_defensive
-            if td_time < defensive_time
-                times[i], results[i] = td_time, "Touchdown"
-            else
-                times[i], results[i] = defensive_time, "Punt"
-            end
-        end
-        drives = DataFrame(
-            game_id=["2024_$i" for i in 1:n],
-            fixed_drive=ones(Int, n),
-            posteam=fill("OFFENSE", n),
-            defteam=fill("DEFENSE", n),
-            posteam_home=fill(true, n),
-            defteam_home=fill(false, n),
-            drive_result=results,
-            time_of_possession=Second.(round.(Int, times)),
-            drive_start_yards_to_goal=fill(50, n),
-            yards_gained=zeros(n),
-            home_spread_change=[r == "Touchdown" ? 7.0 : 0.0 for r in results],
+        marks = ScoreMarks(7.0, 0.0, 0.0, 0.0)
+        moments = SurvivorModel._drive_moments_from_hazards(
+            [0.0, Inf],
+            marks,
+            [lambda_td],
+            [lambda_defensive],
         )
-
-        model = fit_hazard_model(drives; time_edges=[0, Inf])
-        marks = fit_score_marks(drives)
-        moments = drive_moments(model, marks, "OFFENSE", "DEFENSE")
         @test moments.p_td ≈ lambda_td / (lambda_td + lambda_defensive) atol=0.02
         @test moments.p_defensive ≈ lambda_defensive /
             (lambda_td + lambda_defensive) atol=0.02
         @test moments.mean_T ≈ 1 / (lambda_td + lambda_defensive) rtol=0.05
-        @test abs(moments.cov_TS) < 0.05 * sqrt(moments.var_T * moments.var_S)
-    end
-
-    @testset "game_spread_distribution" begin
-        home = DriveMoments(0.3, 0.7, 30.0, 100.0, 2.0, 5.0, 1.0)
-        away = DriveMoments(0.3, 0.7, 30.0, 100.0, 2.0, 5.0, 1.0)
-        dist = game_spread_distribution(home, away; horizon=60.0)
-        @test dist isa Normal
-        @test mean(dist) ≈ 0.0 atol=1e-9
-        @test var(dist) > 0
+        @test abs(moments.cov_TS) <= 1.0e-12
     end
 end

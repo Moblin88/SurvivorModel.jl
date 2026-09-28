@@ -1,11 +1,10 @@
-const HISTORICAL_PRIOR_CACHE_SCHEMA = 2
+const HISTORICAL_PRIOR_CACHE_SCHEMA = 3
 
 struct HistoricalPriorCacheEntry
     schema_version::Int
     season::Int
     max_seasons::Int
     time_edges::Vector{Float64}
-    method::Symbol
     data_fingerprint::String
     prior::HazardPrior
 end
@@ -23,11 +22,9 @@ function _historical_prior_cache_path(
     season::Integer,
     max_seasons::Integer,
     time_edges::AbstractVector{<:Real},
-    method::PriorFitMethod,
     data_fingerprint::AbstractString,
 )
     edge_token = join(_cache_path_token.(Float64.(time_edges)), "_")
-    method_token = _cache_path_token(prior_fit_method_name(method))
     filename = join(
         (
             "historical_prior",
@@ -35,7 +32,6 @@ function _historical_prior_cache_path(
             "season$(Int(season))",
             "window$(Int(max_seasons))",
             "edges$(edge_token)",
-            "method$(method_token)",
             "data$(_cache_path_token(data_fingerprint))",
         ),
         "_",
@@ -48,7 +44,6 @@ function _historical_prior_cache_entry_matches(
     season::Integer,
     max_seasons::Integer,
     time_edges::AbstractVector{<:Real},
-    method::PriorFitMethod,
     data_fingerprint::AbstractString,
 )
     entry isa HistoricalPriorCacheEntry || return false
@@ -57,7 +52,6 @@ function _historical_prior_cache_entry_matches(
     entry.season == Int(season) || return false
     entry.max_seasons == Int(max_seasons) || return false
     entry.time_edges == expected_edges || return false
-    entry.method === prior_fit_method_name(method) || return false
     entry.data_fingerprint == data_fingerprint || return false
     entry.prior.time_edges == expected_edges || return false
     return true
@@ -68,7 +62,6 @@ function _read_historical_prior_cache(
     season::Integer,
     max_seasons::Integer,
     time_edges::AbstractVector{<:Real},
-    method::PriorFitMethod,
     data_fingerprint::AbstractString,
 )
     isfile(path) || return nothing
@@ -91,7 +84,6 @@ function _read_historical_prior_cache(
         season,
         max_seasons,
         time_edges,
-        method,
         data_fingerprint,
     ) || return nothing
     return entry.prior
@@ -124,7 +116,7 @@ function _cached_historical_prior(
     current_season::Integer,
     time_edges=DEFAULT_TIME_EDGES,
     max_seasons::Int=DEFAULT_HISTORICAL_SEASONS,
-    method::PriorFitMethod=DEFAULT_PRIOR_FIT_METHOD,
+    method::EMLBFGSFit=DEFAULT_PRIOR_FIT_METHOD,
     cache_directory::Union{Nothing,AbstractString}=nothing,
 )
     max_seasons > 0 || throw(ArgumentError("max_seasons must be positive"))
@@ -147,7 +139,6 @@ function _cached_historical_prior(
         current_season,
         max_seasons,
         edges,
-        method,
         data_fingerprint,
     )
     cached_prior = _read_historical_prior_cache(
@@ -155,7 +146,6 @@ function _cached_historical_prior(
         current_season,
         max_seasons,
         edges,
-        method,
         data_fingerprint,
     )
     cached_prior !== nothing &&
@@ -178,7 +168,6 @@ function _cached_historical_prior(
         Int(current_season),
         Int(max_seasons),
         edges,
-        prior_fit_method_name(method),
         data_fingerprint,
         prior,
     )

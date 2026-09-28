@@ -339,8 +339,9 @@ docker run --rm -i survivormodel --season 2026 < picks.txt
 ```
 
 GitHub Actions builds the image for pull requests without publishing, then
-publishes the `linux/amd64` image to Docker Hub on pushes to `main` and `v*`
-tags. Before the first publish, create the public Docker Hub repository
+publishes multi-platform `linux/amd64` and `linux/arm64` images to Docker Hub
+on pushes to `main` and `v*` tags. Docker selects the image matching the host
+architecture. Before the first publish, create the public Docker Hub repository
 `moblin88/survivormodel.jl` and configure these repository Actions settings:
 
 - `DOCKERHUB_USERNAME` as a repository Actions variable, set to your Docker

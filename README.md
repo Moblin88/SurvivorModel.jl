@@ -166,13 +166,6 @@ or fit a model. `load_schedule()` can be used to fetch or normalize the
 underlying schedule separately. At the matchup level,
 `expected_game_win_probability` provides a direct probability calculation.
 
-The default package test suite uses deterministic fixtures. To run the
-optional drive-data smoke test against NFLData as well:
-
-```sh
-SURVIVORMODEL_RUN_LIVE_SANITY=true julia --project=. -e 'using Pkg; Pkg.test()'
-```
-
 ## Survivor-pool planning
 
 Use a fitted regular-season context to create one forward survivor pick per

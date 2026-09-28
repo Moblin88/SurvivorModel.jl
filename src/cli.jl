@@ -8,8 +8,8 @@ end
 function _survivor_cli_usage()
     return """
     Usage:
-      survivor --season YEAR [--strikes N] [--hessian-weeks N] [--timeout SECONDS] [--timings] < picks.txt
-      julia --project=. -m SurvivorModel --season YEAR [--strikes N] [--hessian-weeks N] [--timeout SECONDS] [--timings] < picks.txt
+      survivor --season YEAR [--strikes N] [--hessian-weeks N] [--timeout SECONDS] < picks.txt
+      julia --project=. -m SurvivorModel --season YEAR [--strikes N] [--hessian-weeks N] [--timeout SECONDS] < picks.txt
 
     Input:
       One team abbreviation per nonblank line, starting with week 1.
@@ -21,7 +21,6 @@ function _survivor_cli_usage()
       --hessian-weeks N  Number of future weeks with Hessian adjustments
                           for exact-milp (default: 3; 0 is linear-only).
       --timeout SECONDS  HiGHS MILP time limit in seconds (default: unlimited).
-      --timings           Print phase timings to stderr.
       --refresh-data      Clear NFLData's raw cache and refresh summarized
                           historical drive data before running.
       --help              Show this help.
@@ -50,8 +49,6 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
     hessian_weeks_specified = false
     timeout_seconds = nothing
     timeout_specified = false
-    timings = false
-    timings_specified = false
     refresh_data = false
     refresh_data_specified = false
     show_help = false
@@ -75,14 +72,6 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
                 throw(ArgumentError("--refresh-data may only be specified once"))
             refresh_data = true
             refresh_data_specified = true
-            index += 1
-            continue
-        end
-        if argument == "--timings"
-            timings_specified &&
-                throw(ArgumentError("--timings may only be specified once"))
-            timings = true
-            timings_specified = true
             index += 1
             continue
         end
@@ -147,7 +136,6 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
         initial_strikes=2,
         hessian_weeks=3,
         timeout_seconds=nothing,
-        timings=false,
         refresh_data=false,
     )
     season === nothing && throw(ArgumentError("--season is required"))
@@ -162,7 +150,6 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
         initial_strikes=Int(initial_strikes),
         hessian_weeks=Int(hessian_weeks),
         timeout_seconds=timeout_seconds,
-        timings=timings,
         refresh_data=refresh_data,
     )
 end
@@ -332,27 +319,20 @@ function _run_survivor_cli(
     cache_directory::Union{Nothing,AbstractString}=nothing,
     max_seasons::Int=DEFAULT_HISTORICAL_SEASONS,
     through_week::Int=18,
-    timing_output::IO=stderr,
     schedule_loader::Function=load_schedule,
     clear_data_cache::Function=NFLData.clear_cache,
 )
-    timing_started = time_ns()
-    timing_logger = Logging.SimpleLogger(timing_output, Logging.Debug)
-    record_timing = function(phase::Symbol)
-        timings_enabled || return nothing
+    phase_started = time_ns()
+    log_phase_timing = function(phase::Symbol)
         now = time_ns()
-        duration = (now - timing_started) / 1.0e9
-        timing_started = now
-        Logging.with_logger(timing_logger) do
-            @info "survivor phase complete" phase elapsed_seconds=duration
-        end
-        flush(timing_output)
+        elapsed_seconds = (now - phase_started) / 1.0e9
+        phase_started = now
+        @debug "survivor phase complete" phase=phase elapsed_seconds=elapsed_seconds
         return nothing
     end
 
     options = _parse_survivor_cli_args(args)
-    timings_enabled = options.timings
-    record_timing(:parse)
+    log_phase_timing(:parse)
     if options.show_help
         print(output, _survivor_cli_usage())
         return 0
@@ -369,8 +349,8 @@ function _run_survivor_cli(
         schedule_loader=schedule_loader,
         clear_data_cache=clear_data_cache,
     )
-    record_timing(:schedule)
-    record_timing(:state)
+    log_phase_timing(:schedule)
+    log_phase_timing(:state)
     historical_source = _survivor_cli_load_historical_drives(
         options.season,
         max_seasons,
@@ -386,7 +366,7 @@ function _run_survivor_cli(
         ;
         allow_missing_current=state.current_week == 1,
     )
-    record_timing(:drive_data)
+    log_phase_timing(:drive_data)
     historical = _survivor_cli_historical_drives(
         normalized_schedule,
         options.season,
@@ -399,7 +379,7 @@ function _run_survivor_cli(
         max_seasons=max_seasons,
         cache_directory=cache_directory,
     )
-    record_timing(:prior)
+    log_phase_timing(:prior)
     context = fit_regular_season_forecast(
         options.season;
         as_of_week=state.current_week,
@@ -411,8 +391,8 @@ function _run_survivor_cli(
         _normalized_schedule=true,
         _schedule_indexed_drives=true,
     )
-    record_timing(:fit)
-    record_timing(:optimize_start)
+    log_phase_timing(:fit)
+    log_phase_timing(:optimize_start)
     solve_plan = () -> optimize_survivor_pool(
         context;
         picks_made=state.picks_made,
@@ -424,18 +404,14 @@ function _run_survivor_cli(
             timeout_seconds=options.timeout_seconds,
         ),
     )
-    plan = if timings_enabled
-        Logging.with_logger(timing_logger) do
-            solve_plan()
-        end
-    else
-        solve_plan()
-    end
-    record_timing(:optimize)
+    plan = solve_plan()
+    log_phase_timing(:optimize)
     nrow(plan.current_pick) == 1 ||
         throw(ArgumentError("survivor optimization did not produce one current pick"))
-    print(output, String(plan.current_pick.team[1]), '\n')
-    record_timing(:output)
+    selected_team = String(plan.current_pick.team[1])
+    @info "survivor pick selected" week=state.current_week team=selected_team
+    print(output, selected_team, '\n')
+    log_phase_timing(:output)
     return 0
 end
 

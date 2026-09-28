@@ -282,18 +282,22 @@ strikes. Use `--strikes N` to choose a different initial strike count. The
 effective week is one plus the number of supplied picks; games at or after
 that week are treated as future games even when the schedule already contains
 their results, which allows replaying an earlier week of a completed season.
-The default output is only the selected team's abbreviation and a newline.
-For an opt-in phase breakdown, pass `--timings`; timing diagnostics are written
-to stderr so stdout remains suitable for a picks file:
+The selected team is logged at Info level to stderr and also printed as its
+abbreviation with a newline to stdout, so stdout remains suitable for a picks
+file. Phase timings and detailed optimizer diagnostics are Debug-level logs;
+enable them for this package with `JULIA_DEBUG=SurvivorModel`:
 
 ```sh
-survivor --season 2026 --timings < picks.txt
+JULIA_DEBUG=SurvivorModel survivor --season 2026 < picks.txt
 ```
 
-With `--timings`, the stderr diagnostics also include one record for each MILP
-solve. Each record reports the phase, termination/primal status, whether an
-incumbent is available, incumbent objective, objective bound, relative gap, and
-branch-and-bound node count.
+For example, redirect stdout and stderr separately to save the next pick and
+diagnostics to different files:
+
+```sh
+JULIA_DEBUG=SurvivorModel survivor --season 2026 \
+  < picks.txt > next-pick.txt 2> survivor.log
+```
 
 Use `--refresh-data` (or set `SURVIVORMODEL_REFRESH_DATA=true`) for an explicit
 data refresh. This clears NFLData's raw-data cache and rebuilds the package's

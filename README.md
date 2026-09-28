@@ -358,8 +358,9 @@ docker run --rm -i \
   --season 2026 < picks.txt
 ```
 
-`latest` follows `main`; version tags and `sha-<commit>` tags are also
-published.
+`latest` follows `main`. A GitHub tag such as `v1.2.3` is published under the
+same Docker Hub tag; the workflow does not create per-commit SHA tags or
+floating major/minor aliases.
 
 After each week, refresh the forecast context with the new `as_of_week`,
 record the team picked in `picks_made`, update `strikes_remaining`, and call

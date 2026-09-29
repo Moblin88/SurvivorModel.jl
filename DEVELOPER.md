@@ -32,19 +32,33 @@ This retains the candidate-wise convex-hull formulation in the LP relaxation.
 Posterior coordinates are shared by `(hazard kind, team)` across the horizon.
 The fitted covariance is diagonal. The model precomputes candidate
 gradient Gram constants
-`K[t,k] = gradient(v[t])' * Sigma * gradient(v[k])` and tracks
-`gradient(p[w,l])' * Sigma * gradient(v[k])` for each selectable reference
-candidate. A scalar state tracks `trace(Sigma * Hessian(p[w,l]))`; its
-recurrence includes the candidate Hessian contraction and gradient cross
-term. Signed interval recurrences provide finite bounds for the probability,
-gradient, and Hessian dummy products.
+`K[t,k] = gradient(v[t])' * Sigma * gradient(v[k])`. Gradient states use a
+hybrid representation: while any remaining suffix has more active candidate
+references than parameter coordinates, the model tracks the full parameter
+gradient `D[w,l] = gradient(p[w,l])`. Its recurrence for selected candidate
+`t` is
+`D[w+1,l] = v[w,t] * D[w,l] + (1 - v[w,t]) * D[w,l-1] +
+gradient(v[t]) * (p[w,l] - p[w,l-1])`.
+At the first state whose complete remaining suffix fits within the parameter
+dimension, the recurrence switches to only the needed contractions
+`gradient(p[w,l])' * Sigma * gradient(v[k])`. The transition projects the
+parameter state through the covariance and candidate gradients directly into
+the candidate-contraction recurrence, so the full parameter gradient is not
+reconstructed later. Each loss-count slice therefore tracks at most the
+number of posterior coordinates. A scalar state tracks
+`trace(Sigma * Hessian(p[w,l]))`; its recurrence includes the candidate
+Hessian contraction and gradient cross term. Signed interval recurrences
+provide finite bounds for parameter-gradient, candidate-gradient, probability,
+and Hessian dummy products.
 
 Redundant aggregate recurrences directly constrain the weekly probability sum
 through the full horizon and the adjusted objective sum through the retained
 Hessian prefix. The probability aggregate is also constrained to be
 nonincreasing. Gradient reference states are suffix-pruned to the Hessian
 prefix and omitted when no earlier candidate can have a nonzero Gram
-interaction. This pruning is exact; zero-support states are fixed at zero.
+interaction. The hybrid switch checks all later reference widths rather than
+assuming they decrease monotonically. This pruning is exact; zero-support
+states are fixed at zero.
 
 The MILP is warm-started with a deterministic feasible greedy plan that
 selects the highest posterior-mean candidate probability each week while

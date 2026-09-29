@@ -505,6 +505,38 @@ function _survivor_gradient_reference_indices(
     return references
 end
 
+function _survivor_gradient_switch_position(
+    gradient_reference_indices::AbstractVector,
+    number_of_parameters::Integer,
+)
+    number_of_parameters >= 0 ||
+        throw(ArgumentError(
+            "survivor parameter count must be nonnegative",
+        ))
+    for position in eachindex(gradient_reference_indices)
+        all(
+            length(gradient_reference_indices[suffix]) <= number_of_parameters
+            for suffix in position:lastindex(gradient_reference_indices)
+        ) && return position
+    end
+    return length(gradient_reference_indices) + 1
+end
+
+function _survivor_parameter_gradient_contraction(
+    gradient_state::AbstractMatrix,
+    loss_state::Integer,
+    reference::Integer,
+    inputs::SurvivorObjectiveInputs,
+)
+    return sum(
+        gradient_state[loss_state, parameter] *
+        inputs.parameters.variance[parameter] *
+        inputs.derivatives[reference].gradient[parameter]
+        for parameter in eachindex(inputs.parameters.variance);
+        init=0.0,
+    )
+end
+
 function _survivor_greedy_selected_indices(
     data::AbstractDataFrame,
     state::SurvivorPoolState,
@@ -886,6 +918,19 @@ function _survivor_scalar_bounds(
         losses_to_elimination,
         n_candidates,
     )
+    n_parameters = length(inputs.parameters.keys)
+    parameter_gradient_lower = zeros(
+        Float64,
+        curvature_weeks + 1,
+        losses_to_elimination,
+        n_parameters,
+    )
+    parameter_gradient_upper = zeros(
+        Float64,
+        curvature_weeks + 1,
+        losses_to_elimination,
+        n_parameters,
+    )
     hessian_lower =
         zeros(Float64, curvature_weeks + 1, losses_to_elimination)
     hessian_upper =
@@ -906,6 +951,18 @@ function _survivor_scalar_bounds(
         n_candidates,
         losses_to_elimination,
         n_candidates,
+    )
+    candidate_parameter_gradient_lower = zeros(
+        Float64,
+        n_candidates,
+        losses_to_elimination,
+        n_parameters,
+    )
+    candidate_parameter_gradient_upper = zeros(
+        Float64,
+        n_candidates,
+        losses_to_elimination,
+        n_parameters,
     )
     candidate_hessian_lower =
         zeros(Float64, n_candidates, losses_to_elimination)
@@ -952,6 +1009,66 @@ function _survivor_scalar_bounds(
                         previous_upper,
                     )
                 if position < curvature_weeks
+                    for parameter in 1:n_parameters
+                        current_gradient_lower =
+                            parameter_gradient_lower[
+                                position,
+                                loss_state,
+                                parameter,
+                            ]
+                        current_gradient_upper =
+                            parameter_gradient_upper[
+                                position,
+                                loss_state,
+                                parameter,
+                            ]
+                        lower, upper = _survivor_interval_product(
+                            current_gradient_lower,
+                            current_gradient_upper,
+                            probability,
+                        )
+                        previous_gradient_lower, previous_gradient_upper =
+                            loss_state == 1 ?
+                            (0.0, 0.0) :
+                            (
+                                parameter_gradient_lower[
+                                    position,
+                                    loss_state - 1,
+                                    parameter,
+                                ],
+                                parameter_gradient_upper[
+                                    position,
+                                    loss_state - 1,
+                                    parameter,
+                                ],
+                            )
+                        previous_term_lower, previous_term_upper =
+                            _survivor_interval_product(
+                                previous_gradient_lower,
+                                previous_gradient_upper,
+                                1.0 - probability,
+                            )
+                        lower += previous_term_lower
+                        upper += previous_term_upper
+                        source_lower, source_upper =
+                            _survivor_interval_product(
+                                probability_difference_lower,
+                                probability_difference_upper,
+                                derivative.gradient[parameter],
+                            )
+                        lower += source_lower
+                        upper += source_upper
+                        candidate_parameter_gradient_lower[
+                            index,
+                            loss_state,
+                            parameter,
+                        ],
+                        candidate_parameter_gradient_upper[
+                            index,
+                            loss_state,
+                            parameter,
+                        ] = _survivor_widen_interval(lower, upper)
+                    end
                     for reference in gradient_reference_indices[position + 1]
                         current_gradient_lower =
                             gradient_lower[position, loss_state, reference]
@@ -1096,6 +1213,35 @@ function _survivor_scalar_bounds(
                             ),
                         )
                 end
+                for parameter in 1:n_parameters
+                    parameter_gradient_lower[
+                        position + 1,
+                        loss_state,
+                        parameter,
+                    ],
+                    parameter_gradient_upper[
+                        position + 1,
+                        loss_state,
+                        parameter,
+                    ] = _survivor_widen_interval(
+                        minimum(
+                            candidate_parameter_gradient_lower[
+                                index,
+                                loss_state,
+                                parameter,
+                            ]
+                            for index in week_indices[position]
+                        ),
+                        maximum(
+                            candidate_parameter_gradient_upper[
+                                index,
+                                loss_state,
+                                parameter,
+                            ]
+                            for index in week_indices[position]
+                        ),
+                    )
+                end
             end
             if position <= curvature_weeks
                 hessian_lower[position + 1, loss_state],
@@ -1118,12 +1264,18 @@ function _survivor_scalar_bounds(
         all(isfinite, probability_upper) &&
         all(isfinite, gradient_lower) &&
         all(isfinite, gradient_upper) &&
+        all(isfinite, parameter_gradient_lower) &&
+        all(isfinite, parameter_gradient_upper) &&
         all(isfinite, hessian_lower) &&
         all(isfinite, hessian_upper) ||
         throw(ArgumentError("survivor scalar recurrence bounds are not finite"))
     return (
         probability=(lower=probability_lower, upper=probability_upper),
         gradient=(lower=gradient_lower, upper=gradient_upper),
+        parameter_gradient=(
+            lower=parameter_gradient_lower,
+            upper=parameter_gradient_upper,
+        ),
         hessian=(lower=hessian_lower, upper=hessian_upper),
         candidate_probability=(
             lower=candidate_probability_lower,
@@ -1132,6 +1284,10 @@ function _survivor_scalar_bounds(
         candidate_gradient=(
             lower=candidate_gradient_lower,
             upper=candidate_gradient_upper,
+        ),
+        candidate_parameter_gradient=(
+            lower=candidate_parameter_gradient_lower,
+            upper=candidate_parameter_gradient_upper,
         ),
         candidate_hessian=(
             lower=candidate_hessian_lower,
@@ -1182,6 +1338,13 @@ function _survivor_scalar_forward_values(
         losses_to_elimination,
         n_candidates,
     )
+    n_parameters = length(inputs.parameters.keys)
+    parameter_gradient = zeros(
+        Float64,
+        curvature_weeks + 1,
+        losses_to_elimination,
+        n_parameters,
+    )
     hessian = zeros(
         Float64,
         number_of_weeks + 1,
@@ -1200,6 +1363,32 @@ function _survivor_scalar_forward_values(
                 win_probability * probability[position, loss_state] +
                 (1.0 - win_probability) * previous_probability
             if position < curvature_weeks
+                probability_difference =
+                    probability[position, loss_state] - previous_probability
+                for parameter in 1:n_parameters
+                    previous_parameter_gradient = loss_state == 1 ?
+                        0.0 :
+                        parameter_gradient[
+                            position,
+                            loss_state - 1,
+                            parameter,
+                        ]
+                    parameter_gradient[
+                        position + 1,
+                        loss_state,
+                        parameter,
+                    ] =
+                        win_probability *
+                        parameter_gradient[
+                            position,
+                            loss_state,
+                            parameter,
+                        ] +
+                        (1.0 - win_probability) *
+                        previous_parameter_gradient +
+                        derivative.gradient[parameter] *
+                        probability_difference
+                end
                 for reference in gradient_reference_indices[position + 1]
                     current_reference = findfirst(
                         ==(reference),
@@ -1256,6 +1445,7 @@ function _survivor_scalar_forward_values(
     return (
         probability=probability,
         gradient=gradient,
+        parameter_gradient=parameter_gradient,
         hessian=hessian,
     )
 end
@@ -1290,11 +1480,13 @@ end
 function _set_survivor_scalar_warm_start!(
     selected,
     probability,
+    parameter_gradient,
     gradient,
     hessian,
     warm_start,
     candidate_indices,
     gradient_reference_indices,
+    gradient_switch_position::Integer,
     number_of_weeks::Integer,
     losses_to_elimination::Integer,
     curvature_weeks::Integer,
@@ -1317,10 +1509,21 @@ function _set_survivor_scalar_warm_start!(
             warm_start.hessian[position, loss_state],
         )
     end
-    for position in 1:curvature_weeks, loss_state in 1:losses_to_elimination
+    for position in eachindex(parameter_gradient),
+        loss_state in 1:losses_to_elimination,
+        parameter in axes(parameter_gradient[position], 2)
+        set_start_value(
+            parameter_gradient[position][loss_state, parameter],
+            warm_start.parameter_gradient[position, loss_state, parameter],
+        )
+    end
+    for position in gradient_switch_position:curvature_weeks,
+        loss_state in 1:losses_to_elimination
+        gradient_state = gradient[position]
+        gradient_state === nothing && continue
         for (slot, reference) in enumerate(gradient_reference_indices[position])
             set_start_value(
-                gradient[position][loss_state, slot],
+                gradient_state[loss_state, slot],
                 warm_start.gradient[position, loss_state, reference],
             )
         end
@@ -1369,8 +1572,8 @@ function _optimize_survivor_expected_weeks_scalar_milp(
         Int(data.week[index]) - state.current_week + 1
         for index in candidate_indices
     ]
-    # gradient[position][loss, slot] represents g[w′, t′, w, l], where
-    # `slot` identifies a candidate in week w′ >= w.
+    # Track parameter gradients before the suffix-safe switch, then only the
+    # candidate contractions needed for reference weeks w′ >= w.
     gradient_reference_indices = _survivor_gradient_reference_indices(
         candidate_positions,
         number_of_weeks,
@@ -1381,6 +1584,15 @@ function _optimize_survivor_expected_weeks_scalar_milp(
         Dict(reference => slot for (slot, reference) in enumerate(references))
         for references in gradient_reference_indices
     ]
+    parameter_count = length(inputs.parameters.keys)
+    gradient_switch_position = _survivor_gradient_switch_position(
+        gradient_reference_indices,
+        parameter_count,
+    )
+    parameter_state_count = min(
+        curvature_weeks,
+        gradient_switch_position - 1,
+    )
     bounds = _survivor_scalar_bounds(
         inputs,
         candidate_positions,
@@ -1434,8 +1646,19 @@ function _optimize_survivor_expected_weeks_scalar_milp(
         model,
         probability[1:(number_of_weeks + 1), state_indices],
     )
-    gradient = Vector{Matrix{JuMP.VariableRef}}(undef, curvature_weeks)
-    for position in 1:curvature_weeks
+    parameter_gradient =
+        Vector{Matrix{JuMP.VariableRef}}(undef, parameter_state_count)
+    for position in 1:parameter_state_count
+        parameter_gradient[position] = @variable(
+            model,
+            [state_indices, 1:parameter_count],
+        )
+    end
+    gradient =
+        Vector{Union{Nothing,Matrix{JuMP.VariableRef}}}(undef, curvature_weeks)
+    fill!(gradient, nothing)
+    for position in gradient_switch_position:curvature_weeks
+        isempty(gradient_reference_indices[position]) && continue
         gradient[position] = @variable(
             model,
             [state_indices, 1:length(gradient_reference_indices[position])],
@@ -1455,6 +1678,26 @@ function _optimize_survivor_expected_weeks_scalar_milp(
             probability[position, loss_state],
             bounds.probability.upper[position, loss_state],
         )
+        if position <= parameter_state_count
+            for parameter in 1:parameter_count
+                set_lower_bound(
+                    parameter_gradient[position][loss_state, parameter],
+                    bounds.parameter_gradient.lower[
+                        position,
+                        loss_state,
+                        parameter,
+                    ],
+                )
+                set_upper_bound(
+                    parameter_gradient[position][loss_state, parameter],
+                    bounds.parameter_gradient.upper[
+                        position,
+                        loss_state,
+                        parameter,
+                    ],
+                )
+            end
+        end
         if position <= curvature_weeks + 1
             set_lower_bound(
                 hessian[position, loss_state],
@@ -1465,14 +1708,15 @@ function _optimize_survivor_expected_weeks_scalar_milp(
                 bounds.hessian.upper[position, loss_state],
             )
         end
-        if position <= curvature_weeks
+        if position <= curvature_weeks && gradient[position] !== nothing
             for (slot, reference) in enumerate(gradient_reference_indices[position])
+                gradient_state = gradient[position]::Matrix{JuMP.VariableRef}
                 set_lower_bound(
-                    gradient[position][loss_state, slot],
+                    gradient_state[loss_state, slot],
                     bounds.gradient.lower[position, loss_state, reference],
                 )
                 set_upper_bound(
-                    gradient[position][loss_state, slot],
+                    gradient_state[loss_state, slot],
                     bounds.gradient.upper[position, loss_state, reference],
                 )
             end
@@ -1487,9 +1731,20 @@ function _optimize_survivor_expected_weeks_scalar_milp(
         if curvature_weeks >= 0
             @constraint(model, hessian[1, loss_state] == 0.0)
         end
-        if curvature_weeks >= 1
+        if parameter_state_count >= 1
+            for parameter in 1:parameter_count
+                @constraint(
+                    model,
+                    parameter_gradient[1][loss_state, parameter] == 0.0,
+                )
+            end
+        elseif curvature_weeks >= 1 && gradient[1] !== nothing
             for slot in axes(gradient[1], 2)
-                @constraint(model, gradient[1][loss_state, slot] == 0.0)
+                gradient_state = gradient[1]::Matrix{JuMP.VariableRef}
+                @constraint(
+                    model,
+                    gradient_state[loss_state, slot] == 0.0,
+                )
             end
         end
     end
@@ -1538,57 +1793,49 @@ function _optimize_survivor_expected_weeks_scalar_milp(
             probability_difference =
                 probability[position, loss_state] -
                 previous_probability
-            if position < curvature_weeks
-                next_references = gradient_reference_indices[position + 1]
-                for reference in next_references
-                    next_slot = gradient_reference_slots[position + 1][reference]
-                    gradient_recurrences = Dict{Int,Any}()
-                    gradient_dummy_starts = Dict{Int,Float64}()
+            if position < parameter_state_count
+                parameter_gradient_target = parameter_gradient[position + 1]
+                for parameter in 1:parameter_count
+                    parameter_gradient_recurrences = Dict{Int,Any}()
+                    parameter_gradient_dummy_starts = Dict{Int,Float64}()
                     for index in indices
                         derivative = inputs.derivatives[index]
-                        current_slot = get(
-                            gradient_reference_slots[position],
-                            reference,
-                            nothing,
-                        )
-                        current_gradient =
-                            current_slot === nothing ?
+                        previous_parameter_gradient =
+                            loss_state == 1 ?
                             0.0 :
-                            gradient[position][loss_state, current_slot]
-                        previous_gradient =
-                            loss_state == 1 || current_slot === nothing ?
-                            0.0 :
-                            gradient[position][loss_state - 1, current_slot]
-                        gradient_recurrences[index] =
+                            parameter_gradient[position][
+                                loss_state - 1,
+                                parameter,
+                            ]
+                        parameter_gradient_recurrences[index] =
                             derivative.base_probability *
-                            current_gradient +
+                            parameter_gradient[position][
+                                loss_state,
+                                parameter,
+                            ] +
                             (1.0 - derivative.base_probability) *
-                            previous_gradient +
-                            inputs.covariance_gradient_gram[index, reference] *
+                            previous_parameter_gradient +
+                            derivative.gradient[parameter] *
                             probability_difference
-                        gradient_dummy_starts[index] =
+                        parameter_gradient_dummy_starts[index] =
                             index in warm_start_selected ?
                             derivative.base_probability *
-                            (
-                                current_slot === nothing ?
-                                0.0 :
-                                warm_start.gradient[
-                                    position,
-                                    loss_state,
-                                    reference,
-                                ]
-                            ) +
+                            warm_start.parameter_gradient[
+                                position,
+                                loss_state,
+                                parameter,
+                            ] +
                             (1.0 - derivative.base_probability) *
                             (
-                                loss_state == 1 || current_slot === nothing ?
+                                loss_state == 1 ?
                                 0.0 :
-                                warm_start.gradient[
+                                warm_start.parameter_gradient[
                                     position,
                                     loss_state - 1,
-                                    reference,
+                                    parameter,
                                 ]
                             ) +
-                            inputs.covariance_gradient_gram[index, reference] *
+                            derivative.gradient[parameter] *
                             (
                                 warm_start.probability[position, loss_state] -
                                 (
@@ -1604,7 +1851,139 @@ function _optimize_survivor_expected_weeks_scalar_milp(
                     end
                     _survivor_add_one_hot_dummies!(
                         model,
-                        gradient[position + 1][loss_state, next_slot],
+                        parameter_gradient_target[loss_state, parameter],
+                        parameter_gradient_recurrences,
+                        selected,
+                        bounds.candidate_parameter_gradient.lower[
+                            :, loss_state, parameter
+                        ],
+                        bounds.candidate_parameter_gradient.upper[
+                            :, loss_state, parameter
+                        ],
+                        indices,
+                        dummy_start_values=parameter_gradient_dummy_starts,
+                    )
+                end
+            end
+            if position < curvature_weeks &&
+                    position + 1 >= gradient_switch_position
+                next_references = gradient_reference_indices[position + 1]
+                for reference in next_references
+                    next_slot = gradient_reference_slots[position + 1][reference]
+                    gradient_recurrences = Dict{Int,Any}()
+                    gradient_dummy_starts = Dict{Int,Float64}()
+                    current_slot = get(
+                        gradient_reference_slots[position],
+                        reference,
+                        nothing,
+                    )
+                    if position < gradient_switch_position
+                        current_gradient = current_slot === nothing ?
+                            0.0 :
+                            _survivor_parameter_gradient_contraction(
+                                parameter_gradient[position],
+                                loss_state,
+                                reference,
+                                inputs,
+                            )
+                        warm_current_gradient = current_slot === nothing ?
+                            0.0 :
+                            _survivor_parameter_gradient_contraction(
+                                @view(warm_start.parameter_gradient[
+                                    position,
+                                    :,
+                                    :
+                                ]),
+                                loss_state,
+                                reference,
+                                inputs,
+                            )
+                        previous_gradient =
+                            loss_state == 1 || current_slot === nothing ?
+                            0.0 :
+                            _survivor_parameter_gradient_contraction(
+                                parameter_gradient[position],
+                                loss_state - 1,
+                                reference,
+                                inputs,
+                            )
+                        warm_previous_gradient =
+                            loss_state == 1 || current_slot === nothing ?
+                            0.0 :
+                            _survivor_parameter_gradient_contraction(
+                                @view(warm_start.parameter_gradient[
+                                    position,
+                                    :,
+                                    :
+                                ]),
+                                loss_state - 1,
+                                reference,
+                                inputs,
+                            )
+                    else
+                        current_gradient = current_slot === nothing ?
+                            0.0 :
+                            (gradient[position]::Matrix{JuMP.VariableRef})[
+                                loss_state,
+                                current_slot,
+                            ]
+                        warm_current_gradient = current_slot === nothing ?
+                            0.0 :
+                            warm_start.gradient[
+                                position,
+                                loss_state,
+                                reference,
+                            ]
+                        previous_gradient =
+                            loss_state == 1 || current_slot === nothing ?
+                            0.0 :
+                            (gradient[position]::Matrix{JuMP.VariableRef})[
+                                loss_state - 1,
+                                current_slot,
+                            ]
+                        warm_previous_gradient =
+                            loss_state == 1 || current_slot === nothing ?
+                            0.0 :
+                            warm_start.gradient[
+                                position,
+                                loss_state - 1,
+                                reference,
+                            ]
+                    end
+                    for index in indices
+                        derivative = inputs.derivatives[index]
+                        gradient_recurrences[index] =
+                            derivative.base_probability *
+                            current_gradient +
+                            (1.0 - derivative.base_probability) *
+                            previous_gradient +
+                            inputs.covariance_gradient_gram[index, reference] *
+                            probability_difference
+                        gradient_dummy_starts[index] =
+                            index in warm_start_selected ?
+                            derivative.base_probability *
+                            warm_current_gradient +
+                            (1.0 - derivative.base_probability) *
+                            warm_previous_gradient +
+                            inputs.covariance_gradient_gram[index, reference] *
+                            (
+                                warm_start.probability[position, loss_state] -
+                                (
+                                    loss_state == 1 ?
+                                    0.0 :
+                                    warm_start.probability[
+                                        position,
+                                        loss_state - 1,
+                                    ]
+                                )
+                            ) :
+                            0.0
+                    end
+                    target_gradient =
+                        gradient[position + 1]::Matrix{JuMP.VariableRef}
+                    _survivor_add_one_hot_dummies!(
+                        model,
+                        target_gradient[loss_state, next_slot],
                         gradient_recurrences,
                         selected,
                         bounds.candidate_gradient.lower[
@@ -1632,17 +2011,86 @@ function _optimize_survivor_expected_weeks_scalar_milp(
                         index,
                         nothing,
                     )
-                    current_gradient =
-                        current_gradient_slot === nothing ?
-                        0.0 :
-                        gradient[position][loss_state, current_gradient_slot]
-                    previous_gradient_for_selected =
-                        loss_state == 1 || current_gradient_slot === nothing ?
-                        0.0 :
-                        gradient[position][
-                            loss_state - 1,
-                            current_gradient_slot,
-                        ]
+                    if position < gradient_switch_position
+                        current_gradient = current_gradient_slot === nothing ?
+                            0.0 :
+                            _survivor_parameter_gradient_contraction(
+                                parameter_gradient[position],
+                                loss_state,
+                                index,
+                                inputs,
+                            )
+                        previous_gradient_for_selected =
+                            loss_state == 1 ||
+                                    current_gradient_slot === nothing ?
+                            0.0 :
+                            _survivor_parameter_gradient_contraction(
+                                parameter_gradient[position],
+                                loss_state - 1,
+                                index,
+                                inputs,
+                            )
+                        warm_current_gradient =
+                            current_gradient_slot === nothing ?
+                            0.0 :
+                            _survivor_parameter_gradient_contraction(
+                                @view(warm_start.parameter_gradient[
+                                    position,
+                                    :,
+                                    :
+                                ]),
+                                loss_state,
+                                index,
+                                inputs,
+                            )
+                        warm_previous_gradient =
+                            loss_state == 1 ||
+                                    current_gradient_slot === nothing ?
+                            0.0 :
+                            _survivor_parameter_gradient_contraction(
+                                @view(warm_start.parameter_gradient[
+                                    position,
+                                    :,
+                                    :
+                                ]),
+                                loss_state - 1,
+                                index,
+                                inputs,
+                            )
+                    else
+                        current_gradient =
+                            current_gradient_slot === nothing ?
+                            0.0 :
+                            (gradient[position]::Matrix{JuMP.VariableRef})[
+                                loss_state,
+                                current_gradient_slot,
+                            ]
+                        previous_gradient_for_selected =
+                            loss_state == 1 ||
+                                    current_gradient_slot === nothing ?
+                            0.0 :
+                            (gradient[position]::Matrix{JuMP.VariableRef})[
+                                loss_state - 1,
+                                current_gradient_slot,
+                            ]
+                        warm_current_gradient =
+                            current_gradient_slot === nothing ?
+                            0.0 :
+                            warm_start.gradient[
+                                position,
+                                loss_state,
+                                index,
+                            ]
+                        warm_previous_gradient =
+                            loss_state == 1 ||
+                                    current_gradient_slot === nothing ?
+                            0.0 :
+                            warm_start.gradient[
+                                position,
+                                loss_state - 1,
+                                index,
+                            ]
+                    end
                     hessian_recurrences[index] =
                         derivative.base_probability *
                         hessian[position, loss_state] +
@@ -1679,25 +2127,8 @@ function _optimize_survivor_expected_weeks_scalar_milp(
                         ) +
                         2.0 *
                         (
-                            (
-                                current_gradient_slot === nothing ?
-                                0.0 :
-                                warm_start.gradient[
-                                    position,
-                                    loss_state,
-                                    index,
-                                ]
-                            ) -
-                            (
-                                loss_state == 1 ||
-                                        current_gradient_slot === nothing ?
-                                0.0 :
-                                warm_start.gradient[
-                                    position,
-                                    loss_state - 1,
-                                    index,
-                                ]
-                            )
+                            warm_current_gradient -
+                            warm_previous_gradient
                         ) :
                         0.0
                 end
@@ -1782,23 +2213,51 @@ function _optimize_survivor_expected_weeks_scalar_milp(
                     index,
                     nothing,
                 )
-                terminal_gradient = current_gradient_slot === nothing ?
-                    0.0 :
-                    gradient[position][
-                        losses_to_elimination,
-                        current_gradient_slot,
-                    ]
+                if position < gradient_switch_position
+                    terminal_gradient = current_gradient_slot === nothing ?
+                        0.0 :
+                        _survivor_parameter_gradient_contraction(
+                            parameter_gradient[position],
+                            losses_to_elimination,
+                            index,
+                            inputs,
+                        )
+                    warm_terminal_gradient =
+                        current_gradient_slot === nothing ?
+                        0.0 :
+                        _survivor_parameter_gradient_contraction(
+                            @view(warm_start.parameter_gradient[
+                                position,
+                                :,
+                                :
+                            ]),
+                            losses_to_elimination,
+                            index,
+                            inputs,
+                        )
+                else
+                    terminal_gradient =
+                        current_gradient_slot === nothing ?
+                        0.0 :
+                        (gradient[position]::Matrix{JuMP.VariableRef})[
+                            losses_to_elimination,
+                            current_gradient_slot,
+                        ]
+                    warm_terminal_gradient =
+                        current_gradient_slot === nothing ?
+                        0.0 :
+                        warm_start.gradient[
+                            position,
+                            losses_to_elimination,
+                            index,
+                        ]
+                end
                 adjusted_sum_recurrences[index] =
                     current_adjusted_sum -
                     (1.0 - derivative.base_probability) *
                     (probability_terminal + 0.5 * hessian_terminal) +
                     0.5 * derivative.hessian_covariance * probability_terminal +
                     terminal_gradient
-                current_gradient_slot = get(
-                    gradient_reference_slots[position],
-                    index,
-                    nothing,
-                )
                 adjusted_sum_dummy_starts[index] =
                     index in warm_start_selected ?
                     warm_current_adjusted_sum -
@@ -1809,15 +2268,7 @@ function _optimize_survivor_expected_weeks_scalar_milp(
                     ) +
                     0.5 * derivative.hessian_covariance *
                     warm_probability_terminal +
-                    (
-                        current_gradient_slot === nothing ?
-                        0.0 :
-                        warm_start.gradient[
-                            position,
-                            losses_to_elimination,
-                            index,
-                        ]
-                    ) :
+                    warm_terminal_gradient :
                     0.0
             end
             _survivor_add_one_hot_dummies!(
@@ -1847,11 +2298,13 @@ function _optimize_survivor_expected_weeks_scalar_milp(
     _set_survivor_scalar_warm_start!(
         selected,
         probability,
+        parameter_gradient,
         gradient,
         hessian,
         warm_start,
         candidate_indices,
         gradient_reference_indices,
+        gradient_switch_position,
         number_of_weeks,
         losses_to_elimination,
         curvature_weeks,

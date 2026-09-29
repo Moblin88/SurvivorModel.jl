@@ -546,6 +546,250 @@ end
         @test single_bounds.candidate_probability.upper[1, 1] >= 0.8
     end
 
+    @testset "hybrid gradient state selection" begin
+        @test SurvivorModel._survivor_gradient_switch_position(
+            [[1, 2], [3], [1, 2, 3], [2, 4]],
+            2,
+        ) == 4
+        @test SurvivorModel._survivor_gradient_switch_position(
+            [[1], [1, 2, 3]],
+            2,
+        ) == 3
+        @test SurvivorModel._survivor_gradient_switch_position(
+            [Int[], [1, 2]],
+            2,
+        ) == 1
+        @test SurvivorModel._survivor_gradient_switch_position(
+            Vector{Vector{Int}}(),
+            2,
+        ) == 1
+
+        parameter_keys = [(:td, "A"), (:td, "B")]
+        parameters = SurvivorModel.SurvivorParameterSystem(
+            parameter_keys,
+            Dict(key => index for (index, key) in enumerate(parameter_keys)),
+            [0.0, 0.0],
+            [0.7, 1.2],
+        )
+        derivatives = [
+            SurvivorModel.SurvivorCandidateDerivatives(
+                probability,
+                gradient,
+                hessian_covariance,
+            )
+            for (probability, gradient, hessian_covariance) in (
+                (0.82, [1.0, 1.0], 0.03),
+                (0.71, [1.1, 0.9], -0.02),
+                (0.77, [0.9, 1.2], 0.01),
+                (0.63, [1.2, 1.1], -0.01),
+                (0.88, [0.8, 1.3], 0.02),
+                (0.68, [1.3, 0.8], -0.03),
+            )
+        ]
+        inputs = SurvivorModel.SurvivorObjectiveInputs(
+            parameters,
+            derivatives,
+        )
+        candidate_positions = [1, 1, 2, 2, 3, 3]
+        references = SurvivorModel._survivor_gradient_reference_indices(
+            candidate_positions,
+            3,
+            inputs.covariance_gradient_gram;
+            maximum_reference_position=3,
+        )
+        @test length.(references) == [0, 4, 2]
+        switch_position =
+            SurvivorModel._survivor_gradient_switch_position(references, 2)
+        @test switch_position == 3
+        tracked_widths = [
+            position < switch_position ? 2 : length(references[position])
+            for position in eachindex(references)
+        ]
+        @test tracked_widths == [2, 2, 2]
+        @test all(width -> width <= 2, tracked_widths)
+
+        selected = [1, 3, 5]
+        values = SurvivorModel._survivor_scalar_forward_values(
+            selected,
+            inputs,
+            3,
+            2;
+            curvature_weeks=3,
+            gradient_reference_indices=references,
+        )
+        for position in eachindex(references),
+            loss_state in 1:2,
+            reference in references[position]
+            projected_gradient =
+                SurvivorModel._survivor_parameter_gradient_contraction(
+                    @view(values.parameter_gradient[position, :, :]),
+                    loss_state,
+                    reference,
+                    inputs,
+                )
+            @test values.gradient[position, loss_state, reference] ≈
+                  projected_gradient
+        end
+        bounds = SurvivorModel._survivor_scalar_bounds(
+            inputs,
+            candidate_positions,
+            3,
+            2;
+            curvature_weeks=3,
+            gradient_reference_indices=references,
+        )
+        @test all(
+            values.parameter_gradient .>= bounds.parameter_gradient.lower,
+        )
+        @test all(
+            values.parameter_gradient .<= bounds.parameter_gradient.upper,
+        )
+
+        candidates = DataFrame(
+            game_id=["w1", "w1", "w2", "w2", "w3", "w3"],
+            week=candidate_positions,
+            team=["A", "B", "C", "D", "E", "F"],
+            opponent=["X", "Y", "U", "V", "W", "Z"],
+            is_home=[true, false, true, false, true, false],
+            win_probability=[derivative.base_probability for derivative in derivatives],
+        )
+        state = SurvivorPoolState(2025, 1; strikes_remaining=2)
+        data = SurvivorModel._normalize_survivor_candidates(
+            candidates,
+            state,
+            3,
+        )
+        config = SurvivorSelectionConfig(
+            minimum_favorite_spread=nothing,
+            market_guard_weeks=0,
+            through_week=3,
+            hessian_weeks=3,
+        )
+        plan = SurvivorModel._optimize_survivor_expected_weeks_scalar_milp(
+            data,
+            state,
+            config,
+            inputs,
+        )
+        selected_by_position =
+            SurvivorModel._survivor_fixed_selected_indices(
+                data,
+                plan.selections,
+                state,
+                3,
+            )
+        selected_values = SurvivorModel._survivor_scalar_forward_values(
+            selected_by_position,
+            inputs,
+            3,
+            2;
+            curvature_weeks=3,
+            gradient_reference_indices=references,
+        )
+        objective(values) = sum(
+            values.probability[position + 1, loss_state] +
+            0.5 * values.hessian[position + 1, loss_state]
+            for position in 1:3,
+            loss_state in 1:2
+        )
+        exhaustive_objective = maximum(
+            objective(
+                SurvivorModel._survivor_scalar_forward_values(
+                    [first, second, third],
+                    inputs,
+                    3,
+                    2;
+                    curvature_weeks=3,
+                    gradient_reference_indices=references,
+                ),
+            )
+            for first in 1:2, second in 3:4, third in 5:6
+        )
+        @test plan.objective_value ≈ objective(selected_values)
+        @test plan.objective_value ≈ exhaustive_objective
+
+        parameter_only_positions = [1, 1, 1, 2, 2, 2]
+        parameter_only_references =
+            SurvivorModel._survivor_gradient_reference_indices(
+                parameter_only_positions,
+                2,
+                inputs.covariance_gradient_gram;
+                maximum_reference_position=2,
+            )
+        @test length.(parameter_only_references) == [0, 3]
+        @test SurvivorModel._survivor_gradient_switch_position(
+            parameter_only_references,
+            2,
+        ) == 3
+        parameter_only_candidates = DataFrame(
+            game_id=["p1", "p1", "p1", "p2", "p2", "p2"],
+            week=parameter_only_positions,
+            team=["A", "B", "C", "D", "E", "F"],
+            opponent=["X", "Y", "Z", "U", "V", "W"],
+            is_home=[true, false, true, false, true, false],
+            win_probability=[
+                derivative.base_probability for derivative in derivatives
+            ],
+        )
+        parameter_only_data =
+            SurvivorModel._normalize_survivor_candidates(
+                parameter_only_candidates,
+                state,
+                2,
+            )
+        parameter_only_config = SurvivorSelectionConfig(
+            minimum_favorite_spread=nothing,
+            market_guard_weeks=0,
+            through_week=2,
+            hessian_weeks=2,
+        )
+        parameter_only_plan =
+            SurvivorModel._optimize_survivor_expected_weeks_scalar_milp(
+                parameter_only_data,
+                state,
+                parameter_only_config,
+                inputs,
+            )
+        parameter_only_selected =
+            SurvivorModel._survivor_fixed_selected_indices(
+                parameter_only_data,
+                parameter_only_plan.selections,
+                state,
+                2,
+            )
+        parameter_only_objective(values) = sum(
+            values.probability[position + 1, loss_state] +
+            0.5 * values.hessian[position + 1, loss_state]
+            for position in 1:2,
+            loss_state in 1:2
+        )
+        parameter_only_values = SurvivorModel._survivor_scalar_forward_values(
+            parameter_only_selected,
+            inputs,
+            2,
+            2;
+            curvature_weeks=2,
+            gradient_reference_indices=parameter_only_references,
+        )
+        parameter_only_exhaustive = maximum(
+            parameter_only_objective(
+                SurvivorModel._survivor_scalar_forward_values(
+                    [first, second],
+                    inputs,
+                    2,
+                    2;
+                    curvature_weeks=2,
+                    gradient_reference_indices=parameter_only_references,
+                ),
+            )
+            for first in 1:3, second in 4:6
+        )
+        @test parameter_only_plan.objective_value ≈
+              parameter_only_objective(parameter_only_values)
+        @test parameter_only_plan.objective_value ≈
+              parameter_only_exhaustive
+    end
+
     @testset "one-hot dummy product hull" begin
         model = SurvivorModel.JuMP.Model(SurvivorModel.HiGHS.Optimizer)
         SurvivorModel.JuMP.set_silent(model)

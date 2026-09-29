@@ -51,6 +51,17 @@ Hessian contraction and gradient cross term. Signed interval recurrences
 provide finite bounds for parameter-gradient, candidate-gradient, probability,
 and Hessian dummy products.
 
+The interval recurrences include one pass over all candidate histories and a
+team-leave-out pass for each distinct candidate team. The leave-out pass
+excludes that team from every earlier transition, making its candidate-specific
+interval valid when that candidate is selected. Product dummies use this
+conditioned interval on the selected branch and the all-history interval on
+the unselected branch, where the team may have appeared earlier. Shared
+successor-state bounds are tightened to the envelope of these conditioned
+candidate intervals. This reuses the existing product-hull inequalities and
+adds no auxiliary variables or separate cut family; a conditioned endpoint
+can make an existing hull side active.
+
 Redundant aggregate recurrences directly constrain the weekly probability sum
 through the full horizon and the adjusted objective sum through the retained
 Hessian prefix. The probability aggregate is also constrained to be

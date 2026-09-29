@@ -825,6 +825,8 @@ function _survivor_add_one_hot_dummies!(
     candidate_indices,
     ;
     dummy_start_values=nothing,
+    recurrence_lower=candidate_lower,
+    recurrence_upper=candidate_upper,
 )
     isempty(candidate_indices) &&
         throw(ArgumentError("survivor one-hot dummies require candidates"))
@@ -838,7 +840,18 @@ function _survivor_add_one_hot_dummies!(
         upper = Float64(candidate_upper[index])
         lower <= upper && isfinite(lower) && isfinite(upper) ||
             throw(ArgumentError(
-                "survivor one-hot dummy bounds must be finite and ordered",
+                "survivor selected-branch dummy bounds must be finite and ordered",
+            ))
+        all_lower = Float64(recurrence_lower[index])
+        all_upper = Float64(recurrence_upper[index])
+        all_lower <= all_upper &&
+                isfinite(all_lower) && isfinite(all_upper) ||
+            throw(ArgumentError(
+                "survivor all-history recurrence bounds must be finite and ordered",
+            ))
+        all_lower <= lower <= upper <= all_upper ||
+            throw(ArgumentError(
+                "survivor selected-branch bounds must lie within all-history bounds",
             ))
         start_value = if dummy_start_values === nothing
             nothing
@@ -855,9 +868,21 @@ function _survivor_add_one_hot_dummies!(
             value
         end
         if lower == upper
-            dummies[index] = iszero(lower) ?
+            dummy = iszero(lower) ?
                 JuMP.AffExpr(0.0) :
                 lower * selected[index]
+            if all_lower != lower || all_upper != upper
+                recurrence = recurrences[index]
+                @constraint(
+                    model,
+                    dummy >= recurrence - all_upper * (1.0 - selected[index]),
+                )
+                @constraint(
+                    model,
+                    dummy <= recurrence - all_lower * (1.0 - selected[index]),
+                )
+            end
+            dummies[index] = dummy
             continue
         end
         dummy = @variable(model)
@@ -878,11 +903,11 @@ function _survivor_add_one_hot_dummies!(
         end
         @constraint(
             model,
-            dummy >= recurrence - upper * (1.0 - selected[index]),
+            dummy >= recurrence - all_upper * (1.0 - selected[index]),
         )
         @constraint(
             model,
-            dummy <= recurrence - lower * (1.0 - selected[index]),
+            dummy <= recurrence - all_lower * (1.0 - selected[index]),
         )
         if start_value !== nothing
             set_start_value(dummy, start_value)
@@ -896,7 +921,7 @@ function _survivor_add_one_hot_dummies!(
     return dummies
 end
 
-function _survivor_scalar_bounds(
+function _survivor_scalar_bounds_pass(
     inputs::SurvivorObjectiveInputs,
     candidate_positions::AbstractVector{<:Integer},
     number_of_weeks::Integer,
@@ -904,11 +929,21 @@ function _survivor_scalar_bounds(
     ;
     curvature_weeks::Integer=number_of_weeks,
     gradient_reference_indices=nothing,
+    candidate_teams=nothing,
+    excluded_team=nothing,
 )
     n_candidates = length(inputs.derivatives)
     length(candidate_positions) == n_candidates ||
         throw(ArgumentError(
             "survivor candidate positions must match derivative inputs",
+        ))
+    candidate_teams === nothing || length(candidate_teams) == n_candidates ||
+        throw(ArgumentError(
+            "survivor candidate teams must match derivative inputs",
+        ))
+    excluded_team === nothing || candidate_teams !== nothing ||
+        throw(ArgumentError(
+            "survivor leave-out bounds require candidate teams",
         ))
     all(
         position -> 1 <= position <= number_of_weeks,
@@ -927,6 +962,24 @@ function _survivor_scalar_bounds(
         throw(ArgumentError(
             "survivor derivative bounds require candidates in every week",
         ))
+    history_week_indices = if excluded_team === nothing
+        week_indices
+    else
+        [
+            filter(
+                index -> !isequal(candidate_teams[index], excluded_team),
+                week_indices[position],
+            )
+            for position in 1:number_of_weeks
+        ]
+    end
+    history_reachable = falses(number_of_weeks + 1)
+    history_reachable[1] = true
+    for position in 1:number_of_weeks
+        history_reachable[position + 1] =
+            history_reachable[position] &&
+            !isempty(history_week_indices[position])
+    end
     gradient_reference_indices = isnothing(gradient_reference_indices) ?
         [collect(1:n_candidates) for _ in 1:curvature_weeks] :
         gradient_reference_indices
@@ -1210,15 +1263,17 @@ function _survivor_scalar_bounds(
         end
 
         for loss_state in 1:losses_to_elimination
+            eligible_indices = history_week_indices[position]
+            isempty(eligible_indices) && continue
             probability_lower[position + 1, loss_state],
                 probability_upper[position + 1, loss_state] =
                 minimum(
                     candidate_probability_lower[index, loss_state]
-                    for index in week_indices[position]
+                    for index in eligible_indices
                 ),
                 maximum(
                     candidate_probability_upper[index, loss_state]
-                    for index in week_indices[position]
+                    for index in eligible_indices
                 )
             if position < curvature_weeks
                 for reference in gradient_reference_indices[position + 1]
@@ -1230,7 +1285,7 @@ function _survivor_scalar_bounds(
                                 loss_state,
                                 reference,
                             ]
-                            for index in week_indices[position]
+                            for index in eligible_indices
                         ),
                         maximum(
                             candidate_gradient_upper[
@@ -1238,7 +1293,7 @@ function _survivor_scalar_bounds(
                                 loss_state,
                                 reference,
                             ]
-                            for index in week_indices[position]
+                            for index in eligible_indices
                         )
                 end
                 for parameter in 1:n_parameters
@@ -1258,7 +1313,7 @@ function _survivor_scalar_bounds(
                             loss_state,
                             parameter,
                         ]
-                        for index in week_indices[position]
+                        for index in eligible_indices
                     ),
                     maximum(
                         candidate_parameter_gradient_upper[
@@ -1266,7 +1321,7 @@ function _survivor_scalar_bounds(
                             loss_state,
                             parameter,
                         ]
-                        for index in week_indices[position]
+                        for index in eligible_indices
                     )
                 end
             end
@@ -1275,11 +1330,11 @@ function _survivor_scalar_bounds(
                     hessian_upper[position + 1, loss_state] =
                     minimum(
                         candidate_hessian_lower[index, loss_state]
-                        for index in week_indices[position]
+                        for index in eligible_indices
                     ),
                     maximum(
                         candidate_hessian_upper[index, loss_state]
-                        for index in week_indices[position]
+                        for index in eligible_indices
                     )
             end
         end
@@ -1317,6 +1372,261 @@ function _survivor_scalar_bounds(
         candidate_hessian=(
             lower=candidate_hessian_lower,
             upper=candidate_hessian_upper,
+        ),
+        history_reachable=history_reachable,
+    )
+end
+
+function _survivor_bound_intersection(
+    all_history_lower::Float64,
+    all_history_upper::Float64,
+    conditioned_lowers,
+    conditioned_uppers,
+)
+    lower = max(all_history_lower, minimum(conditioned_lowers))
+    upper = min(all_history_upper, maximum(conditioned_uppers))
+    lower <= upper ||
+        throw(ArgumentError(
+            "team-leave-out survivor bounds do not intersect all-history bounds",
+        ))
+    return lower, upper
+end
+
+function _survivor_scalar_bounds(
+    inputs::SurvivorObjectiveInputs,
+    candidate_positions::AbstractVector{<:Integer},
+    number_of_weeks::Integer,
+    losses_to_elimination::Integer,
+    ;
+    curvature_weeks::Integer=number_of_weeks,
+    gradient_reference_indices=nothing,
+    candidate_teams=nothing,
+)
+    n_candidates = length(inputs.derivatives)
+    candidate_teams === nothing || length(candidate_teams) == n_candidates ||
+        throw(ArgumentError(
+            "survivor candidate teams must match derivative inputs",
+        ))
+    candidate_teams === nothing || !any(ismissing, candidate_teams) ||
+        throw(ArgumentError("survivor candidate teams cannot be missing"))
+    references = isnothing(gradient_reference_indices) ?
+        [collect(1:n_candidates) for _ in 1:curvature_weeks] :
+        gradient_reference_indices
+    all_history = _survivor_scalar_bounds_pass(
+        inputs,
+        candidate_positions,
+        number_of_weeks,
+        losses_to_elimination;
+        curvature_weeks=curvature_weeks,
+        gradient_reference_indices=references,
+        candidate_teams=candidate_teams,
+    )
+    candidate_teams === nothing && return all_history
+
+    selected_candidate_probability_lower =
+        copy(all_history.candidate_probability.lower)
+    selected_candidate_probability_upper =
+        copy(all_history.candidate_probability.upper)
+    selected_candidate_gradient_lower =
+        copy(all_history.candidate_gradient.lower)
+    selected_candidate_gradient_upper =
+        copy(all_history.candidate_gradient.upper)
+    selected_candidate_parameter_gradient_lower =
+        copy(all_history.candidate_parameter_gradient.lower)
+    selected_candidate_parameter_gradient_upper =
+        copy(all_history.candidate_parameter_gradient.upper)
+    selected_candidate_hessian_lower =
+        copy(all_history.candidate_hessian.lower)
+    selected_candidate_hessian_upper =
+        copy(all_history.candidate_hessian.upper)
+
+    for team in unique(candidate_teams)
+        leave_out_bounds = _survivor_scalar_bounds_pass(
+            inputs,
+            candidate_positions,
+            number_of_weeks,
+            losses_to_elimination;
+            curvature_weeks=curvature_weeks,
+            gradient_reference_indices=references,
+            candidate_teams=candidate_teams,
+            excluded_team=team,
+        )
+        for index in 1:n_candidates
+            isequal(candidate_teams[index], team) || continue
+            position = Int(candidate_positions[index])
+            leave_out_bounds.history_reachable[position] || continue
+            selected_candidate_probability_lower[index, :] .=
+                leave_out_bounds.candidate_probability.lower[index, :]
+            selected_candidate_probability_upper[index, :] .=
+                leave_out_bounds.candidate_probability.upper[index, :]
+            selected_candidate_gradient_lower[index, :, :] .=
+                leave_out_bounds.candidate_gradient.lower[index, :, :]
+            selected_candidate_gradient_upper[index, :, :] .=
+                leave_out_bounds.candidate_gradient.upper[index, :, :]
+            selected_candidate_parameter_gradient_lower[index, :, :] .=
+                leave_out_bounds.candidate_parameter_gradient.lower[
+                    index,
+                    :,
+                    :,
+                ]
+            selected_candidate_parameter_gradient_upper[index, :, :] .=
+                leave_out_bounds.candidate_parameter_gradient.upper[
+                    index,
+                    :,
+                    :,
+                ]
+            selected_candidate_hessian_lower[index, :] .=
+                leave_out_bounds.candidate_hessian.lower[index, :]
+            selected_candidate_hessian_upper[index, :] .=
+                leave_out_bounds.candidate_hessian.upper[index, :]
+        end
+    end
+
+    week_indices = [
+        findall(==(position), candidate_positions)
+        for position in 1:number_of_weeks
+    ]
+    probability_lower = copy(all_history.probability.lower)
+    probability_upper = copy(all_history.probability.upper)
+    for position in 1:number_of_weeks, loss_state in 1:losses_to_elimination
+        probability_lower[position + 1, loss_state],
+            probability_upper[position + 1, loss_state] =
+            _survivor_bound_intersection(
+                all_history.probability.lower[position + 1, loss_state],
+                all_history.probability.upper[position + 1, loss_state],
+                (
+                    selected_candidate_probability_lower[index, loss_state]
+                    for index in week_indices[position]
+                ),
+                (
+                    selected_candidate_probability_upper[index, loss_state]
+                    for index in week_indices[position]
+                ),
+            )
+    end
+
+    parameter_gradient_lower = copy(all_history.parameter_gradient.lower)
+    parameter_gradient_upper = copy(all_history.parameter_gradient.upper)
+    for position in 1:max(0, curvature_weeks - 1),
+        loss_state in 1:losses_to_elimination,
+        parameter in eachindex(inputs.parameters.keys)
+        parameter_gradient_lower[position + 1, loss_state, parameter],
+            parameter_gradient_upper[position + 1, loss_state, parameter] =
+            _survivor_bound_intersection(
+                all_history.parameter_gradient.lower[
+                    position + 1,
+                    loss_state,
+                    parameter,
+                ],
+                all_history.parameter_gradient.upper[
+                    position + 1,
+                    loss_state,
+                    parameter,
+                ],
+                (
+                    selected_candidate_parameter_gradient_lower[
+                        index,
+                        loss_state,
+                        parameter,
+                    ]
+                    for index in week_indices[position]
+                ),
+                (
+                    selected_candidate_parameter_gradient_upper[
+                        index,
+                        loss_state,
+                        parameter,
+                    ]
+                    for index in week_indices[position]
+                ),
+            )
+    end
+
+    gradient_lower = copy(all_history.gradient.lower)
+    gradient_upper = copy(all_history.gradient.upper)
+    for position in 1:max(0, curvature_weeks - 1),
+        loss_state in 1:losses_to_elimination,
+        reference in references[position + 1]
+        gradient_lower[position + 1, loss_state, reference],
+            gradient_upper[position + 1, loss_state, reference] =
+            _survivor_bound_intersection(
+                all_history.gradient.lower[
+                    position + 1,
+                    loss_state,
+                    reference,
+                ],
+                all_history.gradient.upper[
+                    position + 1,
+                    loss_state,
+                    reference,
+                ],
+                (
+                    selected_candidate_gradient_lower[
+                        index,
+                        loss_state,
+                        reference,
+                    ]
+                    for index in week_indices[position]
+                ),
+                (
+                    selected_candidate_gradient_upper[
+                        index,
+                        loss_state,
+                        reference,
+                    ]
+                    for index in week_indices[position]
+                ),
+            )
+    end
+
+    hessian_lower = copy(all_history.hessian.lower)
+    hessian_upper = copy(all_history.hessian.upper)
+    for position in 1:curvature_weeks,
+        loss_state in 1:losses_to_elimination
+        hessian_lower[position + 1, loss_state],
+            hessian_upper[position + 1, loss_state] =
+            _survivor_bound_intersection(
+                all_history.hessian.lower[position + 1, loss_state],
+                all_history.hessian.upper[position + 1, loss_state],
+                (
+                    selected_candidate_hessian_lower[index, loss_state]
+                    for index in week_indices[position]
+                ),
+                (
+                    selected_candidate_hessian_upper[index, loss_state]
+                    for index in week_indices[position]
+                ),
+            )
+    end
+
+    return merge(
+        all_history,
+        (
+            probability=(lower=probability_lower, upper=probability_upper),
+            parameter_gradient=(
+                lower=parameter_gradient_lower,
+                upper=parameter_gradient_upper,
+            ),
+            gradient=(lower=gradient_lower, upper=gradient_upper),
+            hessian=(lower=hessian_lower, upper=hessian_upper),
+            team_conditioned=(
+                candidate_probability=(
+                    lower=selected_candidate_probability_lower,
+                    upper=selected_candidate_probability_upper,
+                ),
+                candidate_parameter_gradient=(
+                    lower=selected_candidate_parameter_gradient_lower,
+                    upper=selected_candidate_parameter_gradient_upper,
+                ),
+                candidate_gradient=(
+                    lower=selected_candidate_gradient_lower,
+                    upper=selected_candidate_gradient_upper,
+                ),
+                candidate_hessian=(
+                    lower=selected_candidate_hessian_lower,
+                    upper=selected_candidate_hessian_upper,
+                ),
+            ),
         ),
     )
 end
@@ -1624,6 +1934,7 @@ function _optimize_survivor_expected_weeks_scalar_milp(
         losses_to_elimination,
         curvature_weeks=curvature_weeks,
         gradient_reference_indices=gradient_reference_indices,
+        candidate_teams=data.team,
     )
     candidate_probability_sum_lower = [
         sum(
@@ -1639,10 +1950,52 @@ function _optimize_survivor_expected_weeks_scalar_milp(
         )
         for index in candidate_indices
     ]
+    team_candidate_probability_sum_lower = [
+        sum(
+            bounds.team_conditioned.candidate_probability.lower[
+                index,
+                loss_state,
+            ]
+            for loss_state in state_indices
+        )
+        for index in candidate_indices
+    ]
+    team_candidate_probability_sum_upper = [
+        sum(
+            bounds.team_conditioned.candidate_probability.upper[
+                index,
+                loss_state,
+            ]
+            for loss_state in state_indices
+        )
+        for index in candidate_indices
+    ]
     candidate_adjusted_sum_lower = [
         candidate_probability_sum_lower[index] +
         0.5 * sum(
             bounds.candidate_hessian.lower[index, loss_state]
+            for loss_state in state_indices
+        )
+        for index in candidate_indices
+    ]
+    team_candidate_adjusted_sum_lower = [
+        team_candidate_probability_sum_lower[index] +
+        0.5 * sum(
+            bounds.team_conditioned.candidate_hessian.lower[
+                index,
+                loss_state,
+            ]
+            for loss_state in state_indices
+        )
+        for index in candidate_indices
+    ]
+    team_candidate_adjusted_sum_upper = [
+        team_candidate_probability_sum_upper[index] +
+        0.5 * sum(
+            bounds.team_conditioned.candidate_hessian.upper[
+                index,
+                loss_state,
+            ]
             for loss_state in state_indices
         )
         for index in candidate_indices
@@ -1809,10 +2162,20 @@ function _optimize_survivor_expected_weeks_scalar_milp(
                 probability[position + 1, loss_state],
                 probability_recurrences,
                 selected,
-                bounds.candidate_probability.lower[:, loss_state],
-                bounds.candidate_probability.upper[:, loss_state],
+                bounds.team_conditioned.candidate_probability.lower[
+                    :,
+                    loss_state,
+                ],
+                bounds.team_conditioned.candidate_probability.upper[
+                    :,
+                    loss_state,
+                ],
                 indices,
                 dummy_start_values=probability_dummy_starts,
+                recurrence_lower=
+                    bounds.candidate_probability.lower[:, loss_state],
+                recurrence_upper=
+                    bounds.candidate_probability.upper[:, loss_state],
             )
             probability_difference =
                 probability[position, loss_state] -
@@ -1878,14 +2241,22 @@ function _optimize_survivor_expected_weeks_scalar_milp(
                         parameter_gradient_target[loss_state, parameter],
                         parameter_gradient_recurrences,
                         selected,
-                        bounds.candidate_parameter_gradient.lower[
+                        bounds.team_conditioned.candidate_parameter_gradient.lower[
                             :, loss_state, parameter
                         ],
-                        bounds.candidate_parameter_gradient.upper[
+                        bounds.team_conditioned.candidate_parameter_gradient.upper[
                             :, loss_state, parameter
                         ],
                         indices,
                         dummy_start_values=parameter_gradient_dummy_starts,
+                        recurrence_lower=
+                            bounds.candidate_parameter_gradient.lower[
+                                :, loss_state, parameter
+                            ],
+                        recurrence_upper=
+                            bounds.candidate_parameter_gradient.upper[
+                                :, loss_state, parameter
+                            ],
                     )
                 end
             end
@@ -2010,14 +2381,22 @@ function _optimize_survivor_expected_weeks_scalar_milp(
                         target_gradient[loss_state, next_slot],
                         gradient_recurrences,
                         selected,
-                        bounds.candidate_gradient.lower[
+                        bounds.team_conditioned.candidate_gradient.lower[
                             :, loss_state, reference
                         ],
-                        bounds.candidate_gradient.upper[
+                        bounds.team_conditioned.candidate_gradient.upper[
                             :, loss_state, reference
                         ],
                         indices,
                         dummy_start_values=gradient_dummy_starts,
+                        recurrence_lower=
+                            bounds.candidate_gradient.lower[
+                                :, loss_state, reference
+                            ],
+                        recurrence_upper=
+                            bounds.candidate_gradient.upper[
+                                :, loss_state, reference
+                            ],
                     )
                 end
             end
@@ -2161,10 +2540,20 @@ function _optimize_survivor_expected_weeks_scalar_milp(
                     hessian[position + 1, loss_state],
                     hessian_recurrences,
                     selected,
-                    bounds.candidate_hessian.lower[:, loss_state],
-                    bounds.candidate_hessian.upper[:, loss_state],
+                    bounds.team_conditioned.candidate_hessian.lower[
+                        :,
+                        loss_state,
+                    ],
+                    bounds.team_conditioned.candidate_hessian.upper[
+                        :,
+                        loss_state,
+                    ],
                     indices,
                     dummy_start_values=hessian_dummy_starts,
+                    recurrence_lower=
+                        bounds.candidate_hessian.lower[:, loss_state],
+                    recurrence_upper=
+                        bounds.candidate_hessian.upper[:, loss_state],
                 )
             end
         end
@@ -2200,10 +2589,12 @@ function _optimize_survivor_expected_weeks_scalar_milp(
             next_probability_sum,
             probability_sum_recurrences,
             selected,
-            candidate_probability_sum_lower,
-            candidate_probability_sum_upper,
+            team_candidate_probability_sum_lower,
+            team_candidate_probability_sum_upper,
             indices,
             dummy_start_values=probability_sum_dummy_starts,
+            recurrence_lower=candidate_probability_sum_lower,
+            recurrence_upper=candidate_probability_sum_upper,
         )
 
         if position <= curvature_weeks
@@ -2300,10 +2691,12 @@ function _optimize_survivor_expected_weeks_scalar_milp(
                 next_adjusted_sum,
                 adjusted_sum_recurrences,
                 selected,
-                candidate_adjusted_sum_lower,
-                candidate_adjusted_sum_upper,
+                team_candidate_adjusted_sum_lower,
+                team_candidate_adjusted_sum_upper,
                 indices,
                 dummy_start_values=adjusted_sum_dummy_starts,
+                recurrence_lower=candidate_adjusted_sum_lower,
+                recurrence_upper=candidate_adjusted_sum_upper,
             )
         end
     end

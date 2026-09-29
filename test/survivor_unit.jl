@@ -574,6 +574,357 @@ end
         @test all(iszero, exact_zero_bounds.hessian.upper)
     end
 
+    @testset "team-leave-out recurrence bounds" begin
+        keys = [(:td, "A"), (:td, "B"), (:td, "C")]
+        parameters = SurvivorModel.SurvivorParameterSystem(
+            keys,
+            Dict(key => index for (index, key) in enumerate(keys)),
+            zeros(3),
+            [0.7, 1.2, 0.9],
+        )
+        derivatives = [
+            SurvivorModel.SurvivorCandidateDerivatives(
+                0.9,
+                [0.9, 0.0, 0.0],
+                0.2,
+            ),
+            SurvivorModel.SurvivorCandidateDerivatives(
+                0.6,
+                [0.0, 0.7, 0.0],
+                -0.1,
+            ),
+            SurvivorModel.SurvivorCandidateDerivatives(
+                0.4,
+                [0.0, 0.0, 0.5],
+                0.3,
+            ),
+            SurvivorModel.SurvivorCandidateDerivatives(
+                0.8,
+                [0.8, 0.1, -0.2],
+                0.1,
+            ),
+            SurvivorModel.SurvivorCandidateDerivatives(
+                0.7,
+                [-0.4, 0.5, 0.1],
+                0.15,
+            ),
+            SurvivorModel.SurvivorCandidateDerivatives(
+                0.5,
+                [0.3, -0.8, 0.6],
+                -0.2,
+            ),
+            SurvivorModel.SurvivorCandidateDerivatives(
+                0.75,
+                [0.2, 0.3, 0.4],
+                -0.12,
+            ),
+            SurvivorModel.SurvivorCandidateDerivatives(
+                0.65,
+                [0.1, -0.3, 0.5],
+                0.08,
+            ),
+            SurvivorModel.SurvivorCandidateDerivatives(
+                0.55,
+                [-0.2, 0.6, 0.1],
+                0.18,
+            ),
+        ]
+        inputs = SurvivorModel.SurvivorObjectiveInputs(parameters, derivatives)
+        positions = repeat(1:3, inner=3)
+        teams = repeat(["A", "B", "C"], 3)
+        references = SurvivorModel._survivor_gradient_reference_indices(
+            positions,
+            3,
+            inputs.covariance_gradient_gram;
+            maximum_reference_position=3,
+        )
+        bounds = SurvivorModel._survivor_scalar_bounds(
+            inputs,
+            positions,
+            3,
+            2;
+            curvature_weeks=3,
+            gradient_reference_indices=references,
+            candidate_teams=teams,
+        )
+        team_bounds = bounds.team_conditioned
+        all_history_bounds = SurvivorModel._survivor_scalar_bounds(
+            inputs,
+            positions,
+            3,
+            2;
+            curvature_weeks=3,
+            gradient_reference_indices=references,
+        )
+
+        candidate = 4
+        @test (
+            team_bounds.candidate_probability.upper[candidate, 1] -
+            team_bounds.candidate_probability.lower[candidate, 1]
+        ) < (
+            all_history_bounds.candidate_probability.upper[candidate, 1] -
+            all_history_bounds.candidate_probability.lower[candidate, 1]
+        )
+        @test (
+            team_bounds.candidate_parameter_gradient.upper[
+                candidate,
+                1,
+                1,
+            ] -
+            team_bounds.candidate_parameter_gradient.lower[
+                candidate,
+                1,
+                1,
+            ]
+        ) < (
+            all_history_bounds.candidate_parameter_gradient.upper[
+                candidate,
+                1,
+                1,
+            ] -
+            all_history_bounds.candidate_parameter_gradient.lower[
+                candidate,
+                1,
+                1,
+            ]
+        )
+        @test (
+            team_bounds.candidate_gradient.upper[
+                candidate,
+                1,
+                7,
+            ] -
+            team_bounds.candidate_gradient.lower[
+                candidate,
+                1,
+                7,
+            ]
+        ) < (
+            all_history_bounds.candidate_gradient.upper[
+                candidate,
+                1,
+                7,
+            ] -
+            all_history_bounds.candidate_gradient.lower[
+                candidate,
+                1,
+                7,
+            ]
+        )
+        @test (
+            team_bounds.candidate_hessian.upper[candidate, 1] -
+            team_bounds.candidate_hessian.lower[candidate, 1]
+        ) < (
+            all_history_bounds.candidate_hessian.upper[candidate, 1] -
+            all_history_bounds.candidate_hessian.lower[candidate, 1]
+        )
+
+        exhaustive_objectives = Float64[]
+        for first_team in 1:3, second_team in 1:3, third_team in 1:3
+            length(unique((first_team, second_team, third_team))) == 3 ||
+                continue
+            selected = [first_team, 3 + second_team, 6 + third_team]
+            values = SurvivorModel._survivor_scalar_forward_values(
+                selected,
+                inputs,
+                3,
+                2;
+                curvature_weeks=3,
+                gradient_reference_indices=references,
+            )
+            @test all(values.probability .>= bounds.probability.lower)
+            @test all(values.probability .<= bounds.probability.upper)
+            @test all(
+                values.parameter_gradient .>=
+                bounds.parameter_gradient.lower,
+            )
+            @test all(
+                values.parameter_gradient .<=
+                bounds.parameter_gradient.upper,
+            )
+            @test all(values.gradient .>= bounds.gradient.lower)
+            @test all(values.gradient .<= bounds.gradient.upper)
+            @test all(values.hessian .>= bounds.hessian.lower)
+            @test all(values.hessian .<= bounds.hessian.upper)
+            push!(
+                exhaustive_objectives,
+                sum(
+                    values.probability[position + 1, loss_state] +
+                    0.5 * values.hessian[position + 1, loss_state]
+                    for position in 1:3,
+                    loss_state in 1:2
+                ),
+            )
+
+            for position in 1:3
+                index = selected[position]
+                derivative = inputs.derivatives[index]
+                for loss_state in 1:2
+                    previous_probability = loss_state == 1 ?
+                        0.0 :
+                        values.probability[position, loss_state - 1]
+                    probability_difference =
+                        values.probability[position, loss_state] -
+                        previous_probability
+                    candidate_probability =
+                        derivative.base_probability *
+                        values.probability[position, loss_state] +
+                        (1.0 - derivative.base_probability) *
+                        previous_probability
+                    @test team_bounds.candidate_probability.lower[
+                        index,
+                        loss_state,
+                    ] <= candidate_probability <=
+                    team_bounds.candidate_probability.upper[
+                        index,
+                        loss_state,
+                    ]
+
+                    if position < 3
+                        for parameter in 1:3
+                            previous_gradient = loss_state == 1 ?
+                                0.0 :
+                                values.parameter_gradient[
+                                    position,
+                                    loss_state - 1,
+                                    parameter,
+                                ]
+                            candidate_gradient =
+                                derivative.base_probability *
+                                values.parameter_gradient[
+                                    position,
+                                    loss_state,
+                                    parameter,
+                                ] +
+                                (1.0 - derivative.base_probability) *
+                                previous_gradient +
+                                derivative.gradient[parameter] *
+                                probability_difference
+                            @test team_bounds.candidate_parameter_gradient.lower[
+                                    index,
+                                    loss_state,
+                                    parameter,
+                                ] <= candidate_gradient <=
+                            team_bounds.candidate_parameter_gradient.upper[
+                                    index,
+                                    loss_state,
+                                    parameter,
+                                ]
+                        end
+                        for reference in references[position + 1]
+                            previous_projected_gradient = loss_state == 1 ?
+                                0.0 :
+                                values.gradient[
+                                    position,
+                                    loss_state - 1,
+                                    reference,
+                                ]
+                            candidate_projected_gradient =
+                                derivative.base_probability *
+                                values.gradient[
+                                    position,
+                                    loss_state,
+                                    reference,
+                                ] +
+                                (1.0 - derivative.base_probability) *
+                                previous_projected_gradient +
+                                inputs.covariance_gradient_gram[
+                                    index,
+                                    reference,
+                                ] * probability_difference
+                            @test team_bounds.candidate_gradient.lower[
+                                index,
+                                loss_state,
+                                reference,
+                            ] <=
+                                candidate_projected_gradient <=
+                            team_bounds.candidate_gradient.upper[
+                                index,
+                                loss_state,
+                                reference,
+                            ]
+                        end
+                    end
+
+                    previous_hessian = loss_state == 1 ?
+                        0.0 :
+                        values.hessian[position, loss_state - 1]
+                    candidate_gradient_reference =
+                        index in references[position] ? index : nothing
+                    current_projected_gradient =
+                        candidate_gradient_reference === nothing ?
+                        0.0 :
+                        values.gradient[position, loss_state, index]
+                    previous_projected_gradient =
+                        loss_state == 1 ||
+                                candidate_gradient_reference === nothing ?
+                        0.0 :
+                        values.gradient[position, loss_state - 1, index]
+                    candidate_hessian =
+                        derivative.base_probability *
+                        values.hessian[position, loss_state] +
+                        (1.0 - derivative.base_probability) *
+                        previous_hessian +
+                        derivative.hessian_covariance *
+                        probability_difference +
+                        2.0 * (
+                            current_projected_gradient -
+                            previous_projected_gradient
+                        )
+                    @test team_bounds.candidate_hessian.lower[
+                        index,
+                        loss_state,
+                    ] <= candidate_hessian <=
+                    team_bounds.candidate_hessian.upper[
+                        index,
+                        loss_state,
+                    ]
+                end
+                candidate_probability_sum =
+                    sum(values.probability[position + 1, :])
+                @test sum(team_bounds.candidate_probability.lower[index, :]) <=
+                    candidate_probability_sum <=
+                    sum(team_bounds.candidate_probability.upper[index, :])
+                candidate_adjusted_sum =
+                    candidate_probability_sum +
+                    0.5 * sum(values.hessian[position + 1, :])
+                @test (
+                    sum(team_bounds.candidate_probability.lower[index, :]) +
+                    0.5 * sum(team_bounds.candidate_hessian.lower[index, :])
+                ) <= candidate_adjusted_sum <= (
+                    sum(team_bounds.candidate_probability.upper[index, :]) +
+                    0.5 * sum(team_bounds.candidate_hessian.upper[index, :])
+                )
+            end
+        end
+
+        candidates = DataFrame(
+            game_id=["week-$position" for position in positions],
+            week=positions,
+            team=teams,
+            opponent=fill("OPP", length(positions)),
+            is_home=fill(true, length(positions)),
+            win_probability=[
+                derivative.base_probability for derivative in derivatives
+            ],
+            market_spread=fill(missing, length(positions)),
+        )
+        state = SurvivorPoolState(2025, 1; strikes_remaining=2)
+        config = SurvivorSelectionConfig(
+            minimum_favorite_spread=nothing,
+            market_guard_weeks=0,
+            through_week=3,
+            hessian_weeks=3,
+        )
+        plan = SurvivorModel._optimize_survivor_expected_weeks_scalar_milp(
+            candidates,
+            state,
+            config,
+            inputs,
+        )
+        @test plan.objective_value ≈ maximum(exhaustive_objectives)
+    end
+
     @testset "hybrid gradient state selection" begin
         @test SurvivorModel._survivor_gradient_switch_position(
             [[1, 2], [3], [1, 2, 3], [2, 4]],
@@ -979,6 +1330,147 @@ end
             near_bound_model;
             count_variable_in_set_constraints=false,
         ) == 6
+    end
+
+    @testset "conditional one-hot product hull bounds" begin
+        for (selected_value, recurrence_value) in ((0.0, 0.0), (1.0, 0.5))
+            model = SurvivorModel.JuMP.Model(SurvivorModel.HiGHS.Optimizer)
+            SurvivorModel.JuMP.set_silent(model)
+            SurvivorModel.JuMP.@variable(model, 0 <= selected <= 1)
+            SurvivorModel.JuMP.@variable(model, recurrence)
+            SurvivorModel.JuMP.@variable(model, aggregate)
+            SurvivorModel.JuMP.@constraint(model, selected == selected_value)
+            SurvivorModel.JuMP.@constraint(
+                model,
+                recurrence == recurrence_value,
+            )
+            constraints_before_hull = SurvivorModel.JuMP.num_constraints(
+                model;
+                count_variable_in_set_constraints=false,
+            )
+            dummies = SurvivorModel._survivor_add_one_hot_dummies!(
+                model,
+                aggregate,
+                Dict(1 => recurrence),
+                [selected],
+                [0.2],
+                [0.8],
+                1:1,
+                recurrence_lower=[0.0],
+                recurrence_upper=[1.0],
+            )
+            @test SurvivorModel.JuMP.num_constraints(
+                model;
+                count_variable_in_set_constraints=false,
+            ) - constraints_before_hull == 5
+            SurvivorModel.JuMP.@objective(model, Min, aggregate)
+            SurvivorModel.JuMP.optimize!(model)
+            @test SurvivorModel.JuMP.termination_status(model) ==
+                SurvivorModel.JuMP.MOI.OPTIMAL
+            @test SurvivorModel.JuMP.value(dummies[1]) ≈
+                selected_value * recurrence_value
+        end
+
+        for (
+            selected_lower,
+            selected_upper,
+            selected_value,
+            recurrence_value,
+            expected_status,
+            expected_dummy,
+        ) in (
+            (
+                0.2,
+                0.2,
+                0.0,
+                0.5,
+                SurvivorModel.JuMP.MOI.OPTIMAL,
+                0.0,
+            ),
+            (
+                0.2,
+                0.2,
+                1.0,
+                0.2,
+                SurvivorModel.JuMP.MOI.OPTIMAL,
+                0.2,
+            ),
+            (
+                0.2,
+                0.2,
+                1.0,
+                0.3,
+                SurvivorModel.JuMP.MOI.INFEASIBLE,
+                nothing,
+            ),
+            (
+                0.0,
+                0.0,
+                1.0,
+                0.2,
+                SurvivorModel.JuMP.MOI.INFEASIBLE,
+                nothing,
+            ),
+        )
+            model = SurvivorModel.JuMP.Model(SurvivorModel.HiGHS.Optimizer)
+            SurvivorModel.JuMP.set_silent(model)
+            SurvivorModel.JuMP.@variable(model, 0 <= selected <= 1)
+            SurvivorModel.JuMP.@variable(model, recurrence)
+            SurvivorModel.JuMP.@variable(model, aggregate)
+            SurvivorModel.JuMP.@constraint(model, selected == selected_value)
+            SurvivorModel.JuMP.@constraint(
+                model,
+                recurrence == recurrence_value,
+            )
+            constraints_before_hull = SurvivorModel.JuMP.num_constraints(
+                model;
+                count_variable_in_set_constraints=false,
+            )
+            dummies = SurvivorModel._survivor_add_one_hot_dummies!(
+                model,
+                aggregate,
+                Dict(1 => recurrence),
+                [selected],
+                [selected_lower],
+                [selected_upper],
+                1:1,
+                recurrence_lower=[0.0],
+                recurrence_upper=[1.0],
+            )
+            @test SurvivorModel.JuMP.num_constraints(
+                model;
+                count_variable_in_set_constraints=false,
+            ) - constraints_before_hull == 3
+            SurvivorModel.JuMP.@objective(model, Min, aggregate)
+            SurvivorModel.JuMP.optimize!(model)
+            @test SurvivorModel.JuMP.termination_status(model) == expected_status
+            if expected_status == SurvivorModel.JuMP.MOI.OPTIMAL
+                @test SurvivorModel.JuMP.value(dummies[1]) ≈ expected_dummy
+            end
+        end
+
+        infeasible_model =
+            SurvivorModel.JuMP.Model(SurvivorModel.HiGHS.Optimizer)
+        SurvivorModel.JuMP.set_silent(infeasible_model)
+        SurvivorModel.JuMP.@variable(infeasible_model, 0 <= selected <= 1)
+        SurvivorModel.JuMP.@variable(infeasible_model, recurrence)
+        SurvivorModel.JuMP.@variable(infeasible_model, aggregate)
+        SurvivorModel.JuMP.@constraint(infeasible_model, selected == 1.0)
+        SurvivorModel.JuMP.@constraint(infeasible_model, recurrence == 0.1)
+        SurvivorModel._survivor_add_one_hot_dummies!(
+            infeasible_model,
+            aggregate,
+            Dict(1 => recurrence),
+            [selected],
+            [0.2],
+            [0.8],
+            1:1,
+            recurrence_lower=[0.0],
+            recurrence_upper=[1.0],
+        )
+        SurvivorModel.JuMP.optimize!(infeasible_model)
+        @test SurvivorModel.JuMP.termination_status(infeasible_model) ==
+            SurvivorModel.JuMP.MOI.INFEASIBLE
     end
 
     @testset "scalar one-hot gating" begin

@@ -769,17 +769,6 @@ function _survivor_interval_product(
         (coefficient * upper, coefficient * lower)
 end
 
-function _survivor_widen_interval(
-    lower::Float64,
-    upper::Float64,
-)
-    lower <= upper ||
-        throw(ArgumentError("survivor interval bounds must be ordered"))
-    scale = max(abs(lower), abs(upper), 1.0e-12)
-    margin = 1.0e-9 * scale
-    return lower - margin, upper + margin
-end
-
 function _survivor_fixed_selected_indices(
     data::AbstractDataFrame,
     selections::AbstractDataFrame,
@@ -1042,8 +1031,7 @@ function _survivor_scalar_bounds(
                 lower += previous_term_lower
                 upper += previous_term_upper
                 candidate_probability_lower[index, loss_state],
-                    candidate_probability_upper[index, loss_state] =
-                    _survivor_widen_interval(lower, upper)
+                    candidate_probability_upper[index, loss_state] = lower, upper
 
                 probability_difference_lower, probability_difference_upper =
                     _survivor_interval_difference(
@@ -1111,7 +1099,7 @@ function _survivor_scalar_bounds(
                             index,
                             loss_state,
                             parameter,
-                        ] = _survivor_widen_interval(lower, upper)
+                        ] = lower, upper
                     end
                     for reference in gradient_reference_indices[position + 1]
                         current_gradient_lower =
@@ -1155,7 +1143,7 @@ function _survivor_scalar_bounds(
                         upper += source_upper
                         candidate_gradient_lower[index, loss_state, reference],
                             candidate_gradient_upper[index, loss_state, reference] =
-                            _survivor_widen_interval(lower, upper)
+                            lower, upper
                     end
                 end
 
@@ -1216,7 +1204,7 @@ function _survivor_scalar_bounds(
                     upper += source_upper
                     candidate_hessian_lower[index, loss_state],
                         candidate_hessian_upper[index, loss_state] =
-                        _survivor_widen_interval(lower, upper)
+                        lower, upper
                 end
             end
         end
@@ -1224,37 +1212,33 @@ function _survivor_scalar_bounds(
         for loss_state in 1:losses_to_elimination
             probability_lower[position + 1, loss_state],
                 probability_upper[position + 1, loss_state] =
-                _survivor_widen_interval(
-                    minimum(
-                        candidate_probability_lower[index, loss_state]
-                        for index in week_indices[position]
-                    ),
-                    maximum(
-                        candidate_probability_upper[index, loss_state]
-                        for index in week_indices[position]
-                    ),
+                minimum(
+                    candidate_probability_lower[index, loss_state]
+                    for index in week_indices[position]
+                ),
+                maximum(
+                    candidate_probability_upper[index, loss_state]
+                    for index in week_indices[position]
                 )
             if position < curvature_weeks
                 for reference in gradient_reference_indices[position + 1]
                     gradient_lower[position + 1, loss_state, reference],
                         gradient_upper[position + 1, loss_state, reference] =
-                        _survivor_widen_interval(
-                            minimum(
-                                candidate_gradient_lower[
-                                    index,
-                                    loss_state,
-                                    reference,
-                                ]
-                                for index in week_indices[position]
-                            ),
-                            maximum(
-                                candidate_gradient_upper[
-                                    index,
-                                    loss_state,
-                                    reference,
-                                ]
-                                for index in week_indices[position]
-                            ),
+                        minimum(
+                            candidate_gradient_lower[
+                                index,
+                                loss_state,
+                                reference,
+                            ]
+                            for index in week_indices[position]
+                        ),
+                        maximum(
+                            candidate_gradient_upper[
+                                index,
+                                loss_state,
+                                reference,
+                            ]
+                            for index in week_indices[position]
                         )
                 end
                 for parameter in 1:n_parameters
@@ -1267,38 +1251,35 @@ function _survivor_scalar_bounds(
                         position + 1,
                         loss_state,
                         parameter,
-                    ] = _survivor_widen_interval(
-                        minimum(
-                            candidate_parameter_gradient_lower[
-                                index,
-                                loss_state,
-                                parameter,
-                            ]
-                            for index in week_indices[position]
-                        ),
-                        maximum(
-                            candidate_parameter_gradient_upper[
-                                index,
-                                loss_state,
-                                parameter,
-                            ]
-                            for index in week_indices[position]
-                        ),
+                    ] =
+                    minimum(
+                        candidate_parameter_gradient_lower[
+                            index,
+                            loss_state,
+                            parameter,
+                        ]
+                        for index in week_indices[position]
+                    ),
+                    maximum(
+                        candidate_parameter_gradient_upper[
+                            index,
+                            loss_state,
+                            parameter,
+                        ]
+                        for index in week_indices[position]
                     )
                 end
             end
             if position <= curvature_weeks
                 hessian_lower[position + 1, loss_state],
                     hessian_upper[position + 1, loss_state] =
-                    _survivor_widen_interval(
-                        minimum(
-                            candidate_hessian_lower[index, loss_state]
-                            for index in week_indices[position]
-                        ),
-                        maximum(
-                            candidate_hessian_upper[index, loss_state]
-                            for index in week_indices[position]
-                        ),
+                    minimum(
+                        candidate_hessian_lower[index, loss_state]
+                        for index in week_indices[position]
+                    ),
+                    maximum(
+                        candidate_hessian_upper[index, loss_state]
+                        for index in week_indices[position]
                     )
             end
         end

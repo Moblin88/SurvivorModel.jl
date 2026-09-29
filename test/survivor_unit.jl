@@ -544,6 +544,34 @@ end
         )
         @test single_bounds.candidate_probability.lower[1, 1] <= 0.8
         @test single_bounds.candidate_probability.upper[1, 1] >= 0.8
+
+        exact_zero_derivatives = [
+            SurvivorModel.SurvivorCandidateDerivatives(
+                1.0,
+                [0.0, 0.0],
+                0.0,
+            )
+            for _ in 1:2
+        ]
+        exact_zero_bounds = SurvivorModel._survivor_scalar_bounds(
+            SurvivorModel.SurvivorObjectiveInputs(
+                parameters,
+                exact_zero_derivatives,
+            ),
+            [1, 2],
+            2,
+            2,
+        )
+        @test all(iszero, exact_zero_bounds.probability.lower[:, 2])
+        @test all(iszero, exact_zero_bounds.probability.upper[:, 2])
+        @test all(iszero, exact_zero_bounds.candidate_probability.lower[:, 2])
+        @test all(iszero, exact_zero_bounds.candidate_probability.upper[:, 2])
+        @test all(iszero, exact_zero_bounds.gradient.lower)
+        @test all(iszero, exact_zero_bounds.gradient.upper)
+        @test all(iszero, exact_zero_bounds.parameter_gradient.lower)
+        @test all(iszero, exact_zero_bounds.parameter_gradient.upper)
+        @test all(iszero, exact_zero_bounds.hessian.lower)
+        @test all(iszero, exact_zero_bounds.hessian.upper)
     end
 
     @testset "hybrid gradient state selection" begin

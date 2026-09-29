@@ -1102,6 +1102,39 @@ end
 
     end
 
+    @testset "debug solver progress logging" begin
+        config = SurvivorSelectionConfig()
+        SurvivorModel.Logging.with_logger(SurvivorModel.Logging.NullLogger()) do
+            @test !SurvivorModel._survivor_debug_logging_enabled()
+            model = SurvivorModel._survivor_milp_model(config, nothing)
+            @test SurvivorModel.JuMP.MOI.get(
+                SurvivorModel.JuMP.backend(model),
+                SurvivorModel.JuMP.MOI.Silent(),
+            )
+        end
+
+        debug_logger = SurvivorModel.Logging.ConsoleLogger(
+            IOBuffer(),
+            SurvivorModel.Logging.Debug,
+        )
+        SurvivorModel.Logging.with_logger(debug_logger) do
+            @test SurvivorModel._survivor_debug_logging_enabled()
+            model = SurvivorModel._survivor_milp_model(config, nothing)
+            @test !SurvivorModel.JuMP.MOI.get(
+                SurvivorModel.JuMP.backend(model),
+                SurvivorModel.JuMP.MOI.Silent(),
+            )
+            custom_model = SurvivorModel._survivor_milp_model(
+                config,
+                SurvivorModel.HiGHS.Optimizer,
+            )
+            @test SurvivorModel.JuMP.MOI.get(
+                SurvivorModel.JuMP.backend(custom_model),
+                SurvivorModel.JuMP.MOI.Silent(),
+            )
+        end
+    end
+
     @testset "selection configuration" begin
         @test SurvivorSelectionConfig().hessian_weeks == 3
         @test SurvivorSelectionConfig(hessian_weeks=0).hessian_weeks == 0

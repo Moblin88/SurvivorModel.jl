@@ -90,9 +90,26 @@ function SurvivorSelectionConfig(
     )
 end
 
+function _survivor_debug_logging_enabled()
+    # Mirror @debug's module lookup so JULIA_DEBUG=SurvivorModel is honored.
+    logger = Base.CoreLogging.current_logger_for_env(
+        Logging.Debug,
+        :none,
+        @__MODULE__,
+    )
+    return logger !== nothing && Logging.shouldlog(
+        logger,
+        Logging.Debug,
+        @__MODULE__,
+        :none,
+        :survivor_milp_progress,
+    )
+end
+
 function _survivor_optimizer(
     config::SurvivorSelectionConfig,
-    optimizer,
+    optimizer;
+    debug_logging::Bool=false,
 )
     optimizer !== nothing && return optimizer
     attributes = Pair{String,Any}[
@@ -101,7 +118,35 @@ function _survivor_optimizer(
     ]
     config.timeout_seconds === nothing ||
         push!(attributes, "time_limit" => config.timeout_seconds)
+    if debug_logging
+        # Keep HiGHS' native console output away from stdout, which holds the pick.
+        append!(
+            attributes,
+            Pair{String,Any}[
+                "output_flag" => true,
+                "log_to_console" => false,
+                "log_file" => Sys.iswindows() ? "CON" : "/dev/stderr",
+                "mip_report_level" => 2,
+            ],
+        )
+    end
     return optimizer_with_attributes(HiGHS.Optimizer, attributes...)
+end
+
+function _survivor_milp_model(
+    config::SurvivorSelectionConfig,
+    optimizer,
+)
+    debug_logging = optimizer === nothing && _survivor_debug_logging_enabled()
+    model = Model(
+        _survivor_optimizer(
+            config,
+            optimizer;
+            debug_logging=debug_logging,
+        ),
+    )
+    debug_logging || set_silent(model)
+    return model
 end
 
 function _normalize_survivor_picks(picks_made)
@@ -642,8 +687,7 @@ function _survivor_constant_plan(
     config::SurvivorSelectionConfig;
     optimizer=nothing,
 )
-    model = Model(_survivor_optimizer(config, optimizer))
-    set_silent(model)
+    model = _survivor_milp_model(config, optimizer)
     candidate_indices = 1:nrow(data)
     @variable(model, selected[candidate_indices], Bin)
     _add_survivor_assignment_constraints!(
@@ -1555,8 +1599,7 @@ function _optimize_survivor_expected_weeks_scalar_milp(
     length(inputs.derivatives) == nrow(data) ||
         throw(ArgumentError("survivor derivative inputs must match candidates"))
 
-    model = Model(_survivor_optimizer(config, optimizer))
-    set_silent(model)
+    model = _survivor_milp_model(config, optimizer)
     candidate_indices = 1:nrow(data)
     @variable(model, selected[candidate_indices], Bin)
     _add_survivor_assignment_constraints!(

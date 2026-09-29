@@ -285,7 +285,9 @@ their results, which allows replaying an earlier week of a completed season.
 The selected team is logged at Info level to stderr and also printed as its
 abbreviation with a newline to stdout, so stdout remains suitable for a picks
 file. Phase timings and detailed optimizer diagnostics are Debug-level logs;
-enable them for this package with `JULIA_DEBUG=SurvivorModel`:
+enable them for this package with `JULIA_DEBUG=SurvivorModel`. This also enables
+HiGHS root and branch-and-bound progress reporting for the default optimizer,
+without mixing solver output into the picks stream:
 
 ```sh
 JULIA_DEBUG=SurvivorModel survivor --season 2026 < picks.txt

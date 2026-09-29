@@ -68,10 +68,11 @@ forward-evaluated again to verify its reported objective.
 `SurvivorSelectionConfig(timeout_seconds=...)` passes a HiGHS `time_limit`.
 When the limit is reached with a feasible incumbent, the optimizer returns the
 best-known plan; a timeout without a feasible incumbent is an optimization
-failure. The CLI's `--timings` option records solve phase, termination and
-primal status, incumbent availability and objective, bound, relative gap, and
-branch-and-bound node count. Library calls remain quiet unless debug logging
-is enabled.
+failure. Debug logging records phase timings, termination and primal status,
+incumbent availability and objective, bound, relative gap, and branch-and-bound
+node count. With the default optimizer, Debug logging also enables HiGHS root
+and MIP progress output, routed away from stdout so CLI picks remain clean;
+normal library calls remain silent.
 
 ## Cache maintenance
 

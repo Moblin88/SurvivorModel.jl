@@ -8,8 +8,8 @@ end
 function _survivor_cli_usage()
     return """
     Usage:
-      survivor --season YEAR [--ban TEAM1,TEAM2] [--strikes N] [--hessian-weeks N] [--timeout SECONDS] < picks.txt
-      julia --project=. -m SurvivorModel --season YEAR [--ban TEAM1,TEAM2] [--strikes N] [--hessian-weeks N] [--timeout SECONDS] < picks.txt
+      survivor --season YEAR [--ban TEAM1,TEAM2] [--write-model FILE.lp] [--strikes N] [--hessian-weeks N] [--timeout SECONDS] < picks.txt
+      julia --project=. -m SurvivorModel --season YEAR [--ban TEAM1,TEAM2] [--write-model FILE.lp] [--strikes N] [--hessian-weeks N] [--timeout SECONDS] < picks.txt
 
     Input:
       One team abbreviation per nonblank line, starting with week 1.
@@ -18,6 +18,7 @@ function _survivor_cli_usage()
     Options:
       --season YEAR       Target season (required).
       --ban TEAMS         Comma-separated teams forbidden as the current pick.
+      --write-model FILE.lp  Save the MILP with HiGHS and exit without solving.
       --strikes N         Initial strike count (default: 2).
       --hessian-weeks N  Number of future weeks with Hessian adjustments
                           for exact-milp (default: 3; 0 is linear-only).
@@ -55,6 +56,8 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
     strikes_specified = false
     banned_first_pick_teams = String[]
     ban_specified = false
+    write_model_file = nothing
+    write_model_specified = false
     hessian_weeks = 3
     hessian_weeks_specified = false
     timeout_seconds = nothing
@@ -89,6 +92,7 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
         value = nothing
         if argument == "--season" ||
             argument == "--ban" ||
+            argument == "--write-model" ||
             argument == "--strikes" ||
             argument == "--hessian-weeks" ||
             argument == "--timeout"
@@ -103,6 +107,9 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
         elseif startswith(argument, "--ban=")
             option = "--ban"
             value = argument[length("--ban=") + 1:end]
+        elseif startswith(argument, "--write-model=")
+            option = "--write-model"
+            value = argument[length("--write-model=") + 1:end]
         elseif startswith(argument, "--strikes=")
             option = "--strikes"
             value = argument[length("--strikes=") + 1:end]
@@ -128,6 +135,13 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
             banned_first_pick_teams =
                 _parse_survivor_cli_banned_teams(value)
             ban_specified = true
+        elseif option == "--write-model"
+            write_model_specified &&
+                throw(ArgumentError(
+                    "--write-model may only be specified once",
+                ))
+            write_model_file = _survivor_lp_output_path(value)
+            write_model_specified = true
         elseif option == "--strikes"
             parsed = _parse_survivor_cli_integer(value, option)
             strikes_specified &&
@@ -155,6 +169,7 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
         season=0,
         initial_strikes=2,
         banned_first_pick_teams=String[],
+        write_model_file=nothing,
         hessian_weeks=3,
         timeout_seconds=nothing,
         refresh_data=false,
@@ -170,6 +185,7 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
         season=Int(season),
         initial_strikes=Int(initial_strikes),
         banned_first_pick_teams=banned_first_pick_teams,
+        write_model_file=write_model_file,
         hessian_weeks=Int(hessian_weeks),
         timeout_seconds=timeout_seconds,
         refresh_data=refresh_data,
@@ -414,18 +430,33 @@ function _run_survivor_cli(
         _schedule_indexed_drives=true,
     )
     log_phase_timing(:fit)
+    selection_config = SurvivorSelectionConfig(
+        through_week=through_week,
+        banned_first_pick_teams=options.banned_first_pick_teams,
+        hessian_weeks=options.hessian_weeks,
+        timeout_seconds=options.timeout_seconds,
+    )
+    if options.write_model_file !== nothing
+        saved_path = write_survivor_pool_lp(
+            options.write_model_file,
+            context;
+            picks_made=state.picks_made,
+            strikes_remaining=state.strikes_remaining,
+            selection_config=selection_config,
+            include_completed=true,
+        )
+        log_phase_timing(:model_export)
+        @info "survivor MILP saved" path=saved_path
+        return 0
+    end
+
     log_phase_timing(:optimize_start)
     solve_plan = () -> optimize_survivor_pool(
         context;
         picks_made=state.picks_made,
         strikes_remaining=state.strikes_remaining,
         include_completed=true,
-        selection_config=SurvivorSelectionConfig(
-            through_week=through_week,
-            banned_first_pick_teams=options.banned_first_pick_teams,
-            hessian_weeks=options.hessian_weeks,
-            timeout_seconds=options.timeout_seconds,
-        ),
+        selection_config=selection_config,
     )
     plan = solve_plan()
     log_phase_timing(:optimize)

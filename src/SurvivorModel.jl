@@ -39,6 +39,7 @@ export SurvivorSelectionConfig
 export SurvivorPoolState, SurvivorPoolPlan
 export build_survivor_candidates
 export optimize_survivor_pool
+export write_survivor_pool_lp
 
 include("drives.jl")
 include("drive_cache.jl")

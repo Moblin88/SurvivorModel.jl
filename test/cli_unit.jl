@@ -42,6 +42,40 @@ if !isdefined(Main, :_survivor_context_fixture)
     end
 end
 
+@testset "survivor HiGHS LP export" begin
+    schedule, historical, current = _survivor_context_fixture()
+    context = fit_regular_season_forecast(
+        2023;
+        as_of_week=1,
+        schedule=schedule,
+        historical_drives=historical,
+        current_drives=current,
+    )
+    selection_config = SurvivorSelectionConfig(
+        minimum_favorite_spread=nothing,
+        market_guard_weeks=0,
+        through_week=2,
+        hessian_weeks=2,
+    )
+    mktempdir() do directory
+        path = joinpath(directory, "survivor_2023.lp")
+        @test SurvivorModel.write_survivor_pool_lp(
+            path,
+            context;
+            selection_config=selection_config,
+            include_completed=true,
+        ) == path
+        @test isfile(path)
+        @test filesize(path) > 0
+        @test_throws ArgumentError SurvivorModel.write_survivor_pool_lp(
+            joinpath(directory, "survivor_2023.mps"),
+            context;
+            selection_config=selection_config,
+            include_completed=true,
+        )
+    end
+end
+
 @testset "survivor command-line application" begin
     @testset "argument and stdin parsing" begin
         @test SurvivorModel._parse_survivor_cli_args(
@@ -51,6 +85,7 @@ end
             season=2023,
             initial_strikes=2,
             banned_first_pick_teams=String[],
+            write_model_file=nothing,
             hessian_weeks=3,
             timeout_seconds=nothing,
             refresh_data=false,
@@ -64,6 +99,12 @@ end
         @test SurvivorModel._parse_survivor_cli_args(
             ["--season=2023", "--ban=KC,SF"],
         ).banned_first_pick_teams == ["KC", "SF"]
+        @test SurvivorModel._parse_survivor_cli_args(
+            ["--season=2023", "--write-model", "survivor.lp"],
+        ).write_model_file == "survivor.lp"
+        @test SurvivorModel._parse_survivor_cli_args(
+            ["--season=2023", "--write-model=survivor.lp"],
+        ).write_model_file == "survivor.lp"
         @test SurvivorModel._parse_survivor_cli_args(
             ["--season=2023", "--timeout", "12.5"],
         ).timeout_seconds == 12.5
@@ -88,6 +129,7 @@ end
         @test !occursin("--timings", usage)
         @test occursin("--timeout", usage)
         @test occursin("--ban", usage)
+        @test occursin("--write-model", usage)
         @test occursin("--hessian-weeks", usage)
         @test !occursin("--objective", usage)
         @test !occursin("--prove-first-pick", usage)
@@ -123,6 +165,21 @@ end
         )
         @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
             ["--season", "2023", "--ban", "KC", "--ban=SF"],
+        )
+        @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
+            ["--season", "2023", "--write-model"],
+        )
+        @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
+            ["--season", "2023", "--write-model", "survivor.mps"],
+        )
+        @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
+            [
+                "--season",
+                "2023",
+                "--write-model",
+                "one.lp",
+                "--write-model=two.lp",
+            ],
         )
         @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
             ["--season", "2023", "--hessian-weeks", "-1"],
@@ -370,6 +427,32 @@ end
             )
             @test exit_code == 0
             @test strip(String(take!(output))) == "D"
+        end
+
+        mktempdir() do cache_directory
+            output = IOBuffer()
+            model_path = joinpath(cache_directory, "survivor_2023.lp")
+            exit_code = SurvivorModel._run_survivor_cli(
+                [
+                    "--season",
+                    "2023",
+                    "--hessian-weeks",
+                    "2",
+                    "--write-model",
+                    model_path,
+                ];
+                input=IOBuffer(),
+                output=output,
+                schedule=schedule,
+                historical_drives=historical,
+                current_drives=current,
+                cache_directory=cache_directory,
+                through_week=2,
+            )
+            @test exit_code == 0
+            @test isfile(model_path)
+            @test filesize(model_path) > 0
+            @test isempty(strip(String(take!(output))))
         end
 
         completed_schedule = copy(schedule)

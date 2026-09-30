@@ -730,11 +730,40 @@ function _survivor_log_milp_result(
     )
 end
 
+function _survivor_lp_output_path(output_file::AbstractString)
+    path = String(output_file)
+    endswith(lowercase(path), ".lp") ||
+        throw(ArgumentError("survivor HiGHS output path must end in .lp"))
+    return path
+end
+
+function _survivor_write_lp_model(model, output_file::AbstractString)
+    path = _survivor_lp_output_path(output_file)
+    JuMP.MOI.write_to_file(JuMP.backend(model), path)
+    return path
+end
+
+function _survivor_export_lp_if_requested(
+    model,
+    output_file::Union{Nothing,AbstractString},
+    export_lp_only::Bool,
+)
+    if output_file === nothing
+        export_lp_only &&
+            throw(ArgumentError("LP export-only mode requires an output path"))
+        return nothing
+    end
+    path = _survivor_write_lp_model(model, output_file)
+    return export_lp_only ? path : nothing
+end
+
 function _survivor_constant_plan(
     data::AbstractDataFrame,
     state::SurvivorPoolState,
     config::SurvivorSelectionConfig;
     optimizer=nothing,
+    lp_output_file::Union{Nothing,AbstractString}=nothing,
+    export_lp_only::Bool=false,
 )
     model = _survivor_milp_model(config, optimizer)
     candidate_indices = 1:nrow(data)
@@ -747,6 +776,12 @@ function _survivor_constant_plan(
         selected,
     )
     @objective(model, Max, 0.0)
+    lp_export_result = _survivor_export_lp_if_requested(
+        model,
+        lp_output_file,
+        export_lp_only,
+    )
+    export_lp_only && return lp_export_result
     solve_started_at = time_ns()
     optimize!(model)
     _survivor_log_milp_result(
@@ -1921,6 +1956,8 @@ function _optimize_survivor_expected_weeks_scalar_milp(
     config::SurvivorSelectionConfig,
     inputs::SurvivorObjectiveInputs;
     optimizer=nothing,
+    lp_output_file::Union{Nothing,AbstractString}=nothing,
+    export_lp_only::Bool=false,
 )
     number_of_weeks = config.through_week - state.current_week + 1
     curvature_weeks = min(config.hessian_weeks, number_of_weeks)
@@ -1935,6 +1972,8 @@ function _optimize_survivor_expected_weeks_scalar_milp(
             state,
             config;
             optimizer=optimizer,
+            lp_output_file=lp_output_file,
+            export_lp_only=export_lp_only,
         )
     length(inputs.derivatives) == nrow(data) ||
         throw(ArgumentError("survivor derivative inputs must match candidates"))
@@ -2788,6 +2827,12 @@ function _optimize_survivor_expected_weeks_scalar_milp(
             init=0.0,
         )
     @objective(model, Max, objective_expression)
+    lp_export_result = _survivor_export_lp_if_requested(
+        model,
+        lp_output_file,
+        export_lp_only,
+    )
+    export_lp_only && return lp_export_result
     solve_started_at = time_ns()
     optimize!(model)
     _survivor_log_milp_result(
@@ -2870,19 +2915,12 @@ function _optimize_survivor_expected_weeks_scalar_milp(
     )
 end
 
-"""
-    optimize_survivor_pool(context, state; ...)
-
-Forecast unplayed games once from a fitted context, then solve the survivor
-assignment model using those probabilities.
-"""
-function optimize_survivor_pool(
+function _survivor_context_model_inputs(
     context::RegularSeasonForecastContext,
     state::SurvivorPoolState;
-    selection_config::SurvivorSelectionConfig=SurvivorSelectionConfig(),
-    include_completed::Bool=false,
-    horizon::Real=GAME_CLOCK_SECONDS,
-    optimizer=nothing,
+    selection_config::SurvivorSelectionConfig,
+    include_completed::Bool,
+    horizon::Real,
 )
     state.season == context.season ||
         throw(ArgumentError("survivor state season must match forecast context season"))
@@ -2907,12 +2945,93 @@ function optimize_survivor_pool(
         data;
         horizon=horizon,
     )
+    return data, inputs
+end
+
+"""
+    optimize_survivor_pool(context, state; ...)
+
+Forecast unplayed games once from a fitted context, then solve the survivor
+assignment model using those probabilities.
+"""
+function optimize_survivor_pool(
+    context::RegularSeasonForecastContext,
+    state::SurvivorPoolState;
+    selection_config::SurvivorSelectionConfig=SurvivorSelectionConfig(),
+    include_completed::Bool=false,
+    horizon::Real=GAME_CLOCK_SECONDS,
+    optimizer=nothing,
+)
+    data, inputs = _survivor_context_model_inputs(
+        context,
+        state;
+        selection_config=selection_config,
+        include_completed=include_completed,
+        horizon=horizon,
+    )
     return _optimize_survivor_expected_weeks_scalar_milp(
         data,
         state,
         selection_config,
         inputs;
         optimizer=optimizer,
+    )
+end
+
+"""
+    write_survivor_pool_lp(path, context, state; ...)
+    write_survivor_pool_lp(path, context; picks_made, strikes_remaining, ...)
+
+Write the survivor MILP through HiGHS' native LP writer without optimizing it.
+"""
+function write_survivor_pool_lp(
+    output_file::AbstractString,
+    context::RegularSeasonForecastContext,
+    state::SurvivorPoolState;
+    selection_config::SurvivorSelectionConfig=SurvivorSelectionConfig(),
+    include_completed::Bool=false,
+    horizon::Real=GAME_CLOCK_SECONDS,
+)
+    path = _survivor_lp_output_path(output_file)
+    data, inputs = _survivor_context_model_inputs(
+        context,
+        state;
+        selection_config=selection_config,
+        include_completed=include_completed,
+        horizon=horizon,
+    )
+    return _optimize_survivor_expected_weeks_scalar_milp(
+        data,
+        state,
+        selection_config,
+        inputs;
+        lp_output_file=path,
+        export_lp_only=true,
+    )
+end
+
+function write_survivor_pool_lp(
+    output_file::AbstractString,
+    context::RegularSeasonForecastContext;
+    picks_made=Dict{Int,String}(),
+    strikes_remaining::Integer=2,
+    selection_config::SurvivorSelectionConfig=SurvivorSelectionConfig(),
+    include_completed::Bool=false,
+    horizon::Real=GAME_CLOCK_SECONDS,
+)
+    state = SurvivorPoolState(
+        context.season,
+        context.as_of_week;
+        picks_made=picks_made,
+        strikes_remaining=strikes_remaining,
+    )
+    return write_survivor_pool_lp(
+        output_file,
+        context,
+        state;
+        selection_config=selection_config,
+        include_completed=include_completed,
+        horizon=horizon,
     )
 end
 

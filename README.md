@@ -184,6 +184,10 @@ policies, horizon, Hessian-prefix length, and timeout.
 week's pick; they remain available in later weeks unless selected elsewhere in
 the plan.
 
+To save the built MILP in HiGHS' LP format without solving it, use
+`write_survivor_pool_lp(path, context; ...)` or the CLI's `--write-model`
+option.
+
 The optimizer tracks the probability of being alive after each week at every
 loss count below the elimination threshold. It uses the posterior-mean win
 probability for every candidate and propagates scalar
@@ -268,6 +272,15 @@ Then run it from any directory:
 
 ```sh
 survivor --season 2026 < picks.txt
+```
+
+Pass `--write-model FILE.lp` to save the main MILP with HiGHS and exit without
+optimizing or printing a pick. For a preseason 2026 model with no prior picks,
+two strikes, an 18-week horizon, and Hessian adjustments for all 18 weeks:
+
+```sh
+survivor --season 2026 --hessian-weeks 18 \
+  --write-model survivor_2026_full18_hessian18.lp < /dev/null
 ```
 
 Pass `--ban TEAM1,TEAM2` to forbid those teams from the current week's pick

@@ -113,7 +113,6 @@ function _survivor_optimizer(
 )
     optimizer !== nothing && return optimizer
     attributes = Pair{String,Any}[
-        "threads" => BLAS.get_num_threads(),
         "parallel" => "on",
     ]
     config.timeout_seconds === nothing ||

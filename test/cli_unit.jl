@@ -50,6 +50,7 @@ end
             show_help=false,
             season=2023,
             initial_strikes=2,
+            banned_first_pick_teams=String[],
             hessian_weeks=3,
             timeout_seconds=nothing,
             refresh_data=false,
@@ -57,6 +58,12 @@ end
         @test SurvivorModel._parse_survivor_cli_args(
             ["--season=2023", "--strikes=4"],
         ).initial_strikes == 4
+        @test SurvivorModel._parse_survivor_cli_args(
+            ["--season=2023", "--ban", " kc, SF,KC "],
+        ).banned_first_pick_teams == ["KC", "SF"]
+        @test SurvivorModel._parse_survivor_cli_args(
+            ["--season=2023", "--ban=KC,SF"],
+        ).banned_first_pick_teams == ["KC", "SF"]
         @test SurvivorModel._parse_survivor_cli_args(
             ["--season=2023", "--timeout", "12.5"],
         ).timeout_seconds == 12.5
@@ -80,6 +87,7 @@ end
         @test !occursin("micp", usage)
         @test !occursin("--timings", usage)
         @test occursin("--timeout", usage)
+        @test occursin("--ban", usage)
         @test occursin("--hessian-weeks", usage)
         @test !occursin("--objective", usage)
         @test !occursin("--prove-first-pick", usage)
@@ -103,6 +111,18 @@ end
         )
         @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
             ["--season", "2023", "--timeout", "2", "--timeout", "3"],
+        )
+        @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
+            ["--season", "2023", "--ban"],
+        )
+        @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
+            ["--season", "2023", "--ban", "KC,"],
+        )
+        @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
+            ["--season", "2023", "--ban", ",KC"],
+        )
+        @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
+            ["--season", "2023", "--ban", "KC", "--ban=SF"],
         )
         @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
             ["--season", "2023", "--hessian-weeks", "-1"],
@@ -334,6 +354,22 @@ end
             @test occursin("optimize_start", log_text)
             @test occursin("optimize", log_text)
             @test occursin("survivor MILP solve complete", log_text)
+        end
+
+        mktempdir() do cache_directory
+            output = IOBuffer()
+            exit_code = SurvivorModel._run_survivor_cli(
+                ["--season", "2023", "--ban", "c"];
+                input=IOBuffer("A\n"),
+                output=output,
+                schedule=schedule,
+                historical_drives=historical,
+                current_drives=current,
+                cache_directory=cache_directory,
+                through_week=2,
+            )
+            @test exit_code == 0
+            @test strip(String(take!(output))) == "D"
         end
 
         completed_schedule = copy(schedule)

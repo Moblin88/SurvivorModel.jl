@@ -158,6 +158,7 @@ plan = optimize_survivor_pool(
     strikes_remaining=2,
     selection_config=SurvivorSelectionConfig(
         through_week=18,
+        banned_first_pick_teams=["KC", "SF"],
         timeout_seconds=600.0,
     ),
 )
@@ -179,6 +180,9 @@ market spread, survival and elimination probabilities, parameter-variance
 adjustment, and objective contribution. `plan.current_pick` is the row to use
 for the current week. `plan.selection_config` records the eligibility
 policies, horizon, Hessian-prefix length, and timeout.
+`banned_first_pick_teams` excludes those abbreviations only from the current
+week's pick; they remain available in later weeks unless selected elsewhere in
+the plan.
 
 The optimizer tracks the probability of being alive after each week at every
 loss count below the elimination threshold. It uses the posterior-mean win
@@ -264,6 +268,13 @@ Then run it from any directory:
 
 ```sh
 survivor --season 2026 < picks.txt
+```
+
+Pass `--ban TEAM1,TEAM2` to forbid those teams from the current week's pick
+without excluding them from later weeks in the plan:
+
+```sh
+survivor --season 2026 --ban KC,SF < picks.txt
 ```
 
 Pass `--timeout SECONDS` to limit the default HiGHS MILP solve. If HiGHS

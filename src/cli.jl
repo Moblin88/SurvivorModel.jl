@@ -8,8 +8,8 @@ end
 function _survivor_cli_usage()
     return """
     Usage:
-      survivor --season YEAR [--strikes N] [--hessian-weeks N] [--timeout SECONDS] < picks.txt
-      julia --project=. -m SurvivorModel --season YEAR [--strikes N] [--hessian-weeks N] [--timeout SECONDS] < picks.txt
+      survivor --season YEAR [--ban TEAM1,TEAM2] [--strikes N] [--hessian-weeks N] [--timeout SECONDS] < picks.txt
+      julia --project=. -m SurvivorModel --season YEAR [--ban TEAM1,TEAM2] [--strikes N] [--hessian-weeks N] [--timeout SECONDS] < picks.txt
 
     Input:
       One team abbreviation per nonblank line, starting with week 1.
@@ -17,6 +17,7 @@ function _survivor_cli_usage()
 
     Options:
       --season YEAR       Target season (required).
+      --ban TEAMS         Comma-separated teams forbidden as the current pick.
       --strikes N         Initial strike count (default: 2).
       --hessian-weeks N  Number of future weeks with Hessian adjustments
                           for exact-milp (default: 3; 0 is linear-only).
@@ -41,10 +42,19 @@ function _parse_survivor_cli_real(value::AbstractString, option::AbstractString)
     throw(ArgumentError("$option requires a finite positive number of seconds"))
 end
 
+function _parse_survivor_cli_banned_teams(value::AbstractString)
+    return _normalize_survivor_team_abbreviations(
+        split(value, ','; keepempty=true),
+        "--ban",
+    )
+end
+
 function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
     season = nothing
     initial_strikes = 2
     strikes_specified = false
+    banned_first_pick_teams = String[]
+    ban_specified = false
     hessian_weeks = 3
     hessian_weeks_specified = false
     timeout_seconds = nothing
@@ -78,6 +88,7 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
         option = nothing
         value = nothing
         if argument == "--season" ||
+            argument == "--ban" ||
             argument == "--strikes" ||
             argument == "--hessian-weeks" ||
             argument == "--timeout"
@@ -89,6 +100,9 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
         elseif startswith(argument, "--season=")
             option = "--season"
             value = argument[length("--season=") + 1:end]
+        elseif startswith(argument, "--ban=")
+            option = "--ban"
+            value = argument[length("--ban=") + 1:end]
         elseif startswith(argument, "--strikes=")
             option = "--strikes"
             value = argument[length("--strikes=") + 1:end]
@@ -108,6 +122,12 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
             season === nothing ||
                 throw(ArgumentError("--season may only be specified once"))
             season = parsed
+        elseif option == "--ban"
+            ban_specified &&
+                throw(ArgumentError("--ban may only be specified once"))
+            banned_first_pick_teams =
+                _parse_survivor_cli_banned_teams(value)
+            ban_specified = true
         elseif option == "--strikes"
             parsed = _parse_survivor_cli_integer(value, option)
             strikes_specified &&
@@ -134,6 +154,7 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
         show_help=true,
         season=0,
         initial_strikes=2,
+        banned_first_pick_teams=String[],
         hessian_weeks=3,
         timeout_seconds=nothing,
         refresh_data=false,
@@ -148,6 +169,7 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
         show_help=false,
         season=Int(season),
         initial_strikes=Int(initial_strikes),
+        banned_first_pick_teams=banned_first_pick_teams,
         hessian_weeks=Int(hessian_weeks),
         timeout_seconds=timeout_seconds,
         refresh_data=refresh_data,
@@ -400,6 +422,7 @@ function _run_survivor_cli(
         include_completed=true,
         selection_config=SurvivorSelectionConfig(
             through_week=through_week,
+            banned_first_pick_teams=options.banned_first_pick_teams,
             hessian_weeks=options.hessian_weeks,
             timeout_seconds=options.timeout_seconds,
         ),

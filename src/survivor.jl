@@ -5,6 +5,20 @@ const DEFAULT_SURVIVOR_MISSING_MARKET_POLICY = :allow
 
 const SURVIVOR_MISSING_MARKET_POLICIES = (:allow, :exclude)
 
+function _normalize_survivor_team_abbreviations(
+    teams::AbstractVector{<:AbstractString},
+    option::AbstractString,
+)
+    normalized = String[]
+    for raw_team in teams
+        team = uppercase(strip(String(raw_team)))
+        isempty(team) &&
+            throw(ArgumentError("$option must contain nonempty team abbreviations"))
+        team in normalized || push!(normalized, team)
+    end
+    return normalized
+end
+
 """
     SurvivorPoolState
 
@@ -28,13 +42,15 @@ covariance-aware expected-weeks formulation. `timeout_seconds` limits the
 HiGHS solve and returns its best feasible incumbent when the limit is reached.
 `hessian_weeks` controls how many future weeks receive the covariance-aware
 Hessian adjustment; later weeks retain their posterior-mean probability terms
-only.
+only. `banned_first_pick_teams` excludes the listed teams from the current-week
+pick only; they may still be used in later weeks.
 """
 struct SurvivorSelectionConfig
     minimum_favorite_spread::Union{Nothing,Float64}
     missing_market_policy::Symbol
     market_guard_weeks::Int
     through_week::Int
+    banned_first_pick_teams::Vector{String}
     hessian_weeks::Int
     timeout_seconds::Union{Nothing,Float64}
 end
@@ -45,6 +61,7 @@ function SurvivorSelectionConfig(
     missing_market_policy::Symbol=DEFAULT_SURVIVOR_MISSING_MARKET_POLICY,
     market_guard_weeks::Integer=DEFAULT_SURVIVOR_MARKET_GUARD_WEEKS,
     through_week::Integer=18,
+    banned_first_pick_teams::AbstractVector{<:AbstractString}=String[],
     hessian_weeks::Integer=3,
     timeout_seconds=nothing,
 )
@@ -80,11 +97,17 @@ function SurvivorSelectionConfig(
             ))
         value
     end
+    normalized_banned_first_pick_teams =
+        _normalize_survivor_team_abbreviations(
+            banned_first_pick_teams,
+            "banned_first_pick_teams",
+        )
     return SurvivorSelectionConfig(
         normalized_spread,
         missing_market_policy,
         Int(market_guard_weeks),
         Int(through_week),
+        normalized_banned_first_pick_teams,
         Int(hessian_weeks),
         normalized_timeout,
     )
@@ -406,6 +429,8 @@ function _normalize_survivor_candidates(
     candidates::AbstractDataFrame,
     state::SurvivorPoolState,
     through_week::Integer,
+    ;
+    banned_first_pick_teams::AbstractVector{<:AbstractString}=String[],
 )
     _require_columns(
         candidates,
@@ -451,6 +476,31 @@ function _normalize_survivor_candidates(
     data = data[keep, :]
     isempty(data) &&
         throw(ArgumentError("no eligible survivor candidates remain"))
+    normalized_banned_first_pick_teams =
+        _normalize_survivor_team_abbreviations(
+            banned_first_pick_teams,
+            "banned_first_pick_teams",
+        )
+    if !isempty(normalized_banned_first_pick_teams)
+        current_week_has_candidates = any(
+            ==(state.current_week),
+            data.week,
+        )
+        banned_teams = Set(normalized_banned_first_pick_teams)
+        data = data[
+            [
+                week != state.current_week || !(team in banned_teams)
+                for (week, team) in zip(data.week, data.team)
+            ],
+            :,
+        ]
+        current_week_has_candidates &&
+                !any(==(state.current_week), data.week) &&
+                throw(ArgumentError(
+                    "no eligible survivor candidates remain for week " *
+                    "$(state.current_week) after applying first-pick bans",
+                ))
+    end
 
     seen_team_weeks = Set{Tuple{Int,String}}()
     for row in eachrow(data)
@@ -2849,6 +2899,7 @@ function optimize_survivor_pool(
         candidates,
         state,
         selection_config.through_week,
+        banned_first_pick_teams=selection_config.banned_first_pick_teams,
     )
     inputs = _survivor_objective_inputs(
         context.model,

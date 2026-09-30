@@ -73,8 +73,9 @@ states are fixed at zero.
 
 The MILP is warm-started with a deterministic feasible greedy plan that
 selects the highest posterior-mean candidate probability each week while
-respecting market eligibility and team uniqueness. The selected plan is
-forward-evaluated again to verify its reported objective.
+respecting market eligibility, current-week first-pick bans, and team
+uniqueness. The selected plan is forward-evaluated again to verify its reported
+objective.
 
 `SurvivorSelectionConfig(timeout_seconds=...)` passes a HiGHS `time_limit`.
 When the limit is reached with a feasible incumbent, the optimizer returns the

@@ -1661,6 +1661,40 @@ end
         @test SurvivorSelectionConfig(hessian_weeks=19).hessian_weeks == 19
         @test SurvivorSelectionConfig().timeout_seconds === nothing
         @test SurvivorSelectionConfig(timeout_seconds=12.5).timeout_seconds == 12.5
+        @test SurvivorSelectionConfig().banned_first_pick_teams == String[]
+        ban_config = SurvivorSelectionConfig(
+            banned_first_pick_teams=[" kc ", "sf", "KC"],
+        )
+        @test ban_config.banned_first_pick_teams == ["KC", "SF"]
+        @test_throws ArgumentError SurvivorSelectionConfig(
+            banned_first_pick_teams=["KC", " "],
+        )
+
+        ban_candidates = DataFrame(
+            game_id=["week1", "week1", "week2", "week2"],
+            week=[1, 1, 2, 2],
+            team=["A", "B", "A", "C"],
+            opponent=["X", "Y", "D", "E"],
+            is_home=[true, false, true, false],
+            win_probability=[0.9, 0.8, 0.75, 0.65],
+        )
+        ban_state = SurvivorPoolState(2025, 1; strikes_remaining=0)
+        filtered_ban_candidates =
+            SurvivorModel._normalize_survivor_candidates(
+                ban_candidates,
+                ban_state,
+                2;
+                banned_first_pick_teams=[" a "],
+            )
+        @test filtered_ban_candidates.week == [1, 2, 2]
+        @test filtered_ban_candidates.team == ["B", "A", "C"]
+        @test_throws ArgumentError SurvivorModel._normalize_survivor_candidates(
+            ban_candidates,
+            ban_state,
+            2;
+            banned_first_pick_teams=["A", "B"],
+        )
+
         no_guard_config = SurvivorSelectionConfig(
             minimum_favorite_spread=nothing,
             missing_market_policy=:exclude,

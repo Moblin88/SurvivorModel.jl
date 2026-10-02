@@ -77,14 +77,62 @@ respecting market eligibility, current-week first-pick bans, and team
 uniqueness. The selected plan is forward-evaluated again to verify its reported
 objective.
 
-`SurvivorSelectionConfig(timeout_seconds=...)` passes a HiGHS `time_limit`.
-When the limit is reached with a feasible incumbent, the optimizer returns the
-best-known plan; a timeout without a feasible incumbent is an optimization
-failure. Debug logging records phase timings, termination and primal status,
-incumbent availability and objective, bound, relative gap, and branch-and-bound
-node count. With the default optimizer, Debug logging also enables HiGHS root
-and MIP progress output, routed away from stdout so CLI picks remain clean;
-normal library calls remain silent.
+## Benders backend
+
+`SurvivorSelectionConfig(benders=true)` keeps the weekly team assignment in a
+binary HiGHS master built as a JuMP direct model. The master also contains the
+exact probability states and their one-hot recurrence gates; its objective is
+the base probability contribution plus `theta`, which represents the Hessian
+correction. The selected schedule's parameter-gradient, covariance-gradient,
+and Hessian recurrences are evaluated directly, without constructing or
+optimizing an LP recourse model. Probability and Hessian intervals provide
+finite bounds for the two objective components.
+
+If Hessian corrections are modeled and the global bound leaves a gap above the
+greedy incumbent, a reverse pass through the recurrence graph generates an
+analytic cut at the greedy schedule before the first master solve. Each
+one-hot product gate uses the active McCormick side selected by the sign of its
+back-propagated objective adjoint. The resulting pick and probability-state
+slopes form a dual-feasible supporting cut, tight at the directly evaluated
+recourse value. The initial cut is skipped when the global bound already
+closes the gap or when there is no Hessian correction to decompose.
+
+Cuts are added to the same direct master between solves. The master is seeded
+with the deterministic greedy plan, its probability trajectory, and its
+Hessian correction; starts are refreshed from the best feasible plan after
+each cut. Caller-supplied optimizers must support direct incremental
+constraints and MIP starts. The master is re-solved after each cut; the loop
+stops when its upper bound meets the best directly evaluated feasible plan
+within tolerance. This is an outer Benders loop and does not depend on solver
+callbacks.
+
+`SurvivorSelectionConfig(timeout_seconds=...)` passes a HiGHS `time_limit` for
+the extensive-form solve. Benders mode updates the master time limit from the
+shared solve budget; deterministic recurrence evaluation and cut generation
+also count toward elapsed time. It retains the deterministic greedy plan as a
+feasible incumbent, so a timeout returns the best feasible plan seen so far.
+The extensive-form optimizer returns its best solver incumbent when available;
+a timeout without one is an optimization failure. Debug logging records
+extensive-form phase timings, termination and primal status, incumbent
+availability and objective, bound, relative gap, and branch-and-bound node
+count. For the extensive-form default optimizer, it also enables native HiGHS
+root and MIP progress output, routed away from stdout so CLI picks remain
+clean.
+
+Benders keeps native HiGHS output silent, even with Debug enabled, and emits
+structured diagnostics instead. It logs master model size (variables,
+constraint rows, and affine nonzeros); each master solve's status, elapsed
+time, base probability objective, Hessian-correction `theta`, bound, relative
+gap, node count, simplex iterations, cut count, and the week-ordered team
+list; each direct recurrence evaluation's elapsed time, Hessian-correction
+objective, and fixed team list; and each analytic cut's intercept and
+pick/probability slope ranges. Team lists contain only abbreviations, with no
+week labels. Simplex iterations are reported for master solves when the
+optimizer exposes the MathOptInterface attribute. All package diagnostics
+remain Debug-level; normal library calls stay silent.
+
+`write_survivor_pool_lp` always exports the initial extensive-form HiGHS model,
+including when the selection config has `benders=true`.
 
 ## Cache maintenance
 

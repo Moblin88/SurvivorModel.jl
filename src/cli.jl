@@ -8,8 +8,8 @@ end
 function _survivor_cli_usage()
     return """
     Usage:
-      survivor --season YEAR [--ban TEAM1,TEAM2] [--write-model FILE.lp] [--strikes N] [--hessian-weeks N] [--timeout SECONDS] < picks.txt
-      julia --project=. -m SurvivorModel --season YEAR [--ban TEAM1,TEAM2] [--write-model FILE.lp] [--strikes N] [--hessian-weeks N] [--timeout SECONDS] < picks.txt
+      survivor --season YEAR [--ban TEAM1,TEAM2] [--benders] [--write-model FILE.lp] [--strikes N] [--hessian-weeks N] [--timeout SECONDS] < picks.txt
+      julia --project=. -m SurvivorModel --season YEAR [--ban TEAM1,TEAM2] [--benders] [--write-model FILE.lp] [--strikes N] [--hessian-weeks N] [--timeout SECONDS] < picks.txt
 
     Input:
       One team abbreviation per nonblank line, starting with week 1.
@@ -18,11 +18,12 @@ function _survivor_cli_usage()
     Options:
       --season YEAR       Target season (required).
       --ban TEAMS         Comma-separated teams forbidden as the current pick.
+      --benders           Use a Benders master with analytic recurrence cuts.
       --write-model FILE.lp  Save the MILP with HiGHS and exit without solving.
       --strikes N         Initial strike count (default: 2).
       --hessian-weeks N  Number of future weeks with Hessian adjustments
                           for exact-milp (default: 3; 0 is linear-only).
-      --timeout SECONDS  HiGHS MILP time limit in seconds (default: unlimited).
+      --timeout SECONDS  Optimization time limit in seconds (default: unlimited).
       --refresh-data      Clear NFLData's raw cache and refresh summarized
                           historical drive data before running.
       --help              Show this help.
@@ -56,6 +57,8 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
     strikes_specified = false
     banned_first_pick_teams = String[]
     ban_specified = false
+    benders = false
+    benders_specified = false
     write_model_file = nothing
     write_model_specified = false
     hessian_weeks = 3
@@ -85,6 +88,14 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
                 throw(ArgumentError("--refresh-data may only be specified once"))
             refresh_data = true
             refresh_data_specified = true
+            index += 1
+            continue
+        end
+        if argument == "--benders"
+            benders_specified &&
+                throw(ArgumentError("--benders may only be specified once"))
+            benders = true
+            benders_specified = true
             index += 1
             continue
         end
@@ -171,6 +182,7 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
         banned_first_pick_teams=String[],
         write_model_file=nothing,
         hessian_weeks=3,
+        benders=false,
         timeout_seconds=nothing,
         refresh_data=false,
     )
@@ -187,6 +199,7 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
         banned_first_pick_teams=banned_first_pick_teams,
         write_model_file=write_model_file,
         hessian_weeks=Int(hessian_weeks),
+        benders,
         timeout_seconds=timeout_seconds,
         refresh_data=refresh_data,
     )
@@ -434,6 +447,7 @@ function _run_survivor_cli(
         through_week=through_week,
         banned_first_pick_teams=options.banned_first_pick_teams,
         hessian_weeks=options.hessian_weeks,
+        benders=options.benders,
         timeout_seconds=options.timeout_seconds,
     )
     if options.write_model_file !== nothing

@@ -38,12 +38,16 @@ end
     SurvivorSelectionConfig(; kwargs...)
 
 Configuration for survivor selection. `:exact_milp` is the default
-covariance-aware expected-weeks formulation. `timeout_seconds` limits the
-HiGHS solve and returns its best feasible incumbent when the limit is reached.
+covariance-aware expected-weeks formulation. `timeout_seconds` limits solver
+time. At a time limit, Benders returns its best feasible plan; the
+extensive-form solve returns an incumbent if available and otherwise reports
+failure.
 `hessian_weeks` controls how many future weeks receive the covariance-aware
 Hessian adjustment; later weeks retain their posterior-mean probability terms
-only. `banned_first_pick_teams` excludes the listed teams from the current-week
-pick only; they may still be used in later weeks.
+only. Set `benders=true` to use a Benders master with analytically generated
+cuts for the continuous recurrence states. `banned_first_pick_teams`
+excludes the listed teams from the current-week pick only; they may still be
+used in later weeks.
 """
 struct SurvivorSelectionConfig
     minimum_favorite_spread::Union{Nothing,Float64}
@@ -52,6 +56,7 @@ struct SurvivorSelectionConfig
     through_week::Int
     banned_first_pick_teams::Vector{String}
     hessian_weeks::Int
+    benders::Bool
     timeout_seconds::Union{Nothing,Float64}
 end
 
@@ -63,6 +68,7 @@ function SurvivorSelectionConfig(
     through_week::Integer=18,
     banned_first_pick_teams::AbstractVector{<:AbstractString}=String[],
     hessian_weeks::Integer=3,
+    benders::Bool=false,
     timeout_seconds=nothing,
 )
     normalized_spread = if minimum_favorite_spread === nothing
@@ -109,6 +115,7 @@ function SurvivorSelectionConfig(
         Int(through_week),
         normalized_banned_first_pick_teams,
         Int(hessian_weeks),
+        benders,
         normalized_timeout,
     )
 end
@@ -159,7 +166,10 @@ function _survivor_milp_model(
     config::SurvivorSelectionConfig,
     optimizer,
 )
-    debug_logging = optimizer === nothing && _survivor_debug_logging_enabled()
+    debug_logging =
+        optimizer === nothing &&
+        !config.benders &&
+        _survivor_debug_logging_enabled()
     model = Model(
         _survivor_optimizer(
             config,
@@ -167,6 +177,27 @@ function _survivor_milp_model(
             debug_logging=debug_logging,
         ),
     )
+    debug_logging || set_silent(model)
+    return model
+end
+
+function _survivor_direct_milp_model(
+    config::SurvivorSelectionConfig,
+    optimizer,
+)
+    debug_logging =
+        optimizer === nothing &&
+        !config.benders &&
+        _survivor_debug_logging_enabled()
+    optimizer_spec = _survivor_optimizer(
+        config,
+        optimizer;
+        debug_logging=debug_logging,
+    )
+    backend = optimizer_spec isa JuMP.MOI.ModelLike ?
+        optimizer_spec :
+        JuMP.MOI.instantiate(optimizer_spec)
+    model = JuMP.direct_model(backend)
     debug_logging || set_silent(model)
     return model
 end
@@ -527,19 +558,31 @@ function _add_survivor_assignment_constraints!(
     state::SurvivorPoolState,
     config::SurvivorSelectionConfig,
     selected,
+    ;
+    constraint_refs::Union{Nothing,Vector{JuMP.ConstraintRef}}=nothing,
 )
     candidate_indices = 1:nrow(data)
     for week in state.current_week:config.through_week
         indices = findall(==(week), data.week)
-        @constraint(model, sum(selected[index] for index in indices) == 1)
+        constraint = @constraint(
+            model,
+            sum(selected[index] for index in indices) == 1,
+        )
+        constraint_refs === nothing || push!(constraint_refs, constraint)
     end
     for team in unique(data.team)
         indices = findall(==(team), data.team)
-        @constraint(model, sum(selected[index] for index in indices) <= 1)
+        constraint = @constraint(
+            model,
+            sum(selected[index] for index in indices) <= 1,
+        )
+        constraint_refs === nothing || push!(constraint_refs, constraint)
     end
     market_eligible = _survivor_market_guard_mask(data, state, config)
     for index in candidate_indices
-        market_eligible[index] || @constraint(model, selected[index] == 0)
+        market_eligible[index] && continue
+        constraint = @constraint(model, selected[index] == 0)
+        constraint_refs === nothing || push!(constraint_refs, constraint)
     end
     return candidate_indices
 end
@@ -911,6 +954,10 @@ function _survivor_add_one_hot_dummies!(
     dummy_start_values=nothing,
     recurrence_lower=candidate_lower,
     recurrence_upper=candidate_upper,
+    constraint_refs=nothing,
+    variable_refs=nothing,
+    dummy_start_refs=nothing,
+    dummy_start_context=nothing,
 )
     isempty(candidate_indices) &&
         throw(ArgumentError("survivor one-hot dummies require candidates"))
@@ -957,52 +1004,250 @@ function _survivor_add_one_hot_dummies!(
                 lower * selected[index]
             if all_lower != lower || all_upper != upper
                 recurrence = recurrences[index]
-                @constraint(
+                constraint = @constraint(
                     model,
                     dummy >= recurrence - all_upper * (1.0 - selected[index]),
                 )
-                @constraint(
+                constraint_refs === nothing || push!(constraint_refs, constraint)
+                constraint = @constraint(
                     model,
                     dummy <= recurrence - all_lower * (1.0 - selected[index]),
                 )
+                constraint_refs === nothing || push!(constraint_refs, constraint)
             end
             dummies[index] = dummy
             continue
         end
         dummy = @variable(model)
+        variable_refs === nothing || push!(variable_refs, dummy)
+        if dummy_start_refs !== nothing
+            dummy_start_context === nothing &&
+                throw(ArgumentError(
+                    "survivor dummy start references require a context",
+                ))
+            push!(
+                dummy_start_refs,
+                (
+                    dummy,
+                    index,
+                    dummy_start_context[1],
+                    dummy_start_context[2],
+                    dummy_start_context[3],
+                ),
+            )
+        end
         set_lower_bound(dummy, min(0.0, lower))
         set_upper_bound(dummy, max(0.0, upper))
         recurrence = recurrences[index]
         if !iszero(lower)
-            @constraint(
+            constraint = @constraint(
                 model,
                 dummy >= lower * selected[index],
             )
+            constraint_refs === nothing || push!(constraint_refs, constraint)
         end
         if !iszero(upper)
-            @constraint(
+            constraint = @constraint(
                 model,
                 dummy <= upper * selected[index],
             )
+            constraint_refs === nothing || push!(constraint_refs, constraint)
         end
-        @constraint(
+        constraint = @constraint(
             model,
             dummy >= recurrence - all_upper * (1.0 - selected[index]),
         )
-        @constraint(
+        constraint_refs === nothing || push!(constraint_refs, constraint)
+        constraint = @constraint(
             model,
             dummy <= recurrence - all_lower * (1.0 - selected[index]),
         )
+        constraint_refs === nothing || push!(constraint_refs, constraint)
         if start_value !== nothing
             set_start_value(dummy, start_value)
         end
         dummies[index] = 1.0 * dummy
     end
-    @constraint(
+    constraint = @constraint(
         model,
         aggregate == sum(dummies[index] for index in candidate_indices),
     )
+    constraint_refs === nothing || push!(constraint_refs, constraint)
     return dummies
+end
+
+function _survivor_add_probability_recurrences!(
+    model,
+    probability,
+    selected,
+    inputs::SurvivorObjectiveInputs,
+    candidate_indices,
+    week_indices,
+    number_of_weeks::Integer,
+    losses_to_elimination::Integer,
+    bounds,
+    warm_start;
+    constraint_refs=nothing,
+    dummy_variable_refs=nothing,
+    dummy_start_refs=nothing,
+)
+    for position in 1:(number_of_weeks + 1),
+        loss_state in 1:losses_to_elimination
+        set_lower_bound(
+            probability[position, loss_state],
+            bounds.probability.lower[position, loss_state],
+        )
+        set_upper_bound(
+            probability[position, loss_state],
+            bounds.probability.upper[position, loss_state],
+        )
+    end
+
+    constraint = @constraint(model, probability[1, 1] == 1.0)
+    constraint_refs === nothing || push!(constraint_refs, constraint)
+    for loss_state in 2:losses_to_elimination
+        constraint = @constraint(model, probability[1, loss_state] == 0.0)
+        constraint_refs === nothing || push!(constraint_refs, constraint)
+    end
+
+    state_indices = 1:losses_to_elimination
+    warm_start_selected = Set(warm_start.selected)
+    candidate_probability_sum_lower = [
+        sum(
+            bounds.candidate_probability.lower[index, loss_state]
+            for loss_state in state_indices
+        )
+        for index in candidate_indices
+    ]
+    candidate_probability_sum_upper = [
+        sum(
+            bounds.candidate_probability.upper[index, loss_state]
+            for loss_state in state_indices
+        )
+        for index in candidate_indices
+    ]
+    team_candidate_probability_sum_lower = [
+        sum(
+            bounds.team_conditioned.candidate_probability.lower[
+                index,
+                loss_state,
+            ]
+            for loss_state in state_indices
+        )
+        for index in candidate_indices
+    ]
+    team_candidate_probability_sum_upper = [
+        sum(
+            bounds.team_conditioned.candidate_probability.upper[
+                index,
+                loss_state,
+            ]
+            for loss_state in state_indices
+        )
+        for index in candidate_indices
+    ]
+
+    for position in 1:number_of_weeks
+        indices = week_indices[position]
+        for loss_state in state_indices
+            previous_probability = loss_state == 1 ?
+                0.0 :
+                probability[position, loss_state - 1]
+            recurrences = Dict{Int,Any}()
+            dummy_starts = Dict{Int,Float64}()
+            for index in indices
+                derivative = inputs.derivatives[index]
+                recurrences[index] =
+                    derivative.base_probability *
+                    probability[position, loss_state] +
+                    (1.0 - derivative.base_probability) *
+                    previous_probability
+                dummy_starts[index] =
+                    index in warm_start_selected ?
+                    derivative.base_probability *
+                    warm_start.probability[position, loss_state] +
+                    (1.0 - derivative.base_probability) *
+                    (
+                        loss_state == 1 ?
+                        0.0 :
+                        warm_start.probability[position, loss_state - 1]
+                    ) :
+                    0.0
+            end
+            _survivor_add_one_hot_dummies!(
+                model,
+                probability[position + 1, loss_state],
+                recurrences,
+                selected,
+                bounds.team_conditioned.candidate_probability.lower[
+                    :,
+                    loss_state,
+                ],
+                bounds.team_conditioned.candidate_probability.upper[
+                    :,
+                    loss_state,
+                ],
+                indices,
+                dummy_start_values=dummy_starts,
+                recurrence_lower=
+                    bounds.candidate_probability.lower[:, loss_state],
+                recurrence_upper=
+                    bounds.candidate_probability.upper[:, loss_state],
+                constraint_refs=constraint_refs,
+                variable_refs=dummy_variable_refs,
+                dummy_start_refs=dummy_start_refs,
+                dummy_start_context=(:probability, position, loss_state),
+            )
+        end
+
+        current_probability_sum =
+            sum(probability[position, loss_state] for loss_state in state_indices)
+        next_probability_sum =
+            sum(probability[position + 1, loss_state] for loss_state in state_indices)
+        constraint = @constraint(
+            model,
+            next_probability_sum <= current_probability_sum,
+        )
+        constraint_refs === nothing || push!(constraint_refs, constraint)
+        probability_sum_recurrences = Dict{Int,Any}()
+        probability_sum_dummy_starts = Dict{Int,Float64}()
+        warm_current_probability_sum = sum(
+            warm_start.probability[position, loss_state]
+            for loss_state in state_indices
+        )
+        warm_probability_terminal =
+            warm_start.probability[position, losses_to_elimination]
+        for index in indices
+            derivative = inputs.derivatives[index]
+            probability_terminal = probability[position, losses_to_elimination]
+            probability_sum_recurrences[index] =
+                current_probability_sum -
+                (1.0 - derivative.base_probability) * probability_terminal
+            probability_sum_dummy_starts[index] =
+                index in warm_start_selected ?
+                warm_current_probability_sum -
+                (1.0 - derivative.base_probability) *
+                warm_probability_terminal :
+                0.0
+        end
+        _survivor_add_one_hot_dummies!(
+            model,
+            next_probability_sum,
+            probability_sum_recurrences,
+            selected,
+            team_candidate_probability_sum_lower,
+            team_candidate_probability_sum_upper,
+            indices,
+            dummy_start_values=probability_sum_dummy_starts,
+            recurrence_lower=candidate_probability_sum_lower,
+            recurrence_upper=candidate_probability_sum_upper,
+            constraint_refs=constraint_refs,
+            variable_refs=dummy_variable_refs,
+            dummy_start_refs=dummy_start_refs,
+            dummy_start_context=(:probability_sum, position, 0),
+        )
+    end
+    return nothing
 end
 
 function _survivor_scalar_bounds_pass(
@@ -1950,6 +2195,1272 @@ function _set_survivor_scalar_warm_start!(
     return nothing
 end
 
+function _survivor_plan_from_selected_indices(
+    data::AbstractDataFrame,
+    state::SurvivorPoolState,
+    config::SurvivorSelectionConfig,
+    inputs::SurvivorObjectiveInputs,
+    selected_indices,
+    number_of_weeks::Integer,
+    losses_to_elimination::Integer,
+    curvature_weeks::Integer,
+    gradient_reference_indices;
+    expected_objective::Union{Nothing,Real}=nothing,
+)
+    selections = sort(data[selected_indices, :], [:week, :team])
+    nrow(selections) == number_of_weeks ||
+        throw(ArgumentError(
+            "survivor optimization did not select one team per week",
+        ))
+    selected_by_position = _survivor_fixed_selected_indices(
+        data,
+        selections,
+        state,
+        number_of_weeks,
+    )
+    selected_values = _survivor_scalar_forward_values(
+        selected_by_position,
+        inputs,
+        number_of_weeks,
+        losses_to_elimination,
+        curvature_weeks=curvature_weeks,
+        gradient_reference_indices=gradient_reference_indices,
+    )
+    base_by_week = Dict{Int,Float64}()
+    adjustment_by_week = Dict{Int,Float64}()
+    for position in 1:number_of_weeks
+        week = state.current_week + position - 1
+        base_by_week[week] = sum(
+            selected_values.probability[position + 1, loss_state]
+            for loss_state in 1:losses_to_elimination
+        )
+        adjustment_by_week[week] = 0.5 * sum(
+            selected_values.hessian[position + 1, loss_state]
+            for loss_state in 1:losses_to_elimination
+        )
+    end
+    base_survival = [base_by_week[Int(week)] for week in selections.week]
+    parameter_variance_adjustment = [
+        adjustment_by_week[Int(week)] for week in selections.week
+    ]
+    _set_survivor_plan_diagnostics!(
+        selections,
+        base_survival,
+        parameter_variance_adjustment,
+    )
+
+    selected_expected_weeks = Float64(sum(selections.objective_contribution))
+    if expected_objective !== nothing
+        isapprox(
+            Float64(expected_objective),
+            selected_expected_weeks;
+            rtol=1e-6,
+            atol=2e-6,
+        ) || throw(ArgumentError(
+            "survivor covariance objective and selected-plan evaluation " *
+            "disagree: $expected_objective vs $selected_expected_weeks",
+        ))
+    end
+    current_pick = selections[selections.week .== state.current_week, :]
+    nrow(current_pick) == 1 ||
+        throw(ArgumentError(
+            "survivor optimization did not select one current-week pick",
+        ))
+    return SurvivorPoolPlan(
+        state,
+        selections,
+        current_pick,
+        selected_expected_weeks,
+        config,
+    )
+end
+
+function _survivor_benders_objective_upper_bound(
+    bounds,
+    number_of_weeks::Integer,
+    losses_to_elimination::Integer,
+    curvature_weeks::Integer,
+)
+    probability_upper = sum(
+        bounds.probability.upper[position + 1, loss_state]
+        for position in 1:number_of_weeks,
+        loss_state in 1:losses_to_elimination
+    )
+    hessian_upper = sum(
+        bounds.hessian.upper[position + 1, loss_state]
+        for position in 1:curvature_weeks,
+        loss_state in 1:losses_to_elimination;
+        init=0.0,
+    )
+    return probability_upper + 0.5 * hessian_upper
+end
+
+function _survivor_benders_remaining_time(
+    config::SurvivorSelectionConfig,
+    solve_started_at::UInt64,
+)
+    config.timeout_seconds === nothing && return nothing
+    elapsed_seconds = (time_ns() - solve_started_at) / 1.0e9
+    return config.timeout_seconds - elapsed_seconds
+end
+
+function _survivor_benders_timeout_result(
+    best_plan::SurvivorPoolPlan,
+    iteration::Integer,
+    solve_started_at::UInt64;
+    termination_status=nothing,
+)
+    elapsed_seconds = (time_ns() - solve_started_at) / 1.0e9
+    @debug "survivor Benders time limit reached" iterations=iteration elapsed_seconds=elapsed_seconds incumbent_objective=best_plan.objective_value termination_status=termination_status
+    return best_plan
+end
+
+function _survivor_benders_model_size(model)
+    backend = JuMP.backend(model)
+    constraint_count = 0
+    nonzero_count = 0
+    for (function_type, set_type) in JuMP.MOI.get(
+        backend,
+        JuMP.MOI.ListOfConstraintTypesPresent(),
+    )
+        function_type == JuMP.MOI.VariableIndex && continue
+        constraint_indices = JuMP.MOI.get(
+            backend,
+            JuMP.MOI.ListOfConstraintIndices{function_type,set_type}(),
+        )
+        constraint_count += length(constraint_indices)
+        if function_type <: JuMP.MOI.ScalarAffineFunction
+            for constraint_index in constraint_indices
+                constraint_function = JuMP.MOI.get(
+                    backend,
+                    JuMP.MOI.ConstraintFunction(),
+                    constraint_index,
+                )
+                nonzero_count += count(
+                    term -> !iszero(term.coefficient),
+                    constraint_function.terms,
+                )
+            end
+        elseif function_type <: JuMP.MOI.VectorAffineFunction
+            for constraint_index in constraint_indices
+                constraint_function = JuMP.MOI.get(
+                    backend,
+                    JuMP.MOI.ConstraintFunction(),
+                    constraint_index,
+                )
+                nonzero_count += count(
+                    term -> !iszero(term.scalar_term.coefficient),
+                    constraint_function.terms,
+                )
+            end
+        end
+    end
+    return (
+        variables=JuMP.num_variables(model),
+        constraints=constraint_count,
+        nonzeros=nonzero_count,
+    )
+end
+
+function _survivor_benders_simplex_iterations(model)
+    return _survivor_optional_result_attribute(
+        () -> Int(
+            JuMP.MOI.get(
+                JuMP.backend(model),
+                JuMP.MOI.SimplexIterations(),
+            ),
+        ),
+    )
+end
+
+function _survivor_benders_selected_teams(data::AbstractDataFrame, selected_indices)
+    return "[" * join(
+        (
+            String(data.team[index]) for index in sort(
+                selected_indices;
+                by=index -> Int(data.week[index]),
+            )
+        ),
+        ", ",
+    ) * "]"
+end
+
+function _survivor_benders_gap_tolerance(
+    first_bound::Real,
+    second_bound::Real,
+)
+    return max(
+        2e-6,
+        1e-6 * max(abs(first_bound), abs(second_bound)),
+    )
+end
+
+function _survivor_benders_add_gate_pick_slopes!(
+    pick_slopes::Vector{Float64},
+    target_adjoint::Real,
+    selected_index::Integer,
+    candidate_indices,
+    selected_lower::AbstractVector{<:Real},
+    selected_upper::AbstractVector{<:Real},
+    recurrence_lower::AbstractVector{<:Real},
+    recurrence_upper::AbstractVector{<:Real},
+)
+    adjoint = Float64(target_adjoint)
+    isfinite(adjoint) ||
+        throw(ArgumentError(
+            "survivor Benders analytic cut adjoints must be finite",
+        ))
+    iszero(adjoint) && return nothing
+    # Choose a tight McCormick side at the binary pick for this adjoint sign.
+    for index in candidate_indices
+        lower = Float64(selected_lower[index])
+        upper = Float64(selected_upper[index])
+        all_lower = Float64(recurrence_lower[index])
+        all_upper = Float64(recurrence_upper[index])
+        all_lower <= lower <= upper <= all_upper ||
+            throw(ArgumentError(
+                "survivor Benders analytic cut bounds are inconsistent",
+            ))
+        gate_slope = if lower == upper
+            lower
+        elseif index == selected_index
+            adjoint > 0.0 ? all_lower : all_upper
+        else
+            adjoint > 0.0 ? upper : lower
+        end
+        pick_slopes[index] += adjoint * gate_slope
+    end
+    return nothing
+end
+
+function _survivor_benders_add_parameter_gradient_adjoint!(
+    parameter_gradient_adjoint::Array{Float64,3},
+    position::Integer,
+    loss_state::Integer,
+    reference::Integer,
+    coefficient::Real,
+    inputs::SurvivorObjectiveInputs,
+)
+    1 <= position <= size(parameter_gradient_adjoint, 1) ||
+        throw(ArgumentError(
+            "survivor Benders analytic gradient position is out of bounds",
+        ))
+    for parameter in eachindex(inputs.parameters.variance)
+        parameter_gradient_adjoint[position, loss_state, parameter] +=
+            Float64(coefficient) *
+            inputs.parameters.variance[parameter] *
+            inputs.derivatives[reference].gradient[parameter]
+    end
+    return nothing
+end
+
+function _survivor_benders_analytic_cut_components(
+    selected_by_position::AbstractVector{<:Integer},
+    probability_values::AbstractMatrix{<:Real},
+    recourse_objective::Real,
+    inputs::SurvivorObjectiveInputs,
+    candidate_indices,
+    week_indices,
+    number_of_weeks::Integer,
+    losses_to_elimination::Integer,
+    curvature_weeks::Integer,
+    gradient_reference_indices,
+    gradient_reference_slots,
+    gradient_switch_position::Integer,
+    parameter_state_count::Integer,
+    bounds,
+)
+    n_candidates = length(inputs.derivatives)
+    parameter_count = length(inputs.parameters.keys)
+    length(selected_by_position) == number_of_weeks ||
+        throw(ArgumentError(
+            "survivor Benders analytic cuts require one pick per week",
+        ))
+    size(probability_values) ==
+        (number_of_weeks + 1, losses_to_elimination) ||
+        throw(ArgumentError(
+            "survivor Benders analytic cut probabilities have invalid dimensions",
+        ))
+    length(week_indices) == number_of_weeks ||
+        throw(ArgumentError(
+            "survivor Benders analytic cut week indices have invalid dimensions",
+        ))
+    length(gradient_reference_indices) == curvature_weeks ||
+        throw(ArgumentError(
+            "survivor Benders analytic cut references have invalid dimensions",
+        ))
+
+    pick_slopes = zeros(Float64, n_candidates)
+    probability_slopes = zeros(
+        Float64,
+        number_of_weeks + 1,
+        losses_to_elimination,
+    )
+    parameter_gradient_adjoint = zeros(
+        Float64,
+        parameter_state_count,
+        losses_to_elimination,
+        parameter_count,
+    )
+    gradient_adjoint = zeros(
+        Float64,
+        curvature_weeks + 1,
+        losses_to_elimination,
+        n_candidates,
+    )
+    hessian_adjoint = zeros(
+        Float64,
+        curvature_weeks + 1,
+        losses_to_elimination,
+    )
+    for position in 1:curvature_weeks,
+        loss_state in 1:losses_to_elimination
+        hessian_adjoint[position + 1, loss_state] = 0.5
+    end
+
+    for position in number_of_weeks:-1:1
+        selected_index = Int(selected_by_position[position])
+        indices = week_indices[position]
+        selected_index in indices ||
+            throw(ArgumentError(
+                "survivor Benders analytic cut pick does not match its week",
+            ))
+        selected_derivative = inputs.derivatives[selected_index]
+
+        # Collapsed selected bounds make a dummy affine in its pick only.
+        if position <= curvature_weeks
+            for loss_state in 1:losses_to_elimination
+                adjoint = hessian_adjoint[position + 1, loss_state]
+                _survivor_benders_add_gate_pick_slopes!(
+                    pick_slopes,
+                    adjoint,
+                    selected_index,
+                    indices,
+                    @view(bounds.team_conditioned.candidate_hessian.lower[
+                        :,
+                        loss_state,
+                    ]),
+                    @view(bounds.team_conditioned.candidate_hessian.upper[
+                        :,
+                        loss_state,
+                    ]),
+                    @view(bounds.candidate_hessian.lower[:, loss_state]),
+                    @view(bounds.candidate_hessian.upper[:, loss_state]),
+                )
+                iszero(adjoint) && continue
+                if bounds.team_conditioned.candidate_hessian.lower[
+                    selected_index,
+                    loss_state,
+                ] == bounds.team_conditioned.candidate_hessian.upper[
+                    selected_index,
+                    loss_state,
+                ]
+                    continue
+                end
+
+                probability = selected_derivative.base_probability
+                hessian_adjoint[position, loss_state] +=
+                    adjoint * probability
+                if loss_state > 1
+                    hessian_adjoint[position, loss_state - 1] +=
+                        adjoint * (1.0 - probability)
+                end
+                probability_slopes[position, loss_state] +=
+                    adjoint * selected_derivative.hessian_covariance
+                if loss_state > 1
+                    probability_slopes[position, loss_state - 1] -=
+                        adjoint * selected_derivative.hessian_covariance
+                end
+
+                haskey(
+                    gradient_reference_slots[position],
+                    selected_index,
+                ) || continue
+                if position < gradient_switch_position
+                    _survivor_benders_add_parameter_gradient_adjoint!(
+                        parameter_gradient_adjoint,
+                        position,
+                        loss_state,
+                        selected_index,
+                        2.0 * adjoint,
+                        inputs,
+                    )
+                    if loss_state > 1
+                        _survivor_benders_add_parameter_gradient_adjoint!(
+                            parameter_gradient_adjoint,
+                            position,
+                            loss_state - 1,
+                            selected_index,
+                            -2.0 * adjoint,
+                            inputs,
+                        )
+                    end
+                else
+                    gradient_adjoint[
+                        position,
+                        loss_state,
+                        selected_index,
+                    ] += 2.0 * adjoint
+                    if loss_state > 1
+                        gradient_adjoint[
+                            position,
+                            loss_state - 1,
+                            selected_index,
+                        ] -= 2.0 * adjoint
+                    end
+                end
+            end
+        end
+
+        if position < curvature_weeks &&
+           position + 1 >= gradient_switch_position
+            for loss_state in 1:losses_to_elimination,
+                reference in gradient_reference_indices[position + 1]
+                adjoint =
+                    gradient_adjoint[position + 1, loss_state, reference]
+                _survivor_benders_add_gate_pick_slopes!(
+                    pick_slopes,
+                    adjoint,
+                    selected_index,
+                    indices,
+                    @view(
+                        bounds.team_conditioned.candidate_gradient.lower[
+                            :,
+                            loss_state,
+                            reference,
+                        ],
+                    ),
+                    @view(
+                        bounds.team_conditioned.candidate_gradient.upper[
+                            :,
+                            loss_state,
+                            reference,
+                        ],
+                    ),
+                    @view(
+                        bounds.candidate_gradient.lower[
+                            :,
+                            loss_state,
+                            reference,
+                        ],
+                    ),
+                    @view(
+                        bounds.candidate_gradient.upper[
+                            :,
+                            loss_state,
+                            reference,
+                        ],
+                    ),
+                )
+                iszero(adjoint) && continue
+                if bounds.team_conditioned.candidate_gradient.lower[
+                    selected_index,
+                    loss_state,
+                    reference,
+                ] == bounds.team_conditioned.candidate_gradient.upper[
+                    selected_index,
+                    loss_state,
+                    reference,
+                ]
+                    continue
+                end
+
+                probability_slopes[position, loss_state] +=
+                    adjoint *
+                    inputs.covariance_gradient_gram[
+                        selected_index,
+                        reference,
+                    ]
+                if loss_state > 1
+                    probability_slopes[position, loss_state - 1] -=
+                        adjoint *
+                        inputs.covariance_gradient_gram[
+                            selected_index,
+                            reference,
+                        ]
+                end
+                haskey(
+                    gradient_reference_slots[position],
+                    reference,
+                ) || continue
+                if position < gradient_switch_position
+                    _survivor_benders_add_parameter_gradient_adjoint!(
+                        parameter_gradient_adjoint,
+                        position,
+                        loss_state,
+                        reference,
+                        adjoint * selected_derivative.base_probability,
+                        inputs,
+                    )
+                    if loss_state > 1
+                        _survivor_benders_add_parameter_gradient_adjoint!(
+                            parameter_gradient_adjoint,
+                            position,
+                            loss_state - 1,
+                            reference,
+                            adjoint *
+                            (1.0 - selected_derivative.base_probability),
+                            inputs,
+                        )
+                    end
+                else
+                    gradient_adjoint[position, loss_state, reference] +=
+                        adjoint * selected_derivative.base_probability
+                    if loss_state > 1
+                        gradient_adjoint[
+                            position,
+                            loss_state - 1,
+                            reference,
+                        ] += adjoint *
+                            (1.0 - selected_derivative.base_probability)
+                    end
+                end
+            end
+        end
+
+        if position < parameter_state_count
+            for loss_state in 1:losses_to_elimination,
+                parameter in 1:parameter_count
+                adjoint =
+                    parameter_gradient_adjoint[
+                        position + 1,
+                        loss_state,
+                        parameter,
+                    ]
+                _survivor_benders_add_gate_pick_slopes!(
+                    pick_slopes,
+                    adjoint,
+                    selected_index,
+                    indices,
+                    @view(
+                        bounds.team_conditioned.
+                            candidate_parameter_gradient.lower[
+                                :,
+                                loss_state,
+                                parameter,
+                            ],
+                    ),
+                    @view(
+                        bounds.team_conditioned.
+                            candidate_parameter_gradient.upper[
+                                :,
+                                loss_state,
+                                parameter,
+                            ],
+                    ),
+                    @view(
+                        bounds.candidate_parameter_gradient.lower[
+                            :,
+                            loss_state,
+                            parameter,
+                        ],
+                    ),
+                    @view(
+                        bounds.candidate_parameter_gradient.upper[
+                            :,
+                            loss_state,
+                            parameter,
+                        ],
+                    ),
+                )
+                iszero(adjoint) && continue
+                if bounds.team_conditioned.
+                        candidate_parameter_gradient.lower[
+                            selected_index,
+                            loss_state,
+                            parameter,
+                        ] ==
+                   bounds.team_conditioned.
+                        candidate_parameter_gradient.upper[
+                            selected_index,
+                            loss_state,
+                            parameter,
+                        ]
+                    continue
+                end
+
+                probability_slopes[position, loss_state] +=
+                    adjoint * selected_derivative.gradient[parameter]
+                if loss_state > 1
+                    probability_slopes[position, loss_state - 1] -=
+                        adjoint * selected_derivative.gradient[parameter]
+                end
+                probability =
+                    selected_derivative.base_probability
+                parameter_gradient_adjoint[
+                    position,
+                    loss_state,
+                    parameter,
+                ] += adjoint * probability
+                if loss_state > 1
+                    parameter_gradient_adjoint[
+                        position,
+                        loss_state - 1,
+                        parameter,
+                    ] += adjoint * (1.0 - probability)
+                end
+            end
+        end
+    end
+
+    all(isfinite, pick_slopes) && all(isfinite, probability_slopes) ||
+        throw(ArgumentError(
+            "survivor Benders analytic cut slopes must be finite",
+        ))
+    selected_set = Set(selected_by_position)
+    cut_intercept = Float64(recourse_objective)
+    for index in candidate_indices
+        cut_intercept -=
+            pick_slopes[index] * (index in selected_set ? 1.0 : 0.0)
+    end
+    for position in axes(probability_values, 1),
+        loss_state in axes(probability_values, 2)
+        cut_intercept -=
+            probability_slopes[position, loss_state] *
+            Float64(probability_values[position, loss_state])
+    end
+    return (
+        intercept=cut_intercept,
+        pick_slopes=pick_slopes,
+        probability_slopes=probability_slopes,
+    )
+end
+
+function _survivor_benders_add_analytic_cut!(
+    master_model,
+    theta,
+    master_selected,
+    master_probability,
+    selected_by_position::AbstractVector{<:Integer},
+    probability_values::AbstractMatrix{<:Real},
+    recourse_objective::Real,
+    inputs::SurvivorObjectiveInputs,
+    candidate_indices,
+    week_indices,
+    number_of_weeks::Integer,
+    losses_to_elimination::Integer,
+    curvature_weeks::Integer,
+    gradient_reference_indices,
+    gradient_reference_slots,
+    gradient_switch_position::Integer,
+    parameter_state_count::Integer,
+    bounds,
+)
+    components = _survivor_benders_analytic_cut_components(
+        selected_by_position,
+        probability_values,
+        recourse_objective,
+        inputs,
+        candidate_indices,
+        week_indices,
+        number_of_weeks,
+        losses_to_elimination,
+        curvature_weeks,
+        gradient_reference_indices,
+        gradient_reference_slots,
+        gradient_switch_position,
+        parameter_state_count,
+        bounds,
+    )
+    @constraint(
+        master_model,
+        theta <= components.intercept +
+            sum(
+                components.pick_slopes[index] * master_selected[index]
+                for index in candidate_indices
+            ) +
+            sum(
+                components.probability_slopes[position, loss_state] *
+                master_probability[position, loss_state]
+                for position in axes(components.probability_slopes, 1),
+                loss_state in axes(components.probability_slopes, 2)
+            ),
+    )
+    slopes = vcat(
+        components.pick_slopes,
+        vec(components.probability_slopes),
+    )
+    slope_min, slope_max = extrema(slopes)
+    pick_slope_min, pick_slope_max = extrema(components.pick_slopes)
+    probability_slope_min, probability_slope_max =
+        extrema(components.probability_slopes)
+    return (
+        intercept=components.intercept,
+        slope_min=slope_min,
+        slope_max=slope_max,
+        pick_slope_min=pick_slope_min,
+        pick_slope_max=pick_slope_max,
+        probability_slope_min=probability_slope_min,
+        probability_slope_max=probability_slope_max,
+    )
+end
+
+function _survivor_benders_probability_values(master_probability)
+    probability_values = Matrix{Float64}(
+        undef,
+        size(master_probability)...,
+    )
+    for position in axes(master_probability, 1),
+        loss_state in axes(master_probability, 2)
+        probability_values[position, loss_state] = Float64(
+            value(master_probability[position, loss_state]),
+        )
+    end
+    return probability_values
+end
+
+function _set_survivor_benders_probability_dummy_starts!(
+    dummy_start_refs::Vector{Tuple{JuMP.VariableRef,Int,Symbol,Int,Int}},
+    selected_indices,
+    probability_values::AbstractMatrix{<:Real},
+    inputs::SurvivorObjectiveInputs,
+    losses_to_elimination::Integer,
+)
+    selected_set = Set(selected_indices)
+    for (dummy, index, recurrence_kind, position, loss_state) in
+        dummy_start_refs
+        start_value = 0.0
+        if index in selected_set
+            derivative = inputs.derivatives[index]
+            if recurrence_kind == :probability
+                previous_probability = loss_state == 1 ?
+                    0.0 :
+                    probability_values[position, loss_state - 1]
+                start_value =
+                    derivative.base_probability *
+                    probability_values[position, loss_state] +
+                    (1.0 - derivative.base_probability) *
+                    previous_probability
+            elseif recurrence_kind == :probability_sum
+                current_probability_sum = sum(
+                    probability_values[position, state]
+                    for state in 1:losses_to_elimination
+                )
+                start_value =
+                    current_probability_sum -
+                    (1.0 - derivative.base_probability) *
+                    probability_values[position, losses_to_elimination]
+            else
+                throw(ArgumentError(
+                    "unknown survivor probability dummy recurrence kind",
+                ))
+            end
+        end
+        set_start_value(dummy, start_value)
+    end
+    return nothing
+end
+
+function _set_survivor_benders_master_start!(
+    master_selected,
+    master_probability,
+    theta,
+    candidate_indices,
+    selected_indices,
+    probability_values::AbstractMatrix{<:Real},
+    hessian_objective::Real,
+    probability_dummy_start_refs::Vector{
+        Tuple{JuMP.VariableRef,Int,Symbol,Int,Int}
+    },
+    inputs::SurvivorObjectiveInputs,
+    losses_to_elimination::Integer,
+)
+    selected_set = Set(selected_indices)
+    for index in candidate_indices
+        set_start_value(
+            master_selected[index],
+            index in selected_set ? 1.0 : 0.0,
+        )
+    end
+    for position in axes(probability_values, 1),
+        loss_state in axes(probability_values, 2)
+        set_start_value(
+            master_probability[position, loss_state],
+            probability_values[position, loss_state],
+        )
+    end
+    _set_survivor_benders_probability_dummy_starts!(
+        probability_dummy_start_refs,
+        selected_indices,
+        probability_values,
+        inputs,
+        losses_to_elimination,
+    )
+    set_start_value(theta, hessian_objective)
+    return nothing
+end
+
+function _optimize_survivor_scalar_benders!(
+    data::AbstractDataFrame,
+    state::SurvivorPoolState,
+    config::SurvivorSelectionConfig,
+    inputs::SurvivorObjectiveInputs,
+    candidate_indices,
+    number_of_weeks::Integer,
+    losses_to_elimination::Integer,
+    curvature_weeks::Integer,
+    gradient_reference_indices,
+    gradient_reference_slots,
+    gradient_switch_position::Integer,
+    parameter_state_count::Integer,
+    bounds,
+    warm_start,
+    optimizer,
+)
+    master_model = _survivor_direct_milp_model(config, optimizer)
+    @variable(master_model, master_selected[candidate_indices], Bin)
+    _add_survivor_assignment_constraints!(
+        master_model,
+        data,
+        state,
+        config,
+        master_selected,
+    )
+    state_indices = 1:losses_to_elimination
+    @variable(
+        master_model,
+        master_probability[1:(number_of_weeks + 1), state_indices],
+    )
+    master_probability_dummy_start_refs =
+        Tuple{JuMP.VariableRef,Int,Symbol,Int,Int}[]
+    candidate_positions = [
+        Int(data.week[index]) - state.current_week + 1
+        for index in candidate_indices
+    ]
+    week_indices = [
+        findall(==(position), candidate_positions)
+        for position in 1:number_of_weeks
+    ]
+    _survivor_add_probability_recurrences!(
+        master_model,
+        master_probability,
+        master_selected,
+        inputs,
+        candidate_indices,
+        week_indices,
+        number_of_weeks,
+        losses_to_elimination,
+        bounds,
+        warm_start,
+        dummy_start_refs=master_probability_dummy_start_refs,
+    )
+    objective_upper_bound = _survivor_benders_objective_upper_bound(
+        bounds,
+        number_of_weeks,
+        losses_to_elimination,
+        curvature_weeks,
+    )
+    isfinite(objective_upper_bound) ||
+        throw(ArgumentError(
+            "Benders mode requires finite survivor objective bounds",
+        ))
+    objective_upper_bound += 1e-8 * max(1.0, abs(objective_upper_bound))
+    hessian_upper_bound = 0.5 * sum(
+        bounds.hessian.upper[position + 1, loss_state]
+        for position in 1:curvature_weeks,
+        loss_state in state_indices;
+        init=0.0,
+    )
+    isfinite(hessian_upper_bound) ||
+        throw(ArgumentError(
+            "Benders mode requires finite Hessian correction bounds",
+        ))
+    hessian_upper_bound += 1e-8 * max(1.0, abs(hessian_upper_bound))
+    @variable(master_model, theta <= hessian_upper_bound)
+    @objective(
+        master_model,
+        Max,
+        sum(
+            master_probability[position + 1, loss_state]
+            for position in 1:number_of_weeks,
+            loss_state in state_indices
+        ) + theta,
+    )
+
+    best_plan = _survivor_plan_from_selected_indices(
+        data,
+        state,
+        config,
+        inputs,
+        warm_start.selected,
+        number_of_weeks,
+        losses_to_elimination,
+        curvature_weeks,
+        gradient_reference_indices,
+    )
+    best_objective = best_plan.objective_value
+    best_selected_indices = collect(warm_start.selected)
+    best_probability_values = copy(warm_start.probability)
+    best_hessian_objective = 0.5 * sum(
+        warm_start.hessian[position + 1, loss_state]
+        for position in 1:curvature_weeks,
+        loss_state in state_indices;
+        init=0.0,
+    )
+    _set_survivor_benders_master_start!(
+        master_selected,
+        master_probability,
+        theta,
+        candidate_indices,
+        best_selected_indices,
+        best_probability_values,
+        best_hessian_objective,
+        master_probability_dummy_start_refs,
+        inputs,
+        losses_to_elimination,
+    )
+
+    debug_logging = _survivor_debug_logging_enabled()
+    if debug_logging
+        master_model_size = _survivor_benders_model_size(master_model)
+        @debug(
+            "survivor Benders model built",
+            phase=:master,
+            variables=master_model_size.variables,
+            constraints=master_model_size.constraints,
+            nonzeros=master_model_size.nonzeros,
+            cuts=0,
+        )
+    end
+
+    solve_started_at = time_ns()
+    iteration = 1
+    cuts_added = 0
+    initial_master_tolerance = _survivor_benders_gap_tolerance(
+        objective_upper_bound,
+        best_objective,
+    )
+    if curvature_weeks > 0 &&
+       objective_upper_bound > best_objective + initial_master_tolerance
+        remaining_seconds = _survivor_benders_remaining_time(
+            config,
+            solve_started_at,
+        )
+        if remaining_seconds !== nothing && remaining_seconds <= 0.0
+            return _survivor_benders_timeout_result(
+                best_plan,
+                0,
+                solve_started_at,
+            )
+        end
+        initial_cut_started_at = time_ns()
+        initial_probability_objective = sum(
+            best_probability_values[position + 1, loss_state]
+            for position in 1:number_of_weeks,
+            loss_state in state_indices
+        )
+        isapprox(
+            initial_probability_objective + best_hessian_objective,
+            best_plan.objective_value;
+            rtol=1e-6,
+            atol=2e-6,
+        ) || throw(ArgumentError(
+            "survivor Benders master components and greedy plan disagree",
+        ))
+        initial_cut = _survivor_benders_add_analytic_cut!(
+            master_model,
+            theta,
+            master_selected,
+            master_probability,
+            best_selected_indices,
+            best_probability_values,
+            best_hessian_objective,
+            inputs,
+            candidate_indices,
+            week_indices,
+            number_of_weeks,
+            losses_to_elimination,
+            curvature_weeks,
+            gradient_reference_indices,
+            gradient_reference_slots,
+            gradient_switch_position,
+            parameter_state_count,
+            bounds,
+        )
+        @debug(
+            "survivor Benders recourse evaluated analytically",
+            iteration=0,
+            elapsed_seconds=(time_ns() - initial_cut_started_at) / 1.0e9,
+            recourse_objective=best_hessian_objective,
+            objective_component=:hessian_correction,
+            selected_teams=_survivor_benders_selected_teams(
+                data,
+                best_selected_indices,
+            ),
+        )
+        cuts_added += 1
+        @debug(
+            "survivor Benders cut added",
+            iteration=0,
+            source=:greedy_warm_start,
+            cut_method=:analytic_recurrence_dual,
+            cut_count=cuts_added,
+            intercept=initial_cut.intercept,
+            slope_min=initial_cut.slope_min,
+            slope_max=initial_cut.slope_max,
+            pick_slope_min=initial_cut.pick_slope_min,
+            pick_slope_max=initial_cut.pick_slope_max,
+            probability_slope_min=initial_cut.probability_slope_min,
+            probability_slope_max=initial_cut.probability_slope_max,
+        )
+    end
+
+    while true
+        remaining_seconds = _survivor_benders_remaining_time(
+            config,
+            solve_started_at,
+        )
+        if remaining_seconds !== nothing
+            remaining_seconds <= 0.0 &&
+                return _survivor_benders_timeout_result(
+                    best_plan,
+                    iteration,
+                    solve_started_at,
+                )
+            set_time_limit_sec(master_model, remaining_seconds)
+        end
+        master_solve_started_at = time_ns()
+        optimize!(master_model)
+        master_elapsed_seconds =
+            (time_ns() - master_solve_started_at) / 1.0e9
+        master_status = termination_status(master_model)
+        master_has_values = _survivor_has_feasible_incumbent(master_model)
+        master_theta_value = master_has_values ?
+            Float64(value(theta)) :
+            nothing
+        master_probability_values = master_has_values ?
+            _survivor_benders_probability_values(master_probability) :
+            nothing
+        master_probability_objective = master_has_values ?
+            sum(
+                master_probability_values[position + 1, loss_state]
+                for position in 1:number_of_weeks,
+                loss_state in state_indices
+            ) :
+            nothing
+        master_objective_value = master_has_values ?
+            Float64(objective_value(master_model)) :
+            nothing
+        master_upper_bound = master_has_values ?
+            _survivor_optional_result_attribute(
+                () -> Float64(objective_bound(master_model)),
+            ) :
+            nothing
+        if master_upper_bound === nothing &&
+           master_status == JuMP.MOI.OPTIMAL &&
+           master_has_values
+            master_upper_bound = master_objective_value
+        end
+        master_relative_gap = master_has_values ?
+            _survivor_optional_result_attribute(
+                () -> Float64(relative_gap(master_model)),
+            ) :
+            nothing
+        master_node_count = _survivor_optional_result_attribute(
+            () -> Int(node_count(master_model)),
+        )
+        master_simplex_iterations =
+            _survivor_benders_simplex_iterations(master_model)
+        selected_indices = Int[]
+        selected_teams = nothing
+        if master_has_values
+            selected_indices = _survivor_selected_indices(
+                master_model,
+                master_selected,
+                candidate_indices,
+            )
+            selected_teams = _survivor_benders_selected_teams(
+                data,
+                selected_indices,
+            )
+        end
+        @debug(
+            "survivor Benders master solve complete",
+            iteration=iteration,
+            elapsed_seconds=master_elapsed_seconds,
+            termination_status=master_status,
+            primal_status=primal_status(master_model),
+            has_values=master_has_values,
+            theta=master_theta_value,
+            probability_objective=master_probability_objective,
+            master_objective=master_objective_value,
+            master_bound=master_upper_bound,
+            relative_gap=master_relative_gap,
+            node_count=master_node_count,
+            simplex_iterations=master_simplex_iterations,
+            cut_count=cuts_added,
+            selected_teams=selected_teams,
+        )
+        if !master_has_values
+            master_status == JuMP.MOI.TIME_LIMIT &&
+                return _survivor_benders_timeout_result(
+                    best_plan,
+                    iteration,
+                    solve_started_at;
+                    termination_status=master_status,
+                )
+            throw(ArgumentError(
+                "survivor Benders master failed with termination status " *
+                "$master_status",
+            ))
+        end
+
+        candidate_evaluation_started_at = time_ns()
+        candidate_plan = _survivor_plan_from_selected_indices(
+            data,
+            state,
+            config,
+            inputs,
+            selected_indices,
+            number_of_weeks,
+            losses_to_elimination,
+            curvature_weeks,
+            gradient_reference_indices,
+        )
+        selected_probability_values =
+            master_probability_values::Matrix{Float64}
+        probability_objective =
+            master_probability_objective::Float64
+        direct_probability_objective =
+            sum(candidate_plan.selections.survival_probability)
+        isapprox(
+            probability_objective,
+            direct_probability_objective;
+            rtol=1e-6,
+            atol=2e-6,
+        ) || throw(ArgumentError(
+            "survivor Benders master probability and direct plan evaluation " *
+            "disagree: $probability_objective vs " *
+            "$direct_probability_objective",
+        ))
+        candidate_hessian_objective =
+            sum(candidate_plan.selections.parameter_variance_adjustment)
+        @debug(
+            "survivor Benders recourse evaluated analytically",
+            iteration=iteration,
+            elapsed_seconds=
+                (time_ns() - candidate_evaluation_started_at) / 1.0e9,
+            recourse_objective=candidate_hessian_objective,
+            objective_component=:hessian_correction,
+            selected_teams=selected_teams,
+        )
+        if candidate_plan.objective_value > best_objective
+            best_plan = candidate_plan
+            best_objective = candidate_plan.objective_value
+            best_selected_indices = selected_indices
+            best_probability_values = selected_probability_values
+            best_hessian_objective = candidate_hessian_objective
+        end
+
+        master_status == JuMP.MOI.TIME_LIMIT &&
+            return _survivor_benders_timeout_result(
+                best_plan,
+                iteration,
+                solve_started_at;
+                termination_status=master_status,
+            )
+        master_status == JuMP.MOI.OPTIMAL ||
+            throw(ArgumentError(
+                "survivor Benders master stopped with termination status " *
+                "$master_status",
+            ))
+        master_tolerance = _survivor_benders_gap_tolerance(
+            master_upper_bound,
+            best_objective,
+        )
+        if master_upper_bound <= best_objective + master_tolerance
+            @debug(
+                "survivor Benders solve complete",
+                iterations=iteration,
+                cuts_added=cuts_added,
+                elapsed_seconds=(time_ns() - solve_started_at) / 1.0e9,
+                objective=best_objective,
+                objective_bound=master_upper_bound,
+                termination_status=master_status,
+            )
+            return best_plan
+        end
+
+        remaining_seconds = _survivor_benders_remaining_time(
+            config,
+            solve_started_at,
+        )
+        if remaining_seconds !== nothing && remaining_seconds <= 0.0
+            return _survivor_benders_timeout_result(
+                best_plan,
+                iteration,
+                solve_started_at,
+            )
+        end
+        theta_value = master_theta_value::Float64
+        cut_violation_tolerance = _survivor_benders_gap_tolerance(
+            theta_value,
+            candidate_hessian_objective,
+        )
+        if theta_value <=
+           candidate_hessian_objective + cut_violation_tolerance
+            throw(ArgumentError(
+                "survivor Benders master has a positive bound gap but no " *
+                "violated recourse cut",
+            ))
+        end
+        selected_by_position = _survivor_fixed_selected_indices(
+            data,
+            candidate_plan.selections,
+            state,
+            number_of_weeks,
+        )
+        cut_summary = _survivor_benders_add_analytic_cut!(
+            master_model,
+            theta,
+            master_selected,
+            master_probability,
+            selected_by_position,
+            selected_probability_values,
+            candidate_hessian_objective,
+            inputs,
+            candidate_indices,
+            week_indices,
+            number_of_weeks,
+            losses_to_elimination,
+            curvature_weeks,
+            gradient_reference_indices,
+            gradient_reference_slots,
+            gradient_switch_position,
+            parameter_state_count,
+            bounds,
+        )
+        cuts_added += 1
+        @debug(
+            "survivor Benders cut added",
+            iteration=iteration,
+            source=:master_schedule,
+            cut_method=:analytic_recurrence_dual,
+            cut_count=cuts_added,
+            intercept=cut_summary.intercept,
+            slope_min=cut_summary.slope_min,
+            slope_max=cut_summary.slope_max,
+            pick_slope_min=cut_summary.pick_slope_min,
+            pick_slope_max=cut_summary.pick_slope_max,
+            probability_slope_min=cut_summary.probability_slope_min,
+            probability_slope_max=cut_summary.probability_slope_max,
+        )
+        _set_survivor_benders_master_start!(
+            master_selected,
+            master_probability,
+            theta,
+            candidate_indices,
+            best_selected_indices,
+            best_probability_values,
+            best_hessian_objective,
+            master_probability_dummy_start_refs,
+            inputs,
+            losses_to_elimination,
+        )
+        iteration += 1
+    end
+end
+
 function _optimize_survivor_expected_weeks_scalar_milp(
     data::AbstractDataFrame,
     state::SurvivorPoolState,
@@ -1978,17 +3489,7 @@ function _optimize_survivor_expected_weeks_scalar_milp(
     length(inputs.derivatives) == nrow(data) ||
         throw(ArgumentError("survivor derivative inputs must match candidates"))
 
-    model = _survivor_milp_model(config, optimizer)
     candidate_indices = 1:nrow(data)
-    @variable(model, selected[candidate_indices], Bin)
-    _add_survivor_assignment_constraints!(
-        model,
-        data,
-        state,
-        config,
-        selected,
-    )
-
     state_indices = 1:losses_to_elimination
     candidate_positions = [
         Int(data.week[index]) - state.current_week + 1
@@ -2106,6 +3607,37 @@ function _optimize_survivor_expected_weeks_scalar_milp(
         curvature_weeks,
         gradient_reference_indices,
     )
+    if config.benders && lp_output_file === nothing && !export_lp_only
+        return _optimize_survivor_scalar_benders!(
+            data,
+            state,
+            config,
+            inputs,
+            candidate_indices,
+            number_of_weeks,
+            losses_to_elimination,
+            curvature_weeks,
+            gradient_reference_indices,
+            gradient_reference_slots,
+            gradient_switch_position,
+            parameter_state_count,
+            bounds,
+            warm_start,
+            optimizer,
+        )
+    end
+
+    model = config.benders ?
+        _survivor_direct_milp_model(config, optimizer) :
+        _survivor_milp_model(config, optimizer)
+    @variable(model, selected[candidate_indices], Bin)
+    _add_survivor_assignment_constraints!(
+        model,
+        data,
+        state,
+        config,
+        selected,
+    )
     warm_start_selected = Set(warm_start.selected)
     @variable(
         model,
@@ -2135,14 +3667,6 @@ function _optimize_survivor_expected_weeks_scalar_milp(
     )
 
     for position in 1:(number_of_weeks + 1), loss_state in state_indices
-        set_lower_bound(
-            probability[position, loss_state],
-            bounds.probability.lower[position, loss_state],
-        )
-        set_upper_bound(
-            probability[position, loss_state],
-            bounds.probability.upper[position, loss_state],
-        )
         if position <= parameter_state_count
             for parameter in 1:parameter_count
                 set_lower_bound(
@@ -2188,10 +3712,6 @@ function _optimize_survivor_expected_weeks_scalar_milp(
         end
     end
 
-    @constraint(model, probability[1, 1] == 1.0)
-    for loss_state in 2:losses_to_elimination
-        @constraint(model, probability[1, loss_state] == 0.0)
-    end
     for loss_state in state_indices
         if curvature_weeks >= 0
             @constraint(model, hessian[1, loss_state] == 0.0)
@@ -2218,53 +3738,24 @@ function _optimize_survivor_expected_weeks_scalar_milp(
         findall(==(position), candidate_positions)
         for position in 1:number_of_weeks
     ]
+    _survivor_add_probability_recurrences!(
+        model,
+        probability,
+        selected,
+        inputs,
+        candidate_indices,
+        week_indices,
+        number_of_weeks,
+        losses_to_elimination,
+        bounds,
+        warm_start;
+    )
     for position in 1:number_of_weeks
         indices = week_indices[position]
         for loss_state in state_indices
             previous_probability = loss_state == 1 ?
                 0.0 :
                 probability[position, loss_state - 1]
-            probability_recurrences = Dict{Int,Any}()
-            probability_dummy_starts = Dict{Int,Float64}()
-            for index in indices
-                derivative = inputs.derivatives[index]
-                probability_recurrences[index] =
-                    derivative.base_probability *
-                    probability[position, loss_state] +
-                    (1.0 - derivative.base_probability) *
-                    previous_probability
-                probability_dummy_starts[index] =
-                    index in warm_start_selected ?
-                    derivative.base_probability *
-                    warm_start.probability[position, loss_state] +
-                    (1.0 - derivative.base_probability) *
-                    (
-                        loss_state == 1 ?
-                        0.0 :
-                        warm_start.probability[position, loss_state - 1]
-                    ) :
-                    0.0
-            end
-            _survivor_add_one_hot_dummies!(
-                model,
-                probability[position + 1, loss_state],
-                probability_recurrences,
-                selected,
-                bounds.team_conditioned.candidate_probability.lower[
-                    :,
-                    loss_state,
-                ],
-                bounds.team_conditioned.candidate_probability.upper[
-                    :,
-                    loss_state,
-                ],
-                indices,
-                dummy_start_values=probability_dummy_starts,
-                recurrence_lower=
-                    bounds.candidate_probability.lower[:, loss_state],
-                recurrence_upper=
-                    bounds.candidate_probability.upper[:, loss_state],
-            )
             probability_difference =
                 probability[position, loss_state] -
                 previous_probability
@@ -2646,45 +4137,6 @@ function _optimize_survivor_expected_weeks_scalar_milp(
             end
         end
 
-        current_probability_sum =
-            sum(probability[position, loss_state] for loss_state in state_indices)
-        next_probability_sum =
-            sum(probability[position + 1, loss_state] for loss_state in state_indices)
-        @constraint(model, next_probability_sum <= current_probability_sum)
-        probability_sum_recurrences = Dict{Int,Any}()
-        probability_sum_dummy_starts = Dict{Int,Float64}()
-        warm_current_probability_sum = sum(
-            warm_start.probability[position, loss_state]
-            for loss_state in state_indices
-        )
-        warm_probability_terminal =
-            warm_start.probability[position, losses_to_elimination]
-        for index in indices
-            derivative = inputs.derivatives[index]
-            probability_terminal = probability[position, losses_to_elimination]
-            probability_sum_recurrences[index] =
-                current_probability_sum -
-                (1.0 - derivative.base_probability) * probability_terminal
-            probability_sum_dummy_starts[index] =
-                index in warm_start_selected ?
-                warm_current_probability_sum -
-                (1.0 - derivative.base_probability) *
-                warm_probability_terminal :
-                0.0
-        end
-        _survivor_add_one_hot_dummies!(
-            model,
-            next_probability_sum,
-            probability_sum_recurrences,
-            selected,
-            team_candidate_probability_sum_lower,
-            team_candidate_probability_sum_upper,
-            indices,
-            dummy_start_values=probability_sum_dummy_starts,
-            recurrence_lower=candidate_probability_sum_lower,
-            recurrence_upper=candidate_probability_sum_upper,
-        )
-
         if position <= curvature_weeks
             current_adjusted_sum = sum(
                 probability[position, loss_state] +
@@ -2833,6 +4285,25 @@ function _optimize_survivor_expected_weeks_scalar_milp(
         export_lp_only,
     )
     export_lp_only && return lp_export_result
+    if config.benders
+        return _optimize_survivor_scalar_benders!(
+            data,
+            state,
+            config,
+            inputs,
+            candidate_indices,
+            number_of_weeks,
+            losses_to_elimination,
+            curvature_weeks,
+            gradient_reference_indices,
+            gradient_reference_slots,
+            gradient_switch_position,
+            parameter_state_count,
+            bounds,
+            warm_start,
+            optimizer,
+        )
+    end
     solve_started_at = time_ns()
     optimize!(model)
     _survivor_log_milp_result(
@@ -2850,68 +4321,17 @@ function _optimize_survivor_expected_weeks_scalar_milp(
         selected,
         candidate_indices,
     )
-    selections = sort(data[selected_indices, :], [:week, :team])
-    nrow(selections) == number_of_weeks ||
-        throw(ArgumentError("survivor optimization did not select one team per week"))
-
-    selected_by_position = _survivor_fixed_selected_indices(
+    return _survivor_plan_from_selected_indices(
         data,
-        selections,
         state,
-        number_of_weeks,
-    )
-    selected_values = _survivor_scalar_forward_values(
-        selected_by_position,
+        config,
         inputs,
+        selected_indices,
         number_of_weeks,
         losses_to_elimination,
-        curvature_weeks=curvature_weeks,
-        gradient_reference_indices=gradient_reference_indices,
-    )
-    base_by_week = Dict{Int,Float64}()
-    adjustment_by_week = Dict{Int,Float64}()
-    for position in 1:number_of_weeks
-        week = state.current_week + position - 1
-        base_by_week[week] = sum(
-            selected_values.probability[position + 1, loss_state]
-            for loss_state in state_indices
-        )
-        adjustment_by_week[week] = 0.5 * sum(
-            selected_values.hessian[position + 1, loss_state]
-            for loss_state in state_indices
-        )
-    end
-    base_survival = [base_by_week[Int(week)] for week in selections.week]
-    parameter_variance_adjustment = [
-        adjustment_by_week[Int(week)] for week in selections.week
-    ]
-    _set_survivor_plan_diagnostics!(
-        selections,
-        base_survival,
-        parameter_variance_adjustment,
-    )
-    model_expected_weeks = Float64(objective_value(model))
-    selected_expected_weeks = sum(selections.objective_contribution)
-    isapprox(
-        model_expected_weeks,
-        selected_expected_weeks;
-        rtol=1e-6,
-        atol=2e-6,
-    ) || throw(ArgumentError(
-        "survivor covariance objective and selected-plan evaluation disagree: " *
-        "$model_expected_weeks vs $selected_expected_weeks",
-    ))
-
-    current_pick = selections[selections.week .== state.current_week, :]
-    nrow(current_pick) == 1 ||
-        throw(ArgumentError("survivor optimization did not select one current-week pick"))
-
-    return SurvivorPoolPlan(
-        state,
-        selections,
-        current_pick,
-        selected_expected_weeks,
-        config,
+        curvature_weeks,
+        gradient_reference_indices;
+        expected_objective=Float64(objective_value(model)),
     )
 end
 

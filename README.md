@@ -175,11 +175,24 @@ It selects exactly one team for every week in the requested horizon and allows
 each team to be selected at most once. The covariance-aware finite-state
 formulation maximizes expected completed weeks before elimination.
 
+Set `benders=true` in `SurvivorSelectionConfig` or pass `--benders` to use an
+alternative Benders solve: the master chooses weekly teams and propagates the
+exact probability recurrences, and uses a proxy variable for the Hessian
+correction. The gradient and Hessian recurrences are evaluated directly for
+each schedule; an analytic reverse pass through the one-hot product-hull
+recurrences produces supporting cuts over both picks and probability states.
+This avoids building or optimizing a separate LP recourse model. When the
+global upper bound leaves a gap above the greedy incumbent and Hessian
+corrections are modeled, Benders adds the greedy schedule's analytic cut before
+solving the master. It skips this cut when the global bound already closes the
+gap or there is no Hessian correction to decompose. Repeated master solves can
+still be slower than the extensive-form MILP, which remains the default.
+
 `plan.selections` includes each selected team's win probability, selected-team
 market spread, survival and elimination probabilities, parameter-variance
 adjustment, and objective contribution. `plan.current_pick` is the row to use
 for the current week. `plan.selection_config` records the eligibility
-policies, horizon, Hessian-prefix length, and timeout.
+policies, horizon, Hessian-prefix length, solver mode, and timeout.
 `banned_first_pick_teams` excludes those abbreviations only from the current
 week's pick; they remain available in later weeks unless selected elsewhere in
 the plan.
@@ -290,10 +303,19 @@ without excluding them from later weeks in the plan:
 survivor --season 2026 --ban KC,SF < picks.txt
 ```
 
-Pass `--timeout SECONDS` to limit the default HiGHS MILP solve. If HiGHS
-reaches the limit after finding a feasible incumbent, the app returns the best
-incumbent found so far; if no feasible incumbent exists, the optimization
-reports an error. Omit the option for an unlimited solve:
+Pass `--benders` to use the Benders master with analytic recurrence cuts instead
+of the default extensive-form MILP:
+
+```sh
+survivor --season 2026 --benders < picks.txt
+```
+
+Pass `--timeout SECONDS` to limit optimization. In Benders mode the time is
+shared across master solves and analytic cut evaluation, and the best feasible
+plan is returned if the limit is reached. The extensive-form HiGHS solve
+retains its existing behavior: it returns a feasible incumbent when available
+and reports an error if no feasible incumbent exists. Omit the option for an
+unlimited solve:
 
 ```sh
 survivor --season 2026 --timeout 600 < picks.txt
@@ -309,9 +331,12 @@ their results, which allows replaying an earlier week of a completed season.
 The selected team is logged at Info level to stderr and also printed as its
 abbreviation with a newline to stdout, so stdout remains suitable for a picks
 file. Phase timings and detailed optimizer diagnostics are Debug-level logs;
-enable them for this package with `JULIA_DEBUG=SurvivorModel`. This also enables
-HiGHS root and branch-and-bound progress reporting for the default optimizer,
-without mixing solver output into the picks stream:
+enable them for this package with `JULIA_DEBUG=SurvivorModel`. For the default
+extensive-form optimizer this also enables HiGHS root and
+branch-and-bound progress reporting. Benders keeps native HiGHS output silent and instead reports the master model
+size, per-solve status, elapsed time and simplex iterations, master bounds and
+search metrics, direct recurrence-evaluation metrics, the selected teams in
+week order without week labels, and generated analytic cut summaries:
 
 ```sh
 JULIA_DEBUG=SurvivorModel survivor --season 2026 < picks.txt
@@ -349,7 +374,8 @@ full data refresh is desired.
 
 The weekly planner uses the covariance-aware expected-weeks MILP described
 above. `SurvivorSelectionConfig` controls the market guard, missing-line
-policy, planning horizon, `hessian_weeks`, and `timeout_seconds`.
+policy, planning horizon, `hessian_weeks`, the optional `benders` backend, and
+`timeout_seconds`.
 `hessian_weeks` defaults to three, allows zero for posterior-mean probability
 terms only, and is clamped to the available horizon. `timeout_seconds` limits
 the HiGHS solve and defaults to unlimited. The default market policy protects

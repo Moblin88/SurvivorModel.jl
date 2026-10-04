@@ -1573,15 +1573,29 @@ end
                 minimum_favorite_spread=nothing,
                 market_guard_weeks=0,
                 through_week=2,
-                benders=true,
+                benders_weeks=1,
                 timeout_seconds=60.0,
             ),
-            inputs;
-            optimizer=SurvivorModel.HiGHS.Optimizer,
+            inputs,
         )
         @test benders_plan.objective_value ≈ plan.objective_value
         @test nrow(benders_plan.selections) == 2
         @test length(unique(benders_plan.selections.team)) == 2
+        benders_zero_prefix_plan =
+            SurvivorModel._optimize_survivor_expected_weeks_scalar_milp(
+                data,
+                state,
+                SurvivorSelectionConfig(
+                    minimum_favorite_spread=nothing,
+                    market_guard_weeks=0,
+                    through_week=2,
+                    benders_weeks=0,
+                    timeout_seconds=60.0,
+                ),
+                inputs,
+            )
+        @test benders_zero_prefix_plan.objective_value ≈
+              plan.objective_value
 
         prefix_config = SurvivorSelectionConfig(
             minimum_favorite_spread=nothing,
@@ -1633,11 +1647,26 @@ end
                     market_guard_weeks=0,
                     through_week=2,
                     hessian_weeks=1,
-                    benders=true,
+                    benders_weeks=1,
                 ),
                 inputs,
             )
         @test benders_prefix_plan.objective_value ≈
+              prefix_plan.objective_value
+        benders_clamped_prefix_plan =
+            SurvivorModel._optimize_survivor_expected_weeks_scalar_milp(
+                data,
+                state,
+                SurvivorSelectionConfig(
+                    minimum_favorite_spread=nothing,
+                    market_guard_weeks=0,
+                    through_week=2,
+                    hessian_weeks=1,
+                    benders_weeks=20,
+                ),
+                inputs,
+            )
+        @test benders_clamped_prefix_plan.objective_value ≈
               prefix_plan.objective_value
 
         debug_derivative_values = [
@@ -1672,7 +1701,7 @@ end
         debug_state = SurvivorPoolState(
             2025,
             1;
-            strikes_remaining=1,
+            strikes_remaining=2,
         )
         debug_data = SurvivorModel._normalize_survivor_candidates(
             debug_candidates,
@@ -1683,7 +1712,8 @@ end
             minimum_favorite_spread=nothing,
             market_guard_weeks=0,
             through_week=3,
-            benders=true,
+            hessian_weeks=3,
+            benders_weeks=1,
         )
         debug_number_of_weeks = 3
         debug_curvature_weeks = min(
@@ -1740,6 +1770,17 @@ end
             debug_number_of_weeks
         ]
         @test !isempty(debug_feasible_schedules)
+        debug_lp_relaxation =
+            SurvivorModel._optimize_survivor_expected_weeks_scalar_milp(
+                debug_data,
+                debug_state,
+                debug_config,
+                debug_inputs;
+                lp_relaxation=true,
+            )
+        @test debug_lp_relaxation.termination_status ==
+              SurvivorModel.JuMP.MOI.OPTIMAL
+        @test debug_lp_relaxation.dual_cut.margin > 0.0
         for selected_by_position in debug_feasible_schedules
             selected_values =
                 SurvivorModel._survivor_scalar_forward_values(
@@ -1751,15 +1792,26 @@ end
                     gradient_reference_indices=
                         debug_gradient_reference_indices,
                 )
-            recourse_objective = 0.5 * sum(
+            recourse_objective = sum(
+                selected_values.probability[position + 1, loss_state]
+                for position in 1:debug_number_of_weeks,
+                loss_state in 1:debug_losses_to_elimination
+            ) + 0.5 * sum(
                 selected_values.hessian[position + 1, loss_state]
                 for position in 1:debug_curvature_weeks,
                 loss_state in 1:debug_losses_to_elimination;
                 init=0.0,
             )
-            cut = SurvivorModel._survivor_benders_analytic_cut_components(
+            lp_cut_value = SurvivorModel._survivor_benders_lp_cut_value(
+                debug_lp_relaxation.dual_cut,
                 selected_by_position,
                 selected_values.probability,
+                1,
+                debug_losses_to_elimination,
+            )
+            @test lp_cut_value + 1e-7 >= recourse_objective
+            cut = SurvivorModel._survivor_benders_analytic_cut_components(
+                selected_by_position,
                 recourse_objective,
                 debug_inputs,
                 debug_candidate_indices,
@@ -1784,7 +1836,11 @@ end
                         gradient_reference_indices=
                             debug_gradient_reference_indices,
                     )
-                other_recourse_objective = 0.5 * sum(
+                other_recourse_objective = sum(
+                    other_values.probability[position + 1, loss_state]
+                    for position in 1:debug_number_of_weeks,
+                    loss_state in 1:debug_losses_to_elimination
+                ) + 0.5 * sum(
                     other_values.hessian[position + 1, loss_state]
                     for position in 1:debug_curvature_weeks,
                     loss_state in 1:debug_losses_to_elimination;
@@ -1794,13 +1850,8 @@ end
                     sum(
                         cut.pick_slopes[index]
                         for index in other_schedule
-                    ) +
-                    sum(
-                        cut.probability_slopes[position, loss_state] *
-                        other_values.probability[position, loss_state]
-                        for position in axes(other_values.probability, 1),
-                        loss_state in axes(other_values.probability, 2)
                     )
+                @test !hasproperty(cut, :probability_slopes)
                 if other_schedule == selected_by_position
                     @test cut_value ≈ other_recourse_objective atol=1e-7
                 else
@@ -1864,25 +1915,36 @@ end
         @test occursin("elapsed_seconds", benders_debug_output)
         @test occursin("master_bound", benders_debug_output)
         @test occursin("theta", benders_debug_output)
-        @test occursin("probability_objective", benders_debug_output)
+        @test !occursin("probability_objective", benders_debug_output)
         @test occursin("relative_gap", benders_debug_output)
         @test occursin("node_count", benders_debug_output)
         @test occursin("cut_count", benders_debug_output)
         @test occursin("recourse_objective", benders_debug_output)
-        @test occursin(
-            "objective_component = :hessian_correction",
-            benders_debug_output,
-        )
         @test occursin("selected_teams", benders_debug_output)
         @test occursin("variables", benders_debug_output)
+        @test occursin("prefix_weeks = 1", benders_debug_output)
         @test occursin("constraints", benders_debug_output)
         @test occursin("nonzeros", benders_debug_output)
         @test occursin("simplex_iterations", benders_debug_output)
         @test occursin("intercept", benders_debug_output)
         @test occursin("slope_min", benders_debug_output)
         @test occursin("slope_max", benders_debug_output)
+        @test occursin(
+            "survivor LP relaxation solver statistics",
+            benders_debug_output,
+        )
+        @test occursin("solver = :hipo", benders_debug_output)
+        @test occursin("run_crossover = :on", benders_debug_output)
+        @test occursin("barrier_iterations", benders_debug_output)
+        @test occursin(
+            "objective_component = :tail_and_covariance_correction",
+            benders_debug_output,
+        )
         @test occursin("probability_slope_min", benders_debug_output)
-        @test occursin("probability_slope_max", benders_debug_output)
+        @test occursin(
+            "method = :full_model_lp_dual_recourse_cut",
+            benders_debug_output,
+        )
         @test !occursin("simplex_iterations = nothing", benders_debug_output)
         initial_recourse_position = findfirst(
             "survivor Benders recourse evaluated analytically",
@@ -1919,6 +1981,16 @@ end
                     debug_config,
                     debug_inputs,
                 )
+            debug_second_greedy_selected_indices =
+                SurvivorModel._survivor_greedy_selected_indices(
+                    debug_data,
+                    debug_state,
+                    debug_config,
+                    debug_inputs;
+                    first_pick_rank=2,
+                )
+            @test debug_greedy_selected_indices[1] !=
+                  debug_second_greedy_selected_indices[1]
             debug_greedy_teams = sort(
                 debug_data[debug_greedy_selected_indices, :],
                 :week,
@@ -1931,11 +2003,16 @@ end
                 pre_first_master_output,
             )
             @test occursin(
+                "source = :second_greedy_warm_start",
+                pre_first_master_output,
+            )
+            @test occursin(
                 "cut_method = :analytic_recurrence_dual",
                 pre_first_master_output,
             )
             @test occursin("iteration = 0", pre_first_master_output)
-            @test occursin("cut_count = 1", pre_first_master_output)
+            @test occursin("cut_count = 2", pre_first_master_output)
+            @test occursin("cut_count = 3", pre_first_master_output)
             @test occursin(
                 "selected_teams = \"$debug_greedy_team_list\"",
                 pre_first_master_output,
@@ -1955,27 +2032,270 @@ end
                 linear_config,
                 inputs,
             )
+        linear_benders_config = SurvivorSelectionConfig(
+            minimum_favorite_spread=nothing,
+            market_guard_weeks=0,
+            through_week=2,
+            hessian_weeks=0,
+            benders_weeks=1,
+        )
+        linear_benders_buffer = IOBuffer()
+        linear_benders_logger = SurvivorModel.Logging.ConsoleLogger(
+            linear_benders_buffer,
+            SurvivorModel.Logging.Debug,
+        )
         linear_benders_plan =
-            SurvivorModel._optimize_survivor_expected_weeks_scalar_milp(
-                data,
-                state,
-                SurvivorSelectionConfig(
-                    minimum_favorite_spread=nothing,
-                    market_guard_weeks=0,
-                    through_week=2,
-                    hessian_weeks=0,
-                    benders=true,
-                ),
-                inputs,
-            )
+            SurvivorModel.Logging.with_logger(linear_benders_logger) do
+                SurvivorModel._optimize_survivor_expected_weeks_scalar_milp(
+                    data,
+                    state,
+                    linear_benders_config,
+                    inputs,
+                )
+            end
+        linear_benders_output = String(take!(linear_benders_buffer))
         @test linear_benders_plan.objective_value ≈
               linear_reference_plan.objective_value
+        @test occursin(
+            "objective_component = :tail_and_covariance_correction",
+            linear_benders_output,
+        )
+
+        alternative_week_count = 5
+        alternative_choices = 4
+        alternative_pairs = [
+            (week, choice)
+            for week in 1:alternative_week_count
+            for choice in 1:alternative_choices
+        ]
+        alternative_derivative_values = [
+            begin
+                index = (week - 1) * alternative_choices + choice
+                (
+                    probability=0.77 + 0.21 * sin(1.234 * index),
+                    gradient=[
+                        1.6 * sin(1.71 * index),
+                        1.4 * cos(0.93 * index),
+                    ],
+                    hessian=0.8 * sin(2.11 * index),
+                )
+            end
+            for (week, choice) in alternative_pairs
+        ]
+        alternative_parameter_keys = [(:td, "A"), (:td, "B")]
+        alternative_parameters =
+            SurvivorModel.SurvivorParameterSystem(
+                alternative_parameter_keys,
+                Dict(
+                    key => index
+                    for (index, key) in enumerate(alternative_parameter_keys)
+                ),
+                [0.0, 0.0],
+                [0.7, 0.4],
+            )
+        alternative_inputs = SurvivorModel.SurvivorObjectiveInputs(
+            alternative_parameters,
+            [
+                SurvivorModel.SurvivorCandidateDerivatives(
+                    values.probability,
+                    values.gradient,
+                    values.hessian,
+                )
+                for values in alternative_derivative_values
+            ],
+        )
+        alternative_candidates = DataFrame(
+            game_id=[
+                "alternative_w$(week)_g$(choice)"
+                for (week, choice) in alternative_pairs
+            ],
+            week=[week for (week, _) in alternative_pairs],
+            team=[
+                "ALT$(week)_$(choice)"
+                for (week, choice) in alternative_pairs
+            ],
+            opponent=[
+                "OPP$(week)_$(choice)"
+                for (week, choice) in alternative_pairs
+            ],
+            is_home=[iseven(choice) for (_, choice) in alternative_pairs],
+            win_probability=[
+                values.probability
+                for values in alternative_derivative_values
+            ],
+        )
+        alternative_state =
+            SurvivorPoolState(2025, 1; strikes_remaining=2)
+        alternative_data = SurvivorModel._normalize_survivor_candidates(
+            alternative_candidates,
+            alternative_state,
+            alternative_week_count,
+        )
+        alternative_config = SurvivorSelectionConfig(
+            minimum_favorite_spread=nothing,
+            market_guard_weeks=0,
+            through_week=alternative_week_count,
+            hessian_weeks=0,
+            benders_weeks=1,
+            timeout_seconds=60.0,
+        )
+        alternative_benders_buffer = IOBuffer()
+        alternative_benders_logger = SurvivorModel.Logging.ConsoleLogger(
+            alternative_benders_buffer,
+            SurvivorModel.Logging.Debug,
+        )
+        alternative_benders_plan =
+            SurvivorModel.Logging.with_logger(alternative_benders_logger) do
+                SurvivorModel._optimize_survivor_expected_weeks_scalar_milp(
+                    alternative_data,
+                    alternative_state,
+                    alternative_config,
+                    alternative_inputs,
+                )
+            end
+        alternative_benders_output = String(take!(alternative_benders_buffer))
+        @test occursin(
+            "survivor Benders alternative master solve complete",
+            alternative_benders_output,
+        )
+        @test occursin(
+            "survivor Benders solve complete",
+            alternative_benders_output,
+        )
+        alternative_benders_lines = split(alternative_benders_output, '\n')
+        alternative_solve_line = findfirst(
+            line -> occursin(
+                "survivor Benders alternative master solve complete",
+                line,
+            ),
+            alternative_benders_lines,
+        )
+        alternative_master_bound = nothing
+        alternative_forbidden_first_pick = nothing
+        if alternative_solve_line !== nothing
+            alternative_solve_log = join(
+                alternative_benders_lines[
+                    alternative_solve_line:min(
+                        alternative_solve_line + 9,
+                        length(alternative_benders_lines),
+                    )
+                ],
+                "\n",
+            )
+            alternative_master_bound_match = match(
+                r"master_bound = ([^\n]+)",
+                alternative_solve_log,
+            )
+            if alternative_master_bound_match !== nothing
+                alternative_master_bound = parse(
+                    Float64,
+                    alternative_master_bound_match.captures[1],
+                )
+            end
+            alternative_forbidden_pick_match = match(
+                r"forbidden_first_pick = \"([^\"]+)\"",
+                alternative_solve_log,
+            )
+            if alternative_forbidden_pick_match !== nothing
+                alternative_forbidden_first_pick =
+                    alternative_forbidden_pick_match.captures[1]
+            end
+        end
+        @test alternative_master_bound !== nothing
+        if alternative_master_bound !== nothing
+            @test alternative_master_bound > 0.0
+        end
+        @test alternative_forbidden_first_pick !== nothing
+        alternative_candidate_positions = [
+            Int(alternative_data.week[index]) -
+            alternative_state.current_week + 1
+            for index in 1:nrow(alternative_data)
+        ]
+        alternative_week_indices = [
+            findall(==(position), alternative_candidate_positions)
+            for position in 1:alternative_week_count
+        ]
+        alternative_losses =
+            SurvivorModel._survivor_loss_threshold(alternative_state)
+        alternative_gradient_references =
+            SurvivorModel._survivor_gradient_reference_indices(
+                alternative_candidate_positions,
+                alternative_week_count,
+                alternative_inputs.covariance_gradient_gram;
+                maximum_reference_position=alternative_config.hessian_weeks,
+            )
+        alternative_best_objective = -Inf
+        alternative_best_first_picks = Set{String}()
+        alternative_best_other_pick_objective = -Inf
+        for schedule in Iterators.product(alternative_week_indices...)
+            selected_by_position = collect(schedule)
+            values = SurvivorModel._survivor_scalar_forward_values(
+                selected_by_position,
+                alternative_inputs,
+                alternative_week_count,
+                alternative_losses;
+                curvature_weeks=alternative_config.hessian_weeks,
+                gradient_reference_indices=
+                    alternative_gradient_references,
+            )
+            objective = sum(
+                values.probability[position + 1, loss_state]
+                for position in 1:alternative_week_count,
+                loss_state in 1:alternative_losses
+            ) + 0.5 * sum(
+                values.hessian[position + 1, loss_state]
+                for position in 1:alternative_config.hessian_weeks,
+                loss_state in 1:alternative_losses;
+                init=0.0,
+            )
+            if alternative_forbidden_first_pick !== nothing &&
+               String(alternative_data.team[selected_by_position[1]]) !=
+               alternative_forbidden_first_pick
+                alternative_best_other_pick_objective = max(
+                    alternative_best_other_pick_objective,
+                    objective,
+                )
+            end
+            if objective > alternative_best_objective + 1e-10
+                alternative_best_objective = objective
+                empty!(alternative_best_first_picks)
+                push!(
+                    alternative_best_first_picks,
+                    String(alternative_data.team[selected_by_position[1]]),
+                )
+            elseif isapprox(
+                objective,
+                alternative_best_objective;
+                rtol=0.0,
+                atol=1e-10,
+            )
+                push!(
+                    alternative_best_first_picks,
+                    String(alternative_data.team[selected_by_position[1]]),
+                )
+            end
+        end
+        @test length(alternative_best_first_picks) == 1
+        @test alternative_benders_plan.objective_value ≈
+              alternative_best_objective
+        @test only(alternative_benders_plan.current_pick.team) in
+              alternative_best_first_picks
+        @test isfinite(alternative_best_other_pick_objective)
+        if alternative_master_bound !== nothing &&
+           alternative_forbidden_first_pick !== nothing
+            @test alternative_best_other_pick_objective <=
+                  alternative_master_bound +
+                  SurvivorModel._survivor_benders_gap_tolerance(
+                      alternative_best_other_pick_objective,
+                      alternative_master_bound,
+                  )
+        end
 
         benders_timeout_config = SurvivorSelectionConfig(
             minimum_favorite_spread=nothing,
             market_guard_weeks=0,
             through_week=2,
-            benders=true,
+            benders_weeks=1,
             timeout_seconds=1e-12,
         )
         benders_timeout_plan =
@@ -2033,7 +2353,7 @@ end
         config = SurvivorSelectionConfig()
         SurvivorModel.Logging.with_logger(SurvivorModel.Logging.NullLogger()) do
             @test !SurvivorModel._survivor_debug_logging_enabled()
-            model = SurvivorModel._survivor_milp_model(config, nothing)
+            model = SurvivorModel._survivor_milp_model(config)
             @test SurvivorModel.JuMP.MOI.get(
                 SurvivorModel.JuMP.backend(model),
                 SurvivorModel.JuMP.MOI.Silent(),
@@ -2046,15 +2366,14 @@ end
         )
         SurvivorModel.Logging.with_logger(debug_logger) do
             @test SurvivorModel._survivor_debug_logging_enabled()
-            model = SurvivorModel._survivor_milp_model(config, nothing)
+            model = SurvivorModel._survivor_milp_model(config)
             @test !SurvivorModel.JuMP.MOI.get(
                 SurvivorModel.JuMP.backend(model),
                 SurvivorModel.JuMP.MOI.Silent(),
             )
-            benders_config = SurvivorSelectionConfig(benders=true)
+            benders_config = SurvivorSelectionConfig(benders_weeks=1)
             benders_model = SurvivorModel._survivor_milp_model(
                 benders_config,
-                nothing,
             )
             @test SurvivorModel.JuMP.MOI.get(
                 SurvivorModel.JuMP.backend(benders_model),
@@ -2063,29 +2382,42 @@ end
             benders_direct_model =
                 SurvivorModel._survivor_direct_milp_model(
                     benders_config,
-                    nothing,
                 )
             @test SurvivorModel.JuMP.MOI.get(
                 SurvivorModel.JuMP.backend(benders_direct_model),
                 SurvivorModel.JuMP.MOI.Silent(),
             )
-            custom_model = SurvivorModel._survivor_milp_model(
-                config,
-                SurvivorModel.HiGHS.Optimizer,
-            )
-            @test SurvivorModel.JuMP.MOI.get(
-                SurvivorModel.JuMP.backend(custom_model),
-                SurvivorModel.JuMP.MOI.Silent(),
-            )
         end
+    end
+
+    @testset "Benders initial LP solver options" begin
+        moi = SurvivorModel.JuMP.MOI
+        config = SurvivorSelectionConfig(benders_weeks=1)
+        lp_optimizer = moi.instantiate(
+            SurvivorModel._survivor_optimizer(
+                config;
+                lp_relaxation=true,
+            ),
+        )
+        master_optimizer = moi.instantiate(
+            SurvivorModel._survivor_optimizer(config),
+        )
+        raw_attribute(name) = moi.RawOptimizerAttribute(name)
+        @test moi.get(lp_optimizer, raw_attribute("solver")) == "hipo"
+        @test moi.get(lp_optimizer, raw_attribute("parallel")) == "on"
+        @test moi.get(lp_optimizer, raw_attribute("threads")) == 0
+        @test moi.get(lp_optimizer, raw_attribute("run_crossover")) == "on"
+        @test moi.get(master_optimizer, raw_attribute("solver")) == "choose"
     end
 
     @testset "selection configuration" begin
         @test SurvivorSelectionConfig().hessian_weeks == 3
         @test SurvivorSelectionConfig(hessian_weeks=0).hessian_weeks == 0
         @test SurvivorSelectionConfig(hessian_weeks=19).hessian_weeks == 19
-        @test !SurvivorSelectionConfig().benders
-        @test SurvivorSelectionConfig(benders=true).benders
+        @test SurvivorSelectionConfig().benders_weeks === nothing
+        @test SurvivorSelectionConfig(benders_weeks=0).benders_weeks == 0
+        @test SurvivorSelectionConfig(benders_weeks=20).benders_weeks == 20
+        @test_throws ArgumentError SurvivorSelectionConfig(benders_weeks=-1)
         @test SurvivorSelectionConfig().timeout_seconds === nothing
         @test SurvivorSelectionConfig(timeout_seconds=12.5).timeout_seconds == 12.5
         @test SurvivorSelectionConfig().banned_first_pick_teams == String[]
@@ -2100,7 +2432,6 @@ end
         @testset "Benders direct master" begin
             model = SurvivorModel._survivor_direct_milp_model(
                 SurvivorSelectionConfig(),
-                nothing,
             )
             @test SurvivorModel.JuMP.backend(model) isa
                   SurvivorModel.HiGHS.Optimizer

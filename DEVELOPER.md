@@ -79,60 +79,56 @@ objective.
 
 ## Benders backend
 
-`SurvivorSelectionConfig(benders=true)` keeps the weekly team assignment in a
-binary HiGHS master built as a JuMP direct model. The master also contains the
-exact probability states and their one-hot recurrence gates; its objective is
-the base probability contribution plus `theta`, which represents the Hessian
-correction. The selected schedule's parameter-gradient, covariance-gradient,
-and Hessian recurrences are evaluated directly, without constructing or
-optimizing an LP recourse model. Probability and Hessian intervals provide
-finite bounds for the two objective components.
+`SurvivorSelectionConfig(benders_weeks=K)` enables a meet-in-the-middle
+decomposition. `K` is clamped to the remaining horizon. The HiGHS direct
+master contains every binary pick, all one-pick-per-week and team-once
+constraints, and the survival-probability recurrence through the first `K`
+weeks. Its bounded `theta` represents the omitted tail survival and all
+configured covariance-gradient and Hessian corrections. These recurrences are
+evaluated analytically from a selected schedule; no recourse LP is built or
+optimized.
 
-If Hessian corrections are modeled and the global bound leaves a gap above the
-greedy incumbent, a reverse pass through the recurrence graph generates an
-analytic cut at the greedy schedule before the first master solve. Each
-one-hot product gate uses the active McCormick side selected by the sign of its
-back-propagated objective adjoint. The resulting pick and probability-state
-slopes form a dual-feasible supporting cut, tight at the directly evaluated
-recourse value. The initial cut is skipped when the global bound already
-closes the gap or when there is no Hessian correction to decompose.
+The initial master cut is derived from the dual of the full extensive-form LP
+relaxation. Rows containing recourse variables provide the dual-feasible
+projection onto pick and prefix-state variables; master-only assignment and
+prefix constraints remain in the master. This LP is solved to optimality,
+unless the shared timeout expires, using HiGHS HiPO with `parallel=on`,
+automatic thread selection (`threads=0`), and `run_crossover=on`; these
+settings are limited to the initial LP relaxation, not the master MIPs. The
+solver's dual status is checked before constructing the cut. An additional
+product-hull-based interval bounds `theta`. Two cached
+greedy schedules seed analytic recourse cuts: one greedily selects the
+highest-mean candidate each week, while the second forces the second-highest-
+mean candidate in week one. Analytic
+reverse-mode cuts account for the prefix state and use the existing projection
+of tail parameter gradients onto games to limit the number of gradient gates.
+Hessian and gradient corrections remain in recourse, including corrections
+associated with prefix weeks.
 
-Cuts are added to the same direct master between solves. The master is seeded
-with the deterministic greedy plan, its probability trajectory, and its
-Hessian correction; starts are refreshed from the best feasible plan after
-each cut. Caller-supplied optimizers must support direct incremental
-constraints and MIP starts. The master is re-solved after each cut; the loop
-stops when its upper bound meets the best directly evaluated feasible plan
-within tolerance. This is an outer Benders loop and does not depend on solver
-callbacks.
+At each iteration, the master is solved to optimality and its selected
+schedule is evaluated exactly. A zero recourse correction certifies that
+schedule as globally optimal. Otherwise its exact objective is a feasible
+lower bound; a second master solve forbids its first pick, and its bound is an
+upper bound for all alternatives. Comparing those bounds can certify the
+current-week pick without proving that the returned future schedule is
+globally optimal. If the bounds intersect, an analytic optimality cut is
+added and the loop continues. The mode therefore guarantees the optimal
+current-week pick, not necessarily the globally optimal complete schedule. If
+only one current-week candidate is eligible, the pick is forced and its
+feasible greedy witness is returned without constructing the master.
 
-`SurvivorSelectionConfig(timeout_seconds=...)` passes a HiGHS `time_limit` for
-the extensive-form solve. Benders mode updates the master time limit from the
-shared solve budget; deterministic recurrence evaluation and cut generation
-also count toward elapsed time. It retains the deterministic greedy plan as a
-feasible incumbent, so a timeout returns the best feasible plan seen so far.
-The extensive-form optimizer returns its best solver incumbent when available;
-a timeout without one is an optimization failure. Debug logging records
-extensive-form phase timings, termination and primal status, incumbent
-availability and objective, bound, relative gap, and branch-and-bound node
-count. For the extensive-form default optimizer, it also enables native HiGHS
-root and MIP progress output, routed away from stdout so CLI picks remain
-clean.
+`SurvivorSelectionConfig(timeout_seconds=...)` provides a shared solve budget
+for the full LP relaxation and Benders master MIPs. Deterministic recurrence
+evaluation and cut generation also count toward elapsed time. The best
+feasible full schedule is retained, so timeout returns it without claiming an
+optimality proof. All survivor optimizations use HiGHS; callers cannot supply a
+custom optimizer. Debug logging reports LP-cut provenance, master sizes,
+the initial LP solver and barrier/crossover iterations, solve bounds and
+statuses, analytic corrections, cut coefficients, and selected teams. All
+package diagnostics remain Debug-level; normal library calls stay silent.
 
-Benders keeps native HiGHS output silent, even with Debug enabled, and emits
-structured diagnostics instead. It logs master model size (variables,
-constraint rows, and affine nonzeros); each master solve's status, elapsed
-time, base probability objective, Hessian-correction `theta`, bound, relative
-gap, node count, simplex iterations, cut count, and the week-ordered team
-list; each direct recurrence evaluation's elapsed time, Hessian-correction
-objective, and fixed team list; and each analytic cut's intercept and
-pick/probability slope ranges. Team lists contain only abbreviations, with no
-week labels. Simplex iterations are reported for master solves when the
-optimizer exposes the MathOptInterface attribute. All package diagnostics
-remain Debug-level; normal library calls stay silent.
-
-`write_survivor_pool_lp` always exports the initial extensive-form HiGHS model,
-including when the selection config has `benders=true`.
+`write_survivor_pool_lp` always exports the initial extensive-form HiGHS model
+and exits without solving, regardless of `benders_weeks`.
 
 ## Cache maintenance
 

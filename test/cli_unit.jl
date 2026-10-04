@@ -56,7 +56,7 @@ end
         market_guard_weeks=0,
         through_week=2,
         hessian_weeks=2,
-        benders=true,
+        benders_weeks=1,
     )
     mktempdir() do directory
         path = joinpath(directory, "survivor_2023.lp")
@@ -88,13 +88,19 @@ end
             banned_first_pick_teams=String[],
             write_model_file=nothing,
             hessian_weeks=3,
-            benders=false,
+            benders_weeks=nothing,
             timeout_seconds=nothing,
             refresh_data=false,
         )
         @test SurvivorModel._parse_survivor_cli_args(
-            ["--season=2023", "--benders"],
-        ).benders
+            ["--season=2023", "--benders-weeks", "5"],
+        ).benders_weeks == 5
+        @test SurvivorModel._parse_survivor_cli_args(
+            ["--season=2023", "--benders-weeks=5"],
+        ).benders_weeks == 5
+        @test SurvivorModel._parse_survivor_cli_args(
+            ["--season=2023", "--benders-weeks=0"],
+        ).benders_weeks == 0
         @test SurvivorModel._parse_survivor_cli_args(
             ["--season=2023", "--strikes=4"],
         ).initial_strikes == 4
@@ -134,7 +140,8 @@ end
         @test !occursin("--timings", usage)
         @test occursin("--timeout", usage)
         @test occursin("--ban", usage)
-        @test occursin("--benders", usage)
+        @test occursin("--benders-weeks", usage)
+        @test !occursin("--benders ", usage)
         @test occursin("--write-model", usage)
         @test occursin("--hessian-weeks", usage)
         @test !occursin("--objective", usage)
@@ -161,7 +168,22 @@ end
             ["--season", "2023", "--timeout", "2", "--timeout", "3"],
         )
         @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
-            ["--season", "2023", "--benders", "--benders"],
+            ["--season", "2023", "--benders"],
+        )
+        @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
+            ["--season", "2023", "--benders-weeks"],
+        )
+        @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
+            ["--season", "2023", "--benders-weeks", "-1"],
+        )
+        @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
+            [
+                "--season",
+                "2023",
+                "--benders-weeks",
+                "2",
+                "--benders-weeks=3",
+            ],
         )
         @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
             ["--season", "2023", "--ban"],
@@ -400,7 +422,7 @@ end
                 ),
             ) do
                 SurvivorModel._run_survivor_cli(
-                    ["--season", "2023", "--benders"];
+                    ["--season", "2023", "--benders-weeks", "1"];
                     input=IOBuffer("A\n"),
                     output=output,
                     schedule=schedule,
@@ -419,7 +441,7 @@ end
             @test occursin("survivor phase complete", log_text)
             @test occursin("optimize_start", log_text)
             @test occursin("optimize", log_text)
-            @test occursin("survivor Benders solve complete", log_text)
+            @test occursin("survivor Benders first pick forced", log_text)
         end
 
         mktempdir() do cache_directory
@@ -447,7 +469,8 @@ end
                     "2023",
                     "--hessian-weeks",
                     "2",
-                    "--benders",
+                    "--benders-weeks",
+                    "1",
                     "--write-model",
                     model_path,
                 ];

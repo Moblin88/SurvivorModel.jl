@@ -83,10 +83,17 @@ objective.
 decomposition. `K` is clamped to the remaining horizon. The HiGHS direct
 master contains every binary pick, all one-pick-per-week and team-once
 constraints, and the survival-probability recurrence through the first `K`
-weeks. Its bounded `theta` represents the omitted tail survival and all
-configured covariance-gradient and Hessian corrections. These recurrences are
+weeks only. All parameter/projected-gradient and Hessian states and gates
+remain in fully analytic recourse. The gradient switch and reference pruning
+use the original full correction horizon, independently of `K`.
+
+The master objective is survival through `K` plus `theta`. Its upper bound
+sums omitted survival and all Hessian interval upper bounds, including when
+`K` covers the full horizon. Shorter prefixes retain a
+`1e-8 * max(1,abs(bound))` numerical
+margin. `hessian_weeks` semantics do not change. Tail recurrences are
 evaluated analytically from a selected schedule; no recourse LP is built or
-optimized.
+solved in the seed or iteration loop.
 
 The initial master cut is derived from the dual of the full extensive-form LP
 relaxation. Rows containing recourse variables provide the dual-feasible
@@ -95,15 +102,48 @@ prefix constraints remain in the master. This LP is solved to optimality,
 unless the shared timeout expires, using HiGHS HiPO with `parallel=on`,
 automatic thread selection (`threads=0`), and `run_crossover=on`; these
 settings are limited to the initial LP relaxation, not the master MIPs. The
-solver's dual status is checked before constructing the cut. An additional
-product-hull-based interval bounds `theta`. Two cached
+solver's dual status and omitted-column stationarity are checked before
+constructing the cut. Signed maximization multipliers are `-JuMP.dual(row)`;
+equality shadow prices must not be used because they discard the required
+sign. Only picks and prefix probability states are master columns. An additional
+product-hull-based interval bound constrains `theta`. Two cached
 greedy schedules seed analytic recourse cuts: one greedily selects the
 highest-mean candidate each week, while the second forces the second-highest-
-mean candidate in week one. Analytic
-reverse-mode cuts account for the prefix state and use the existing projection
-of tail parameter gradients onto games to limit the number of gradient gates.
-Hessian and gradient corrections remain in recourse, including corrections
-associated with prefix weeks.
+mean candidate in week one. The analytic reverse-pass construction uses the existing
+projection of tail parameter gradients onto games to limit the number of
+gradient gates. No reference/Pareto selection or core construction is used.
+
+At each schedule, forward recurrences supply the exact states. The reverse
+pass propagates recourse objective adjoints through the probability,
+parameter/projected-gradient, Hessian and product-hull recurrences, initialized
+with omitted survival terms and `0.5` on every Hessian objective state.
+All derivative recurrences propagate through the full correction horizon;
+only probability propagation stops at the master split, producing explicit
+prefix-probability coefficients alongside pick coefficients. Initial-state and gate RHS
+contributions produce the dual intercept. The cut is
+`theta <= intercept + pick_slopes'picks + probability_slopes'prefix_probabilities`.
+Its intercept comes from the dual RHS, never from subtracting slopes from
+an evaluated objective. The existing scale-dependent Benders objective
+tolerance checks dual tightness at the generating schedule; a failed
+certificate raises an explicit error. Seeds, main schedules and alternative
+schedules all use this same analytic cut construction.
+Their prefix objectives contain survival only. Master warm starts cover
+picks, `theta`, and prefix probabilities; scalar extensive-model warm starts
+remain unchanged. Alternative solve results, including the prefix survival
+objective, are captured before restoring
+forbidden-pick bounds or starts.
+
+For a gate adjoint `a`, the certificate uses the selected recurrence upper
+side if `a>0`, the lower side if `a<0`, and the corresponding unselected
+pick bounds; collapsed gates are affine pick terms. Reverse substitution
+cancels every omitted state column and leaves retained state slopes. All
+chosen rows are tight at the generating binary schedule, so RHS-derived
+intercept plus slopes equals exact recourse and certifies dual optimality.
+The unit suite checks global-cut stationarity, analytic cut tightness and
+validity exhaustively over feasible schedules, and intercept invariance
+under small objective perturbations. It
+covers `K=0`, full `K`, `H=0`, all relative split/horizon positions, both
+gradient representations and switch boundaries, and multiple loss states.
 
 At each iteration, the master is solved to optimality and its selected
 schedule is evaluated exactly. A zero recourse correction certifies that
@@ -118,14 +158,24 @@ only one current-week candidate is eligible, the pick is forced and its
 feasible greedy witness is returned without constructing the master.
 
 `SurvivorSelectionConfig(timeout_seconds=...)` provides a shared solve budget
-for the full LP relaxation and Benders master MIPs. Deterministic recurrence
-evaluation and cut generation also count toward elapsed time. The best
+for the full LP relaxation and Benders master MIPs. Model construction, deterministic recurrence
+evaluation and cut generation also count toward elapsed time; the remaining
+budget is reapplied before each solve. The best
 feasible full schedule is retained, so timeout returns it without claiming an
-optimality proof. All survivor optimizations use HiGHS; callers cannot supply a
+optimality proof.
+Unexpected LP statuses or failed numerical certificates raise explicit
+errors. All survivor optimizations use HiGHS; callers cannot supply a
 custom optimizer. Debug logging reports LP-cut provenance, master sizes,
-the initial LP solver and barrier/crossover iterations, solve bounds and
-statuses, analytic corrections, cut coefficients, and selected teams. All
-package diagnostics remain Debug-level; normal library calls stay silent.
+the initial LP solver and barrier/crossover iterations, and a plain progress
+table with one row per master or forbidden-pick solve. The `cuts` column
+counts cuts present at solve time: the alternative row includes the
+main-schedule cut, and the next master row includes both new cuts when bounds
+overlap. The table shows each solve's status, selected and forbidden first
+picks, best feasible lower bound, master objective and upper bound, exact
+schedule objective, recourse correction, cut count, and solve time. Its header
+repeats every 20 rows. The table is written to stderr only when package Debug
+logging is enabled. Detailed initialization and final proof/timeout records
+remain available. Normal library calls stay silent.
 
 `write_survivor_pool_lp` always exports the initial extensive-form HiGHS model
 and exits without solving, regardless of `benders_weeks`.

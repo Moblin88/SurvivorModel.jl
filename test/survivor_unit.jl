@@ -68,6 +68,28 @@ function _market_guard_candidates()
     )
 end
 
+function _capture_stderr_output(f::Function)
+    return mktemp() do _, output
+        result = redirect_stderr(output) do
+            f()
+        end
+        flush(output)
+        seekstart(output)
+        return result, read(output, String)
+    end
+end
+
+function _test_benders_progress_rows(output::AbstractString)
+    rows = Vector{Vector{String}}()
+    for line in split(output, '\n')
+        fields = strip.(split(line, " | "))
+        length(fields) == 13 || continue
+        tryparse(Int, fields[1]) === nothing && continue
+        push!(rows, String.(fields))
+    end
+    return rows
+end
+
 @testset "survivor pool optimization" begin
     @testset "candidate expansion and filtering" begin
         forecast = _survivor_forecast_fixture()
@@ -1792,7 +1814,7 @@ end
                     gradient_reference_indices=
                         debug_gradient_reference_indices,
                 )
-            recourse_objective = sum(
+            full_objective = sum(
                 selected_values.probability[position + 1, loss_state]
                 for position in 1:debug_number_of_weeks,
                 loss_state in 1:debug_losses_to_elimination
@@ -1802,6 +1824,10 @@ end
                 loss_state in 1:debug_losses_to_elimination;
                 init=0.0,
             )
+            prefix_objective = SurvivorModel._survivor_benders_prefix_expression(
+                selected_values.probability, 1, debug_losses_to_elimination,
+            )
+            recourse_objective = full_objective - prefix_objective
             lp_cut_value = SurvivorModel._survivor_benders_lp_cut_value(
                 debug_lp_relaxation.dual_cut,
                 selected_by_position,
@@ -1809,7 +1835,10 @@ end
                 1,
                 debug_losses_to_elimination,
             )
-            @test lp_cut_value + 1e-7 >= recourse_objective
+            @test lp_cut_value + 1e-7 >= full_objective
+            @test propertynames(debug_lp_relaxation.dual_cut) ==
+                (:intercept, :pick_slopes, :probability_slopes, :margin, :stationarity_residual)
+            @test debug_lp_relaxation.dual_cut.stationarity_residual <= 2e-6
             cut = SurvivorModel._survivor_benders_analytic_cut_components(
                 selected_by_position,
                 recourse_objective,
@@ -1819,6 +1848,43 @@ end
                 debug_number_of_weeks,
                 debug_losses_to_elimination,
                 debug_curvature_weeks,
+                1,
+                debug_gradient_reference_indices,
+                debug_gradient_reference_slots,
+                debug_gradient_switch_position,
+                debug_parameter_state_count,
+                debug_bounds,
+            )
+            for objective_shift in (-1e-6, 1e-6)
+                perturbed_cut =
+                    SurvivorModel._survivor_benders_analytic_cut_components(
+                        selected_by_position,
+                        recourse_objective + objective_shift,
+                        debug_inputs,
+                        debug_candidate_indices,
+                        debug_week_indices,
+                        debug_number_of_weeks,
+                        debug_losses_to_elimination,
+                        debug_curvature_weeks,
+                        1,
+                        debug_gradient_reference_indices,
+                        debug_gradient_reference_slots,
+                        debug_gradient_switch_position,
+                        debug_parameter_state_count,
+                        debug_bounds,
+                    )
+                @test perturbed_cut == cut
+            end
+            @test_throws ArgumentError SurvivorModel._survivor_benders_analytic_cut_components(
+                selected_by_position,
+                recourse_objective - 0.01,
+                debug_inputs,
+                debug_candidate_indices,
+                debug_week_indices,
+                debug_number_of_weeks,
+                debug_losses_to_elimination,
+                debug_curvature_weeks,
+                1,
                 debug_gradient_reference_indices,
                 debug_gradient_reference_slots,
                 debug_gradient_switch_position,
@@ -1836,7 +1902,7 @@ end
                         gradient_reference_indices=
                             debug_gradient_reference_indices,
                     )
-                other_recourse_objective = sum(
+                other_full_objective = sum(
                     other_values.probability[position + 1, loss_state]
                     for position in 1:debug_number_of_weeks,
                     loss_state in 1:debug_losses_to_elimination
@@ -1846,16 +1912,138 @@ end
                     loss_state in 1:debug_losses_to_elimination;
                     init=0.0,
                 )
+                other_prefix_objective = SurvivorModel._survivor_benders_prefix_expression(
+                    other_values.probability, 1, debug_losses_to_elimination,
+                )
+                other_recourse_objective =
+                    other_full_objective - other_prefix_objective
                 cut_value = cut.intercept +
                     sum(
                         cut.pick_slopes[index]
                         for index in other_schedule
+                    ) +
+                    sum(
+                        cut.probability_slopes[position, loss_state] *
+                        other_values.probability[position + 1, loss_state]
+                        for position in 1:1,
+                        loss_state in 1:debug_losses_to_elimination;
+                        init=0.0,
                     )
-                @test !hasproperty(cut, :probability_slopes)
+                @test hasproperty(cut, :probability_slopes)
                 if other_schedule == selected_by_position
                     @test cut_value ≈ other_recourse_objective atol=1e-7
                 else
                     @test cut_value + 1e-7 >= other_recourse_objective
+                end
+            end
+        end
+        @testset "probability-only master across correction horizons" begin
+            for losses in (1, 2), hessian_weeks in 0:3
+                matrix_state = SurvivorPoolState(2025, 1; strikes_remaining=losses)
+                references = SurvivorModel._survivor_gradient_reference_indices(
+                    debug_data.week, 3, debug_inputs.covariance_gradient_gram;
+                    maximum_reference_position=hessian_weeks,
+                )
+                objectives = Dict(
+                    Tuple(schedule) => begin
+                        forward = SurvivorModel._survivor_scalar_forward_values(
+                            schedule, debug_inputs, 3, losses;
+                            curvature_weeks=hessian_weeks,
+                            gradient_reference_indices=references,
+                        )
+                        SurvivorModel._survivor_benders_prefix_expression(
+                            forward.probability, 3, losses,
+                        ) + 0.5 * sum(forward.hessian)
+                    end
+                    for schedule in debug_feasible_schedules
+                )
+                optimum = maximum(values(objectives))
+                slots = [
+                    Dict(reference => slot for (slot, reference) in enumerate(refs))
+                    for refs in references
+                ]
+                bounds = SurvivorModel._survivor_scalar_bounds(
+                    debug_inputs, debug_data.week, 3, losses;
+                    curvature_weeks=hessian_weeks,
+                    gradient_reference_indices=references,
+                    candidate_teams=debug_data.team,
+                )
+                for prefix in 0:3
+                    upper = SurvivorModel._survivor_benders_objective_upper_bound(
+                        bounds, 3, losses, hessian_weeks, prefix,
+                    )
+                    expected_upper = sum(
+                        bounds.probability.upper[position + 1, loss_state]
+                        for position in (prefix + 1):3, loss_state in 1:losses;
+                        init=0.0,
+                    ) + 0.5 * sum(
+                        bounds.hessian.upper[position + 1, loss_state]
+                        for position in 1:hessian_weeks, loss_state in 1:losses;
+                        init=0.0,
+                    )
+                    @test upper == expected_upper
+                    for switch in 1:(hessian_weeks + 1),
+                        schedule in debug_feasible_schedules
+                        forward = SurvivorModel._survivor_scalar_forward_values(
+                            schedule, debug_inputs, 3, losses;
+                            curvature_weeks=hessian_weeks,
+                            gradient_reference_indices=references,
+                        )
+                        recourse = objectives[Tuple(schedule)] -
+                            SurvivorModel._survivor_benders_prefix_expression(
+                                forward.probability, prefix, losses,
+                            )
+                        @test recourse <= upper + 1e-8
+                        cut = SurvivorModel._survivor_benders_analytic_cut_components(
+                            schedule, recourse, debug_inputs, debug_candidate_indices,
+                            debug_week_indices, 3, losses, hessian_weeks, prefix,
+                            references, slots, switch,
+                            min(hessian_weeks, switch - 1), bounds,
+                        )
+                        @test propertynames(cut) ==
+                            (:intercept, :pick_slopes, :probability_slopes)
+                        @test size(cut.probability_slopes) == (prefix, losses)
+                        for other_schedule in debug_feasible_schedules
+                            other = SurvivorModel._survivor_scalar_forward_values(
+                                other_schedule, debug_inputs, 3, losses;
+                                curvature_weeks=hessian_weeks,
+                                gradient_reference_indices=references,
+                            )
+                            other_recourse = objectives[Tuple(other_schedule)] -
+                                SurvivorModel._survivor_benders_prefix_expression(
+                                    other.probability, prefix, losses,
+                                )
+                            cut_value = cut.intercept +
+                                sum(cut.pick_slopes[index] for index in other_schedule) +
+                                sum(
+                                    cut.probability_slopes[position, loss_state] *
+                                    other.probability[position + 1, loss_state]
+                                    for position in 1:prefix, loss_state in 1:losses;
+                                    init=0.0,
+                                )
+                            @test cut_value + 1e-8 >= other_recourse
+                            if schedule == other_schedule
+                                @test cut_value ≈ other_recourse atol=2e-10
+                            end
+                        end
+                    end
+                    matrix_config = SurvivorSelectionConfig(
+                        minimum_favorite_spread=nothing, market_guard_weeks=0,
+                        through_week=3, hessian_weeks=hessian_weeks,
+                        benders_weeks=prefix, timeout_seconds=60.0,
+                    )
+                    result = SurvivorModel._optimize_survivor_expected_weeks_scalar_milp(
+                        debug_data, matrix_state, matrix_config, debug_inputs,
+                    )
+                    schedule = SurvivorModel._survivor_fixed_selected_indices(
+                        debug_data, result.selections, matrix_state, 3,
+                    )
+                    @test result.objective_value ≈ objectives[Tuple(schedule)] atol=2e-8
+                    best_first_pick = maximum(
+                        objective for (other, objective) in objectives
+                        if first(other) == first(schedule)
+                    )
+                    @test best_first_pick ≈ optimum atol=2e-6
                 end
             end
         end
@@ -1875,16 +2063,26 @@ end
             benders_debug_buffer,
             SurvivorModel.Logging.Debug,
         )
-        benders_debug_plan =
-            SurvivorModel.Logging.with_logger(benders_debug_logger) do
-                SurvivorModel._optimize_survivor_expected_weeks_scalar_milp(
-                    debug_data,
-                    debug_state,
-                    debug_config,
-                    debug_inputs,
-                )
+        benders_debug_plan, benders_debug_stderr_output =
+            _capture_stderr_output() do
+                SurvivorModel.Logging.with_logger(benders_debug_logger) do
+                    SurvivorModel._optimize_survivor_expected_weeks_scalar_milp(
+                        debug_data,
+                        debug_state,
+                        debug_config,
+                        debug_inputs,
+                    )
+                end
             end
         benders_debug_output = String(take!(benders_debug_buffer))
+        @test !occursin("Running HiGHS", benders_debug_stderr_output)
+        @test !occursin("Simplex", benders_debug_stderr_output)
+        benders_progress_rows =
+            _test_benders_progress_rows(benders_debug_stderr_output)
+        progress_header = SurvivorModel._survivor_benders_progress_header()
+        progress_header_fields = strip.(split(progress_header, " | "))
+        @test length(progress_header_fields) == 13
+        @test count(==("cuts"), progress_header_fields) == 1
         @test benders_debug_plan.objective_value ≈
               debug_reference_plan.objective_value
         @test nrow(benders_debug_plan.selections) == 3
@@ -1902,7 +2100,50 @@ end
         )
         @test !occursin("selected_schedule", benders_debug_output)
         @test occursin("survivor Benders model built", benders_debug_output)
-        @test occursin("survivor Benders master solve complete", benders_debug_output)
+        @test !occursin("survivor Benders progress", benders_debug_output)
+        @test occursin(
+            progress_header,
+            benders_debug_stderr_output,
+        )
+        @test occursin("best-LB", benders_debug_stderr_output)
+        @test occursin("rec-gap", benders_debug_stderr_output)
+        @test any(row -> row[2] == "master", benders_progress_rows)
+        @test all(
+            row -> !(row[2] in ("master-cut", "alt-cut")),
+            benders_progress_rows,
+        )
+        @test all(
+            length(row) == length(progress_header_fields)
+            for row in benders_progress_rows
+        )
+        sample_progress_row = SurvivorModel._survivor_benders_progress_row(
+            21,
+            "master",
+            SurvivorModel.JuMP.MOI.OPTIMAL,
+            "SEA",
+            "-",
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            0.5,
+            0.0,
+            4,
+            0.1,
+        )
+        @test length(progress_header) == length(sample_progress_row)
+        repeated_header_row_count, repeated_header_output =
+            _capture_stderr_output() do
+                SurvivorModel._survivor_benders_print_progress_row(
+                    20,
+                    sample_progress_row,
+                )
+            end
+        @test repeated_header_row_count == 21
+        @test repeated_header_output ==
+            "\n" * progress_header * "\n" *
+            repeat("-", length(progress_header)) * "\n" *
+            sample_progress_row * "\n"
         @test occursin(
             "survivor Benders recourse evaluated analytically",
             benders_debug_output,
@@ -1911,10 +2152,12 @@ end
             "survivor Benders recourse solve complete",
             benders_debug_output,
         )
-        @test occursin("survivor Benders cut added", benders_debug_output)
+        @test occursin(
+            "survivor Benders cut added",
+            benders_debug_output,
+        )
         @test occursin("elapsed_seconds", benders_debug_output)
-        @test occursin("master_bound", benders_debug_output)
-        @test occursin("theta", benders_debug_output)
+        @test occursin("theta", benders_debug_stderr_output)
         @test !occursin("probability_objective", benders_debug_output)
         @test occursin("relative_gap", benders_debug_output)
         @test occursin("node_count", benders_debug_output)
@@ -1954,70 +2197,56 @@ end
             "survivor Benders cut added",
             benders_debug_output,
         )
-        first_master_position = findfirst(
-            "survivor Benders master solve complete",
-            benders_debug_output,
-        )
         @test initial_recourse_position !== nothing
         @test initial_cut_position !== nothing
-        @test first_master_position !== nothing
         if initial_recourse_position !== nothing &&
-           initial_cut_position !== nothing &&
-           first_master_position !== nothing
+           initial_cut_position !== nothing
             @test first(initial_recourse_position) <
-                  first(initial_cut_position) <
-                  first(first_master_position)
-            pre_first_master_end = prevind(
-                benders_debug_output,
-                first(first_master_position),
-            )
-            pre_first_master_output = benders_debug_output[
-                firstindex(benders_debug_output):pre_first_master_end
-            ]
-            debug_greedy_selected_indices =
-                SurvivorModel._survivor_greedy_selected_indices(
-                    debug_data,
-                    debug_state,
-                    debug_config,
-                    debug_inputs,
-                )
-            debug_second_greedy_selected_indices =
-                SurvivorModel._survivor_greedy_selected_indices(
-                    debug_data,
-                    debug_state,
-                    debug_config,
-                    debug_inputs;
-                    first_pick_rank=2,
-                )
-            @test debug_greedy_selected_indices[1] !=
-                  debug_second_greedy_selected_indices[1]
-            debug_greedy_teams = sort(
-                debug_data[debug_greedy_selected_indices, :],
-                :week,
-            ).team
-            debug_greedy_team_list = "[" *
-                join(String.(debug_greedy_teams), ", ") *
-                "]"
-            @test occursin(
-                "source = :greedy_warm_start",
-                pre_first_master_output,
-            )
-            @test occursin(
-                "source = :second_greedy_warm_start",
-                pre_first_master_output,
-            )
-            @test occursin(
-                "cut_method = :analytic_recurrence_dual",
-                pre_first_master_output,
-            )
-            @test occursin("iteration = 0", pre_first_master_output)
-            @test occursin("cut_count = 2", pre_first_master_output)
-            @test occursin("cut_count = 3", pre_first_master_output)
-            @test occursin(
-                "selected_teams = \"$debug_greedy_team_list\"",
-                pre_first_master_output,
-            )
+                  first(initial_cut_position)
         end
+        debug_greedy_selected_indices =
+            SurvivorModel._survivor_greedy_selected_indices(
+                debug_data,
+                debug_state,
+                debug_config,
+                debug_inputs,
+            )
+        debug_second_greedy_selected_indices =
+            SurvivorModel._survivor_greedy_selected_indices(
+                debug_data,
+                debug_state,
+                debug_config,
+                debug_inputs;
+                first_pick_rank=2,
+            )
+        @test debug_greedy_selected_indices[1] !=
+              debug_second_greedy_selected_indices[1]
+        debug_greedy_teams = sort(
+            debug_data[debug_greedy_selected_indices, :],
+            :week,
+        ).team
+        debug_greedy_team_list = "[" *
+            join(String.(debug_greedy_teams), ", ") *
+            "]"
+        @test occursin(
+            "source = :greedy_warm_start",
+            benders_debug_output,
+        )
+        @test occursin(
+            "source = :second_greedy_warm_start",
+            benders_debug_output,
+        )
+        @test occursin(
+            "cut_method = :analytic_recourse_dual",
+            benders_debug_output,
+        )
+        @test occursin("iteration = 0", benders_debug_output)
+        @test occursin("cut_count = 2", benders_debug_output)
+        @test occursin("cut_count = 3", benders_debug_output)
+        @test occursin(
+            "selected_teams = \"$debug_greedy_team_list\"",
+            benders_debug_output,
+        )
 
         linear_config = SurvivorSelectionConfig(
             minimum_favorite_spread=nothing,
@@ -2144,61 +2373,45 @@ end
             alternative_benders_buffer,
             SurvivorModel.Logging.Debug,
         )
-        alternative_benders_plan =
-            SurvivorModel.Logging.with_logger(alternative_benders_logger) do
-                SurvivorModel._optimize_survivor_expected_weeks_scalar_milp(
-                    alternative_data,
-                    alternative_state,
-                    alternative_config,
-                    alternative_inputs,
-                )
+        alternative_benders_plan, alternative_benders_stderr_output =
+            _capture_stderr_output() do
+                SurvivorModel.Logging.with_logger(
+                    alternative_benders_logger,
+                ) do
+                    SurvivorModel._optimize_survivor_expected_weeks_scalar_milp(
+                        alternative_data,
+                        alternative_state,
+                        alternative_config,
+                        alternative_inputs,
+                    )
+                end
             end
         alternative_benders_output = String(take!(alternative_benders_buffer))
         @test occursin(
-            "survivor Benders alternative master solve complete",
-            alternative_benders_output,
+            SurvivorModel._survivor_benders_progress_header(),
+            alternative_benders_stderr_output,
         )
+        @test !occursin("survivor Benders progress", alternative_benders_output)
         @test occursin(
             "survivor Benders solve complete",
             alternative_benders_output,
         )
-        alternative_benders_lines = split(alternative_benders_output, '\n')
+        alternative_progress_rows =
+            _test_benders_progress_rows(alternative_benders_stderr_output)
         alternative_solve_line = findfirst(
-            line -> occursin(
-                "survivor Benders alternative master solve complete",
-                line,
-            ),
-            alternative_benders_lines,
+            row -> length(row) >= 13 && row[2] == "alt",
+            alternative_progress_rows,
         )
         alternative_master_bound = nothing
         alternative_forbidden_first_pick = nothing
+        alternative_selected_first_pick = nothing
         if alternative_solve_line !== nothing
-            alternative_solve_log = join(
-                alternative_benders_lines[
-                    alternative_solve_line:min(
-                        alternative_solve_line + 9,
-                        length(alternative_benders_lines),
-                    )
-                ],
-                "\n",
-            )
-            alternative_master_bound_match = match(
-                r"master_bound = ([^\n]+)",
-                alternative_solve_log,
-            )
-            if alternative_master_bound_match !== nothing
-                alternative_master_bound = parse(
-                    Float64,
-                    alternative_master_bound_match.captures[1],
-                )
-            end
-            alternative_forbidden_pick_match = match(
-                r"forbidden_first_pick = \"([^\"]+)\"",
-                alternative_solve_log,
-            )
-            if alternative_forbidden_pick_match !== nothing
-                alternative_forbidden_first_pick =
-                    alternative_forbidden_pick_match.captures[1]
+            progress_fields = alternative_progress_rows[alternative_solve_line]
+            if length(progress_fields) >= 13
+                alternative_selected_first_pick = progress_fields[5]
+                alternative_forbidden_first_pick = progress_fields[6]
+                alternative_master_bound =
+                    tryparse(Float64, progress_fields[9])
             end
         end
         @test alternative_master_bound !== nothing
@@ -2206,6 +2419,35 @@ end
             @test alternative_master_bound > 0.0
         end
         @test alternative_forbidden_first_pick !== nothing
+        @test alternative_selected_first_pick !== nothing
+        if alternative_selected_first_pick !== nothing &&
+           alternative_forbidden_first_pick !== nothing
+            @test alternative_selected_first_pick !=
+                  alternative_forbidden_first_pick
+        end
+        alternative_master_lines = findall(
+            row -> length(row) == 13 && row[2] == "master",
+            alternative_progress_rows,
+        )
+        @test !isempty(alternative_master_lines)
+        for master_line in alternative_master_lines
+            master_row = alternative_progress_rows[master_line]
+            master_line < length(alternative_progress_rows) || continue
+            alternative_row = alternative_progress_rows[master_line + 1]
+            alternative_row[2] == "alt" || continue
+            @test parse(Int, alternative_row[4]) ==
+                  parse(Int, master_row[4]) + 1
+            if master_line + 2 <= length(alternative_progress_rows)
+                next_master_row =
+                    alternative_progress_rows[master_line + 2]
+                if next_master_row[2] == "master"
+                    @test parse(Int, next_master_row[1]) ==
+                          parse(Int, alternative_row[1]) + 1
+                    @test parse(Int, next_master_row[4]) ==
+                          parse(Int, alternative_row[4]) + 1
+                end
+            end
+        end
         alternative_candidate_positions = [
             Int(alternative_data.week[index]) -
             alternative_state.current_week + 1

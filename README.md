@@ -177,15 +177,26 @@ formulation maximizes expected completed weeks before elimination.
 
 Set `benders_weeks=K` in `SurvivorSelectionConfig` or pass
 `--benders-weeks K` to use the meet-in-the-middle Benders solve. `K` is
-clamped to the remaining horizon; zero puts no survival states in the master.
-The master contains all weekly assignments and survival-probability states
-through week `K`. The tail probabilities and all configured gradient/Hessian
-corrections are handled by analytic recourse cuts; no recourse LP is solved
-during the cut loop. Before iteration, the algorithm solves the full
+clamped to the remaining horizon; zero leaves only initial states in the master.
+The master contains all weekly assignments, survival-probability recurrences
+through week `K` only. Its objective includes prefix survival plus `theta`.
+With `H=min(hessian_weeks, remaining horizon)`, all gradient/Hessian states,
+gates, and covariance corrections remain in analytic recourse, even when
+`K` covers the full horizon.
+`hessian_weeks` still sets the correction horizon, independently of `K`.
+Omitted survival and every Hessian correction belong to `theta`. Recourse uses
+the original full-horizon parameter-to-game projection and reference pruning.
+Recourse states and their cuts are derived analytically; no recourse LP
+is built or solved during the seed or iteration loop. Cuts include pick and
+prefix-probability coefficients, with the intercept derived from the dual RHS,
+never recalibrated to an approximate objective. Before iteration, the algorithm solves the full
 linearized model relaxation to optimality (unless the shared timeout expires)
 with HiGHS HiPO, parallelism, and crossover enabled to obtain the affine dual
-cut over picks and prefix states. It then adds cuts from two greedy schedules
-with different first picks.
+cut over picks and prefix states. It then adds analytic recourse cuts
+from two greedy schedules with different first picks. Analytic dual tightness
+at the generating schedule and initial LP dual stationarity are checked;
+invalid certificates are explicit
+errors, and the initial LP and master solves share the Benders timeout.
 
 This mode certifies the optimal current-week pick by comparing its feasible
 objective value with an upper bound from a master solve that forbids that pick.
@@ -321,7 +332,8 @@ survivor --season 2026 --benders-weeks 5 < picks.txt
 ```
 
 Pass `--timeout SECONDS` to limit optimization. In Benders mode the time is
-shared across master solves and analytic cut evaluation, and the best feasible
+shared across the initial relaxation,
+master solves, and analytic evaluation, and the best feasible
 plan is returned if the limit is reached. The extensive-form HiGHS solve
 retains its existing behavior: it returns a feasible incumbent when available
 and reports an error if no feasible incumbent exists. Omit the option for an
@@ -343,11 +355,16 @@ abbreviation with a newline to stdout, so stdout remains suitable for a picks
 file. Phase timings and detailed optimizer diagnostics are Debug-level logs;
 enable them for this package with `JULIA_DEBUG=SurvivorModel`. For the default
 extensive-form optimizer this also enables HiGHS root and
-branch-and-bound progress reporting. Benders keeps native HiGHS output silent and instead reports the master model
-size, initial LP solver and barrier/crossover iterations, per-solve status,
-elapsed time and simplex iterations, master bounds and search metrics, direct
-recurrence-evaluation metrics, the selected teams in week order without week
-labels, and generated analytic cut summaries:
+branch-and-bound progress reporting. Benders keeps native HiGHS output silent
+and instead reports the master model size and initial LP solver statistics,
+then prints one plain progress table row per master and forbidden-pick solve.
+The `cuts` column counts cuts present at each solve: the alternative row
+includes the main-schedule cut, and a continued iteration's next master row
+includes both new cuts. The table tracks the chosen and banned first picks,
+best feasible lower bound, master objective and upper bound, exact schedule
+objective, recourse correction, cut count, and solve time. Its header repeats
+every 20 rows. Detailed initialization and final proof/timeout records remain
+available:
 
 ```sh
 JULIA_DEBUG=SurvivorModel survivor --season 2026 < picks.txt

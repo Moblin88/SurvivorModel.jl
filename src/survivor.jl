@@ -2390,6 +2390,12 @@ function _survivor_benders_lp_dual_cut(
         loss_state in 1:losses_to_elimination
     ]
     intercept = 0.0
+    recourse_residual = Dict(
+        variable => Float64(JuMP.coefficient(objective, variable))
+        for variable in JuMP.all_variables(model)
+        if !haskey(pick_positions, variable) &&
+           !haskey(probability_positions, variable)
+    )
 
     for constraint in JuMP.all_constraints(
         model;
@@ -2422,7 +2428,9 @@ function _survivor_benders_lp_dual_cut(
         end
         has_recourse_variable || continue
 
-        dual_weight = Float64(JuMP.shadow_price(constraint))
+        # MOI dual signs are objective-sense independent; equality shadow prices
+        # discard the sign needed by the maximization stationarity equations.
+        dual_weight = -Float64(JuMP.dual(constraint))
         isfinite(dual_weight) ||
             throw(ArgumentError(
                 "survivor LP dual cut has a non-finite row multiplier",
@@ -2438,6 +2446,17 @@ function _survivor_benders_lp_dual_cut(
                 dual_weight * lower
         else
             intercept += dual_weight * rhs
+        end
+        if function_value isa JuMP.VariableRef
+            if haskey(recourse_residual, function_value)
+                recourse_residual[function_value] -= dual_weight
+            end
+        else
+            for (coefficient, variable) in JuMP.linear_terms(function_value)
+                if haskey(recourse_residual, variable)
+                    recourse_residual[variable] -= dual_weight * coefficient
+                end
+            end
         end
         for (coefficient, variable) in master_terms
             if haskey(pick_positions, variable)
@@ -2461,11 +2480,18 @@ function _survivor_benders_lp_dual_cut(
         sum(abs, values(pick_slopes); init=0.0) +
         sum(abs, probability_slopes; init=0.0)
     margin = max(2e-6, 1e-6 * max(1.0, coefficient_scale))
+    stationarity_residual = maximum(abs, values(recourse_residual); init=0.0)
+    isfinite(stationarity_residual) && stationarity_residual <= 2e-6 ||
+        throw(ArgumentError(
+            "survivor LP dual cut recourse stationarity residual is " *
+            "$stationarity_residual",
+        ))
     return (
         intercept=intercept,
         pick_slopes,
         probability_slopes,
         margin,
+        stationarity_residual,
     )
 end
 
@@ -2642,6 +2668,92 @@ function _survivor_benders_gap_tolerance(
     )
 end
 
+function _survivor_benders_progress_header()
+    return join(
+        (
+            lpad("it", 3),
+            rpad("solve", 6),
+            rpad("status", 7),
+            lpad("cuts", 4),
+            rpad("pick", 4),
+            rpad("ban", 4),
+            lpad("best-LB", 8),
+            lpad("obj", 8),
+            lpad("UB", 8),
+            lpad("exact", 8),
+            lpad("theta", 8),
+            lpad("rec-gap", 8),
+            lpad("sec", 12),
+        ),
+        " | ",
+    )
+end
+
+function _survivor_benders_progress_value(value)
+    value === nothing && return "-"
+    number = Float64(value)
+    isfinite(number) || return string(number)
+    return string(round(number; sigdigits=6))
+end
+
+function _survivor_benders_progress_row(
+    iteration::Integer,
+    solve::AbstractString,
+    status,
+    pick::AbstractString,
+    banned_pick::AbstractString,
+    best_lower_bound::Real,
+    solve_objective,
+    solve_upper_bound,
+    exact_objective,
+    theta,
+    recourse_gap,
+    cut_count::Integer,
+    solve_seconds::Real,
+)
+    status_label = if status == JuMP.MOI.OPTIMAL
+        "OPT"
+    elseif status == JuMP.MOI.TIME_LIMIT
+        "TLIM"
+    else
+        label = first(split(string(status), "::"))
+        first(label, min(length(label), 7))
+    end
+    return join(
+        (
+            lpad(string(iteration), 3),
+            rpad(String(solve), 6),
+            rpad(status_label, 7),
+            lpad(string(cut_count), 4),
+            rpad(String(pick), 4),
+            rpad(String(banned_pick), 4),
+            lpad(_survivor_benders_progress_value(best_lower_bound), 8),
+            lpad(_survivor_benders_progress_value(solve_objective), 8),
+            lpad(_survivor_benders_progress_value(solve_upper_bound), 8),
+            lpad(_survivor_benders_progress_value(exact_objective), 8),
+            lpad(_survivor_benders_progress_value(theta), 8),
+            lpad(_survivor_benders_progress_value(recourse_gap), 8),
+            lpad(_survivor_benders_progress_value(solve_seconds), 12),
+        ),
+        " | ",
+    )
+end
+
+function _survivor_benders_print_progress_row(
+    row_count::Integer,
+    row::AbstractString,
+)
+    if row_count % 20 == 0
+        println(stderr)
+        header = _survivor_benders_progress_header()
+        println(stderr, header)
+        println(stderr, repeat("-", length(header)))
+    end
+    println(stderr, row)
+    flush(stderr)
+    return row_count + 1
+end
+
 function _survivor_benders_add_gate_pick_slopes!(
     pick_slopes::Vector{Float64},
     target_adjoint::Real,
@@ -2652,13 +2764,16 @@ function _survivor_benders_add_gate_pick_slopes!(
     recurrence_lower::AbstractVector{<:Real},
     recurrence_upper::AbstractVector{<:Real},
 )
+    # The selected recurrence row is the active basis row for this one-hot
+    # gate. Return its constant RHS shift together with the pick terms.
     adjoint = Float64(target_adjoint)
     isfinite(adjoint) ||
         throw(ArgumentError(
             "survivor Benders analytic cut adjoints must be finite",
         ))
-    iszero(adjoint) && return nothing
+    iszero(adjoint) && return 0.0
     # Choose a tight McCormick side at the binary pick for this adjoint sign.
+    intercept = 0.0
     for index in candidate_indices
         lower = Float64(selected_lower[index])
         upper = Float64(selected_upper[index])
@@ -2671,13 +2786,19 @@ function _survivor_benders_add_gate_pick_slopes!(
         gate_slope = if lower == upper
             lower
         elseif index == selected_index
-            adjoint > 0.0 ? all_lower : all_upper
+            if adjoint > 0.0
+                intercept -= adjoint * all_lower
+                all_lower
+            else
+                intercept -= adjoint * all_upper
+                all_upper
+            end
         else
             adjoint > 0.0 ? upper : lower
         end
         pick_slopes[index] += adjoint * gate_slope
     end
-    return nothing
+    return intercept
 end
 
 function _survivor_benders_add_parameter_gradient_adjoint!(
@@ -2710,6 +2831,7 @@ function _survivor_benders_analytic_cut_components(
     number_of_weeks::Integer,
     losses_to_elimination::Integer,
     curvature_weeks::Integer,
+    prefix_weeks::Integer,
     gradient_reference_indices,
     gradient_reference_slots,
     gradient_switch_position::Integer,
@@ -2730,8 +2852,17 @@ function _survivor_benders_analytic_cut_components(
         throw(ArgumentError(
             "survivor Benders analytic cut references have invalid dimensions",
         ))
+    0 <= prefix_weeks <= number_of_weeks ||
+        throw(ArgumentError(
+            "survivor Benders analytic cut prefix weeks are invalid",
+        ))
 
     pick_slopes = zeros(Float64, n_candidates)
+    probability_slopes = zeros(
+        Float64,
+        prefix_weeks,
+        losses_to_elimination,
+    )
     probability_adjoint = zeros(
         Float64,
         number_of_weeks + 1,
@@ -2754,15 +2885,21 @@ function _survivor_benders_analytic_cut_components(
         curvature_weeks + 1,
         losses_to_elimination,
     )
+    dual_intercept = 0.0
     for position in 1:curvature_weeks,
         loss_state in 1:losses_to_elimination
         hessian_adjoint[position + 1, loss_state] = 0.5
     end
-    for position in 1:number_of_weeks,
-        loss_state in 1:losses_to_elimination
-        probability_adjoint[position + 1, loss_state] = 1.0
+    if prefix_weeks < number_of_weeks
+        for position in (prefix_weeks + 1):number_of_weeks,
+            loss_state in 1:losses_to_elimination
+            probability_adjoint[position + 1, loss_state] = 1.0
+        end
     end
 
+    # The reverse pass below is backward substitution for Bᵀ y = c on the
+    # active fixed-pick recurrence basis. It constructs the dual multipliers;
+    # it is not a tangent or a separately chosen supporting inequality.
     for position in number_of_weeks:-1:1
         selected_index = Int(selected_by_position[position])
         indices = week_indices[position]
@@ -2776,7 +2913,7 @@ function _survivor_benders_analytic_cut_components(
         if position <= curvature_weeks
             for loss_state in 1:losses_to_elimination
                 adjoint = hessian_adjoint[position + 1, loss_state]
-                _survivor_benders_add_gate_pick_slopes!(
+                dual_intercept += _survivor_benders_add_gate_pick_slopes!(
                     pick_slopes,
                     adjoint,
                     selected_index,
@@ -2863,7 +3000,7 @@ function _survivor_benders_analytic_cut_components(
                 reference in gradient_reference_indices[position + 1]
                 adjoint =
                     gradient_adjoint[position + 1, loss_state, reference]
-                _survivor_benders_add_gate_pick_slopes!(
+                dual_intercept += _survivor_benders_add_gate_pick_slopes!(
                     pick_slopes,
                     adjoint,
                     selected_index,
@@ -2972,7 +3109,7 @@ function _survivor_benders_analytic_cut_components(
                         loss_state,
                         parameter,
                     ]
-                _survivor_benders_add_gate_pick_slopes!(
+                dual_intercept += _survivor_benders_add_gate_pick_slopes!(
                     pick_slopes,
                     adjoint,
                     selected_index,
@@ -3047,46 +3184,48 @@ function _survivor_benders_analytic_cut_components(
             end
         end
 
-        for loss_state in 1:losses_to_elimination
-            adjoint = probability_adjoint[position + 1, loss_state]
-            _survivor_benders_add_gate_pick_slopes!(
-                pick_slopes,
-                adjoint,
-                selected_index,
-                indices,
-                @view(
-                    bounds.team_conditioned.candidate_probability.lower[
-                        :,
-                        loss_state,
-                    ],
-                ),
-                @view(
-                    bounds.team_conditioned.candidate_probability.upper[
-                        :,
-                        loss_state,
-                    ],
-                ),
-                @view(bounds.candidate_probability.lower[:, loss_state]),
-                @view(bounds.candidate_probability.upper[:, loss_state]),
-            )
-            iszero(adjoint) && continue
-            if bounds.team_conditioned.candidate_probability.lower[
-                selected_index,
-                loss_state,
-            ] ==
-               bounds.team_conditioned.candidate_probability.upper[
-                   selected_index,
-                   loss_state,
-               ]
-                continue
-            end
+        if position > prefix_weeks
+            for loss_state in 1:losses_to_elimination
+                adjoint = probability_adjoint[position + 1, loss_state]
+                dual_intercept += _survivor_benders_add_gate_pick_slopes!(
+                    pick_slopes,
+                    adjoint,
+                    selected_index,
+                    indices,
+                    @view(
+                        bounds.team_conditioned.candidate_probability.lower[
+                            :,
+                            loss_state,
+                        ],
+                    ),
+                    @view(
+                        bounds.team_conditioned.candidate_probability.upper[
+                            :,
+                            loss_state,
+                        ],
+                    ),
+                    @view(bounds.candidate_probability.lower[:, loss_state]),
+                    @view(bounds.candidate_probability.upper[:, loss_state]),
+                )
+                iszero(adjoint) && continue
+                if bounds.team_conditioned.candidate_probability.lower[
+                    selected_index,
+                    loss_state,
+                ] ==
+                   bounds.team_conditioned.candidate_probability.upper[
+                       selected_index,
+                       loss_state,
+                   ]
+                    continue
+                end
 
-            probability = selected_derivative.base_probability
-            probability_adjoint[position, loss_state] +=
-                adjoint * probability
-            if loss_state > 1
-                probability_adjoint[position, loss_state - 1] +=
-                    adjoint * (1.0 - probability)
+                probability = selected_derivative.base_probability
+                probability_adjoint[position, loss_state] +=
+                    adjoint * probability
+                if loss_state > 1
+                    probability_adjoint[position, loss_state - 1] +=
+                        adjoint * (1.0 - probability)
+                end
             end
         end
     end
@@ -3095,15 +3234,57 @@ function _survivor_benders_analytic_cut_components(
         throw(ArgumentError(
             "survivor Benders analytic cut slopes must be finite",
         ))
-    selected_set = Set(selected_by_position)
-    cut_intercept = Float64(recourse_objective)
-    for index in candidate_indices
-        cut_intercept -=
-            pick_slopes[index] * (index in selected_set ? 1.0 : 0.0)
+    for position in 1:prefix_weeks,
+        loss_state in 1:losses_to_elimination
+        probability_slopes[position, loss_state] =
+            probability_adjoint[position + 1, loss_state]
     end
+    all(isfinite, probability_slopes) ||
+        throw(ArgumentError(
+            "survivor Benders analytic prefix slopes must be finite",
+        ))
+    dual_intercept += probability_adjoint[1, 1]
+    selected_values = _survivor_scalar_forward_values(
+        selected_by_position,
+        inputs,
+        number_of_weeks,
+        losses_to_elimination;
+        curvature_weeks=curvature_weeks,
+        gradient_reference_indices=gradient_reference_indices,
+    )
+    selected_prefix_probability = prefix_weeks == 0 ?
+        0.0 :
+        sum(
+            probability_slopes[position, loss_state] *
+            selected_values.probability[position + 1, loss_state]
+            for position in 1:prefix_weeks,
+            loss_state in 1:losses_to_elimination;
+            init=0.0,
+        )
+    selected_set = Set(selected_by_position)
+    selected_pick_value = sum(
+        pick_slopes[index]
+        for index in candidate_indices
+        if index in selected_set;
+        init=0.0,
+    )
+    dual_value = dual_intercept +
+        selected_pick_value +
+        selected_prefix_probability
+    dual_tolerance = _survivor_benders_gap_tolerance(
+        dual_value,
+        recourse_objective,
+    )
+    abs(dual_value - Float64(recourse_objective)) <= dual_tolerance ||
+        throw(ArgumentError(
+            "survivor Benders analytic dual is not tight at its " *
+            "generating schedule: dual=$dual_value, " *
+            "recourse=$(Float64(recourse_objective))",
+        ))
     return (
-        intercept=cut_intercept,
+        intercept=dual_intercept,
         pick_slopes=pick_slopes,
+        probability_slopes=probability_slopes,
     )
 end
 
@@ -3136,6 +3317,7 @@ function _survivor_benders_add_analytic_cut!(
         number_of_weeks,
         losses_to_elimination,
         curvature_weeks,
+        prefix_weeks,
         gradient_reference_indices,
         gradient_reference_slots,
         gradient_switch_position,
@@ -3148,8 +3330,9 @@ function _survivor_benders_add_analytic_cut!(
             sum(
                 components.pick_slopes[index] * master_selected[index]
                 for index in candidate_indices
-            ) -
+            ) +
             sum(
+                components.probability_slopes[position, loss_state] *
                 master_probability[position + 1, loss_state]
                 for position in 1:prefix_weeks,
                 loss_state in 1:losses_to_elimination;
@@ -3163,6 +3346,12 @@ function _survivor_benders_add_analytic_cut!(
         slope_max=pick_slope_max,
         pick_slope_min=pick_slope_min,
         pick_slope_max=pick_slope_max,
+        probability_slope_min=isempty(components.probability_slopes) ?
+            0.0 :
+            minimum(components.probability_slopes),
+        probability_slope_max=isempty(components.probability_slopes) ?
+            0.0 :
+            maximum(components.probability_slopes),
     )
 end
 
@@ -3271,6 +3460,7 @@ function _optimize_survivor_scalar_benders!(
         inputs;
         lp_relaxation=true,
         lp_time_limit=remaining_seconds,
+        lp_budget_started_at=solve_started_at,
     )
     @debug(
         "survivor Benders full LP relaxation complete",
@@ -3367,7 +3557,9 @@ function _optimize_survivor_scalar_benders!(
         throw(ArgumentError(
             "Benders mode requires finite survivor recourse bounds",
         ))
-    recourse_upper_bound += 1e-8 * max(1.0, abs(recourse_upper_bound))
+    if prefix_weeks < number_of_weeks
+        recourse_upper_bound += 1e-8 * max(1.0, abs(recourse_upper_bound))
+    end
     @variable(master_model, theta <= recourse_upper_bound)
     prefix_objective = _survivor_benders_prefix_expression(
         master_probability,
@@ -3405,11 +3597,8 @@ function _optimize_survivor_scalar_benders!(
         (:second_greedy_warm_start, second_warm_start, second_seed_plan),
     )
         selected_by_position = collect(seed.selected)
-        seed_prefix_objective = sum(
-            seed.probability[position + 1, loss_state]
-            for position in 1:prefix_weeks,
-            loss_state in state_indices;
-            init=0.0,
+        seed_prefix_objective = _survivor_benders_prefix_expression(
+            seed.probability, prefix_weeks, losses_to_elimination,
         )
         initial_cut = _survivor_benders_add_analytic_cut!(
             master_model,
@@ -3418,7 +3607,7 @@ function _optimize_survivor_scalar_benders!(
             master_probability,
             prefix_weeks,
             selected_by_position,
-            seed_plan.objective_value,
+            seed_plan.objective_value - seed_prefix_objective,
             inputs,
             candidate_indices,
             week_indices,
@@ -3448,7 +3637,7 @@ function _optimize_survivor_scalar_benders!(
             "survivor Benders cut added",
             iteration=0,
             source=source,
-            cut_method=:analytic_recurrence_dual,
+            cut_method=:analytic_recourse_dual,
             cut_count=cuts_added,
             intercept=initial_cut.intercept,
             pick_slope_min=initial_cut.pick_slope_min,
@@ -3468,6 +3657,7 @@ function _optimize_survivor_scalar_benders!(
             cuts=cuts_added,
         )
     end
+    progress_row_count = 0
 
     _set_survivor_benders_master_start!(
         master_selected,
@@ -3476,11 +3666,8 @@ function _optimize_survivor_scalar_benders!(
         candidate_indices,
         first_selected,
         first_seed_plan.objective_value -
-        sum(
-            warm_start.probability[position + 1, loss_state]
-            for position in 1:prefix_weeks,
-            loss_state in state_indices;
-            init=0.0,
+        _survivor_benders_prefix_expression(
+            warm_start.probability, prefix_weeks, losses_to_elimination,
         ),
         warm_start,
         prefix_weeks,
@@ -3509,11 +3696,8 @@ function _optimize_survivor_scalar_benders!(
             candidate_indices,
             first_selected,
             first_seed_plan.objective_value -
-            sum(
-                warm_start.probability[position + 1, loss_state]
-                for position in 1:prefix_weeks,
-                loss_state in state_indices;
-                init=0.0,
+            _survivor_benders_prefix_expression(
+                warm_start.probability, prefix_weeks, losses_to_elimination,
             ),
             warm_start,
             prefix_weeks,
@@ -3531,26 +3715,14 @@ function _optimize_survivor_scalar_benders!(
         master_objective_value = master_has_values ?
             Float64(objective_value(master_model)) :
             nothing
-        master_upper_bound = master_has_values ?
-            _survivor_optional_result_attribute(
-                () -> Float64(objective_bound(master_model)),
-            ) :
-            nothing
+        master_upper_bound = _survivor_optional_result_attribute(
+            () -> Float64(objective_bound(master_model)),
+        )
         if master_upper_bound === nothing &&
            master_status == JuMP.MOI.OPTIMAL &&
            master_has_values
             master_upper_bound = master_objective_value
         end
-        master_relative_gap = master_has_values ?
-            _survivor_optional_result_attribute(
-                () -> Float64(relative_gap(master_model)),
-            ) :
-            nothing
-        master_node_count = _survivor_optional_result_attribute(
-            () -> Int(node_count(master_model)),
-        )
-        master_simplex_iterations =
-            _survivor_benders_simplex_iterations(master_model)
         selected_indices = master_has_values ?
             _survivor_selected_indices(
                 master_model,
@@ -3558,26 +3730,28 @@ function _optimize_survivor_scalar_benders!(
                 candidate_indices,
             ) :
             Int[]
-        selected_teams = master_has_values ?
-            _survivor_benders_selected_teams(data, selected_indices) :
-            nothing
-        @debug(
-            "survivor Benders master solve complete",
-            iteration=iteration,
-            elapsed_seconds=master_elapsed_seconds,
-            termination_status=master_status,
-            primal_status=primal_status(master_model),
-            has_values=master_has_values,
-            theta=master_theta_value,
-            master_objective=master_objective_value,
-            master_bound=master_upper_bound,
-            relative_gap=master_relative_gap,
-            node_count=master_node_count,
-            simplex_iterations=master_simplex_iterations,
-            cut_count=cuts_added,
-            selected_teams=selected_teams,
-        )
         if !master_has_values
+            if debug_logging
+                progress_row_count =
+                    _survivor_benders_print_progress_row(
+                        progress_row_count,
+                        _survivor_benders_progress_row(
+                            iteration,
+                            "master",
+                            master_status,
+                            "-",
+                            "-",
+                            best_objective,
+                            master_objective_value,
+                            master_upper_bound,
+                            nothing,
+                            master_theta_value,
+                            nothing,
+                            cuts_added,
+                            master_elapsed_seconds,
+                        ),
+                    )
+            end
             master_status == JuMP.MOI.TIME_LIMIT &&
                 return _survivor_benders_timeout_result(
                     best_plan,
@@ -3608,12 +3782,13 @@ function _optimize_survivor_scalar_benders!(
             gradient_reference_indices,
         )
         candidate_objective = candidate_plan.objective_value
-        candidate_prefix_objective = sum(
-            candidate_plan.selections.survival_probability[
-                candidate_plan.selections.week .<
-                state.current_week + prefix_weeks
-            ];
-            init=0.0,
+        candidate_values = _survivor_scalar_forward_values(
+            selected_by_position, inputs, number_of_weeks, losses_to_elimination;
+            curvature_weeks=curvature_weeks,
+            gradient_reference_indices=gradient_reference_indices,
+        )
+        candidate_prefix_objective = _survivor_benders_prefix_expression(
+            candidate_values.probability, prefix_weeks, losses_to_elimination,
         )
         master_prefix_objective = Float64(
             value(
@@ -3635,17 +3810,29 @@ function _optimize_survivor_scalar_benders!(
         candidate_recourse_objective =
             candidate_objective - candidate_prefix_objective
         correction = candidate_recourse_objective - master_theta_value
-        @debug(
-            "survivor Benders recourse evaluated analytically",
-            iteration=iteration,
-            recourse_objective=candidate_recourse_objective,
-            correction=correction,
-            objective_component=:tail_and_covariance_correction,
-            selected_teams=selected_teams,
-        )
         if candidate_objective > best_objective
             best_plan = candidate_plan
             best_objective = candidate_objective
+        end
+        if debug_logging
+            progress_row_count = _survivor_benders_print_progress_row(
+                progress_row_count,
+                _survivor_benders_progress_row(
+                    iteration,
+                    "master",
+                    master_status,
+                    String(data.team[selected_by_position[1]]),
+                    "-",
+                    best_objective,
+                    master_objective_value,
+                    master_upper_bound,
+                    candidate_objective,
+                    master_theta_value,
+                    correction,
+                    cuts_added,
+                    master_elapsed_seconds,
+                ),
+            )
         end
         if master_status != JuMP.MOI.OPTIMAL
             master_status == JuMP.MOI.TIME_LIMIT &&
@@ -3669,6 +3856,39 @@ function _optimize_survivor_scalar_benders!(
                 "survivor Benders master underestimates analytic recourse by " *
                 "$correction",
             ))
+        if correction < -correction_tolerance
+            cut_violation_tolerance = _survivor_benders_gap_tolerance(
+                master_theta_value,
+                candidate_recourse_objective,
+            )
+            master_theta_value > candidate_recourse_objective +
+                    cut_violation_tolerance ||
+                throw(ArgumentError(
+                    "survivor Benders master recourse cut is not violated " *
+                    "beyond tolerance",
+                ))
+        end
+        _survivor_benders_add_analytic_cut!(
+            master_model,
+            theta,
+            master_selected,
+            master_probability,
+            prefix_weeks,
+            selected_by_position,
+            candidate_recourse_objective,
+            inputs,
+            candidate_indices,
+            week_indices,
+            number_of_weeks,
+            losses_to_elimination,
+            curvature_weeks,
+            gradient_reference_indices,
+            gradient_reference_slots,
+            gradient_switch_position,
+            parameter_state_count,
+            bounds,
+        )
+        cuts_added += 1
         if abs(correction) <= correction_tolerance
             @debug(
                 "survivor Benders solve complete",
@@ -3709,15 +3929,12 @@ function _optimize_survivor_scalar_benders!(
             alternative_warm_start === second_warm_start ?
             second_seed_plan :
             first_seed_plan
-        alternative_prefix_objective = sum(
-            alternative_warm_start.probability[position + 1, loss_state]
-            for position in 1:prefix_weeks,
-            loss_state in state_indices;
-            init=0.0,
+        alternative_seed_prefix_objective = _survivor_benders_prefix_expression(
+            alternative_warm_start.probability, prefix_weeks, losses_to_elimination,
         )
-        alternative_recourse_objective =
+        alternative_seed_recourse_objective =
             alternative_seed_plan.objective_value -
-            alternative_prefix_objective
+            alternative_seed_prefix_objective
         remaining_seconds = _survivor_benders_remaining_time(
             config,
             solve_started_at,
@@ -3737,7 +3954,7 @@ function _optimize_survivor_scalar_benders!(
             master_probability,
             candidate_indices,
             alternative_warm_start.selected,
-            alternative_recourse_objective,
+            alternative_seed_recourse_objective,
             alternative_warm_start,
             prefix_weeks,
             losses_to_elimination,
@@ -3746,10 +3963,24 @@ function _optimize_survivor_scalar_benders!(
         alternative_solve_started_at = time_ns()
         alternative_solve_result = try
             optimize!(master_model)
+            solve_seconds =
+                (time_ns() - alternative_solve_started_at) / 1.0e9
             status = termination_status(master_model)
             has_values = _survivor_has_feasible_incumbent(master_model)
             objective = has_values ?
                 Float64(objective_value(master_model)) :
+                nothing
+            theta_value = has_values ? Float64(value(theta)) : nothing
+            prefix_objective = has_values ?
+                Float64(
+                    value(
+                        _survivor_benders_prefix_expression(
+                            master_probability,
+                            prefix_weeks,
+                            losses_to_elimination,
+                        ),
+                    ),
+                ) :
                 nothing
             upper_bound = _survivor_optional_result_attribute(
                 () -> Float64(objective_bound(master_model)),
@@ -3765,12 +3996,14 @@ function _optimize_survivor_scalar_benders!(
                 ) :
                 Int[]
             (
-                status,
-                primal_status=primal_status(master_model),
-                has_values,
-                objective,
-                upper_bound,
-                selected_indices,
+                status=status,
+                has_values=has_values,
+                objective=objective,
+                theta_value=theta_value,
+                prefix_objective=prefix_objective,
+                upper_bound=upper_bound,
+                solve_seconds=solve_seconds,
+                selected_indices=selected_indices,
             )
         finally
             delete_upper_bound(master_selected[forbidden_first_pick])
@@ -3781,11 +4014,8 @@ function _optimize_survivor_scalar_benders!(
                 candidate_indices,
                 first_selected,
                 first_seed_plan.objective_value -
-                sum(
-                    warm_start.probability[position + 1, loss_state]
-                    for position in 1:prefix_weeks,
-                    loss_state in state_indices;
-                    init=0.0,
+                _survivor_benders_prefix_expression(
+                    warm_start.probability, prefix_weeks, losses_to_elimination,
                 ),
                 warm_start,
                 prefix_weeks,
@@ -3793,30 +4023,50 @@ function _optimize_survivor_scalar_benders!(
             )
         end
         alternative_status = alternative_solve_result.status
-        alternative_primal_status = alternative_solve_result.primal_status
         alternative_has_values = alternative_solve_result.has_values
         alternative_objective = alternative_solve_result.objective
+        alternative_theta_value = alternative_solve_result.theta_value
+        alternative_master_prefix_objective =
+            alternative_solve_result.prefix_objective
         alternative_upper_bound = alternative_solve_result.upper_bound
+        alternative_solve_seconds = alternative_solve_result.solve_seconds
         alternative_selected_indices =
             alternative_solve_result.selected_indices
-        @debug(
-            "survivor Benders alternative master solve complete",
-            iteration=iteration,
-            elapsed_seconds=
-                (time_ns() - alternative_solve_started_at) / 1.0e9,
-            termination_status=alternative_status,
-            primal_status=alternative_primal_status,
-            has_values=alternative_has_values,
-            master_objective=alternative_objective,
-            master_bound=alternative_upper_bound,
-            forbidden_first_pick=String(data.team[forbidden_first_pick]),
-            selected_teams=alternative_has_values ?
-                _survivor_benders_selected_teams(
-                    data,
-                    alternative_selected_indices,
-                ) :
-                nothing,
-        )
+        alternative_first_pick = if alternative_has_values
+            first_selected_position = findfirst(
+                index -> candidate_positions[index] == 1,
+                alternative_selected_indices,
+            )
+            first_selected_position === nothing ?
+                "-" :
+                String(
+                    data.team[
+                        alternative_selected_indices[first_selected_position]
+                    ],
+                )
+        else
+            "-"
+        end
+        if debug_logging
+            progress_row_count = _survivor_benders_print_progress_row(
+                progress_row_count,
+                _survivor_benders_progress_row(
+                    iteration,
+                    "alt",
+                    alternative_status,
+                    alternative_first_pick,
+                    String(data.team[forbidden_first_pick]),
+                    best_objective,
+                    alternative_objective,
+                    alternative_upper_bound,
+                    nothing,
+                    alternative_theta_value,
+                    nothing,
+                    cuts_added,
+                    alternative_solve_seconds,
+                ),
+            )
+        end
         if alternative_status == JuMP.MOI.TIME_LIMIT
             return _survivor_benders_timeout_result(
                 best_plan,
@@ -3829,6 +4079,11 @@ function _optimize_survivor_scalar_benders!(
             throw(ArgumentError(
                 "survivor Benders alternative master failed with termination " *
                 "status $alternative_status",
+            ))
+        alternative_has_values ||
+            throw(ArgumentError(
+                "survivor Benders alternative master completed without a " *
+                "feasible schedule",
             ))
         alternative_upper_bound === nothing &&
             return _survivor_benders_timeout_result(
@@ -3854,24 +4109,93 @@ function _optimize_survivor_scalar_benders!(
             )
             return candidate_plan
         end
-        cut_violation_tolerance = _survivor_benders_gap_tolerance(
-            master_theta_value,
-            candidate_recourse_objective,
-        )
-        master_theta_value > candidate_recourse_objective +
-                cut_violation_tolerance ||
+        alternative_master_prefix_objective === nothing &&
             throw(ArgumentError(
-                "survivor Benders master has a positive correction but no " *
-                "violated analytic recourse cut",
+                "survivor Benders alternative master has no prefix objective",
             ))
-        cut_summary = _survivor_benders_add_analytic_cut!(
+        alternative_theta_value === nothing &&
+            throw(ArgumentError(
+                "survivor Benders alternative master has no recourse value",
+            ))
+        alternative_selected_by_position =
+            _survivor_fixed_selected_indices(
+                data,
+                sort(data[alternative_selected_indices, :], [:week, :team]),
+                state,
+                number_of_weeks,
+            )
+        alternative_plan = _survivor_plan_from_selected_indices(
+            data,
+            state,
+            config,
+            inputs,
+            alternative_selected_indices,
+            number_of_weeks,
+            losses_to_elimination,
+            curvature_weeks,
+            gradient_reference_indices,
+        )
+        alternative_candidate_objective = alternative_plan.objective_value
+        alternative_values = _survivor_scalar_forward_values(
+            alternative_selected_by_position, inputs, number_of_weeks,
+            losses_to_elimination;
+            curvature_weeks=curvature_weeks,
+            gradient_reference_indices=gradient_reference_indices,
+        )
+        alternative_candidate_prefix_objective = _survivor_benders_prefix_expression(
+            alternative_values.probability, prefix_weeks, losses_to_elimination,
+        )
+        isapprox(
+            alternative_candidate_prefix_objective,
+            alternative_master_prefix_objective;
+            rtol=1e-6,
+            atol=2e-6,
+        ) || throw(ArgumentError(
+            "survivor Benders alternative prefix probability and direct " *
+            "schedule evaluation disagree",
+        ))
+        alternative_candidate_recourse_objective =
+            alternative_candidate_objective -
+            alternative_candidate_prefix_objective
+        alternative_correction =
+            alternative_candidate_recourse_objective -
+            alternative_theta_value
+        alternative_correction_tolerance =
+            _survivor_benders_gap_tolerance(
+                alternative_candidate_recourse_objective,
+                alternative_theta_value,
+            )
+        alternative_correction <= alternative_correction_tolerance ||
+            throw(ArgumentError(
+                "survivor Benders alternative master underestimates " *
+                "analytic recourse by $alternative_correction",
+            ))
+        if alternative_correction < -alternative_correction_tolerance
+            alternative_cut_violation_tolerance =
+                _survivor_benders_gap_tolerance(
+                    alternative_theta_value,
+                    alternative_candidate_recourse_objective,
+                )
+            alternative_theta_value >
+                    alternative_candidate_recourse_objective +
+                    alternative_cut_violation_tolerance ||
+                throw(ArgumentError(
+                    "survivor Benders alternative master has no violated " *
+                    "analytic recourse cut",
+                ))
+        end
+        if alternative_candidate_objective > best_objective
+            best_plan = alternative_plan
+            best_objective = alternative_candidate_objective
+        end
+        _survivor_benders_add_analytic_cut!(
             master_model,
             theta,
             master_selected,
             master_probability,
             prefix_weeks,
-            selected_by_position,
-            candidate_objective,
+            alternative_selected_by_position,
+            alternative_candidate_recourse_objective,
             inputs,
             candidate_indices,
             week_indices,
@@ -3885,16 +4209,6 @@ function _optimize_survivor_scalar_benders!(
             bounds,
         )
         cuts_added += 1
-        @debug(
-            "survivor Benders cut added",
-            iteration=iteration,
-            source=:master_schedule,
-            cut_method=:analytic_recurrence_dual,
-            cut_count=cuts_added,
-            intercept=cut_summary.intercept,
-            pick_slope_min=cut_summary.pick_slope_min,
-            pick_slope_max=cut_summary.pick_slope_max,
-        )
         iteration += 1
     end
 end
@@ -3908,6 +4222,7 @@ function _optimize_survivor_expected_weeks_scalar_milp(
     export_lp_only::Bool=false,
     lp_relaxation::Bool=false,
     lp_time_limit=config.timeout_seconds,
+    lp_budget_started_at=nothing,
 )
     number_of_weeks = config.through_week - state.current_week + 1
     curvature_weeks = min(config.hessian_weeks, number_of_weeks)
@@ -4785,6 +5100,17 @@ function _optimize_survivor_expected_weeks_scalar_milp(
     @objective(model, Max, objective_expression)
     if lp_relaxation
         JuMP.relax_integrality(model)
+        if lp_budget_started_at !== nothing
+            remaining = _survivor_benders_remaining_time(config, lp_budget_started_at)
+            if remaining !== nothing
+                remaining <= 0.0 && return (
+                    termination_status=JuMP.MOI.TIME_LIMIT,
+                    dual_status=JuMP.MOI.NO_SOLUTION,
+                    objective_bound=nothing,
+                )
+                JuMP.set_time_limit_sec(model, remaining)
+            end
+        end
         solve_started_at = time_ns()
         optimize!(model)
         diagnostics = _survivor_log_milp_result(

@@ -2650,6 +2650,8 @@ end
         @test moi.get(lp_optimizer, raw_attribute("threads")) == 0
         @test moi.get(lp_optimizer, raw_attribute("run_crossover")) == "on"
         @test moi.get(master_optimizer, raw_attribute("solver")) == "choose"
+        @test moi.get(master_optimizer, raw_attribute("mip_lp_solver")) == "hipo"
+        @test moi.get(master_optimizer, raw_attribute("run_crossover")) == "on"
     end
 
     @testset "selection configuration" begin

@@ -163,6 +163,9 @@ function _survivor_optimizer(
                 "run_crossover" => "on",
             ],
         )
+    else
+        push!(attributes, "mip_lp_solver" => "hipo")
+        push!(attributes, "run_crossover" => "on")
     end
     time_limit_seconds === nothing ||
         push!(attributes, "time_limit" => time_limit_seconds)

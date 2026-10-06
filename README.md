@@ -206,6 +206,8 @@ optimal once the current pick is certified. If the solve times out first, the
 best feasible plan is returned without an optimality proof. Omitting
 `benders_weeks` keeps the extensive-form MILP as the default. All survivor
 optimization modes use HiGHS.
+MIP solves request HiPO for basis-free LP relaxations via `mip_lp_solver`,
+with crossover enabled; node relaxations with a valid basis use simplex.
 If only one current-week candidate is eligible, that pick is forced and is
 returned with a feasible greedy schedule without building the Benders master.
 

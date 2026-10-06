@@ -258,19 +258,27 @@ fractional unfixed week branches into every eligible remaining candidate,
 including zero-valued LP candidates. Every path explicitly fixes other picks
 in that week to zero and excludes chosen teams elsewhere.
 
-Before each child solve, the shared greedy builder completes the entire path,
+Before selecting a queued node, the shared greedy builder completes each new
+unpruned path,
 reserving teams for fixed future weeks as well as the prefix. Matching and
 completion honor the shared deadline. Complete schedules are
 validated/forward-evaluated exactly before updating the single global
 incumbent (objective ties prefer the smaller first-pick index). There is no
-unbounded schedule/plan cache or per-region witness history.
+unbounded schedule/plan cache or per-region witness history. Each queued node
+retains only its scalar completion lower bound and a ranking-ready flag;
+`-Inf` denotes no feasible completion. Selection never reruns an already
+attempted heuristic, including unsuccessful attempts. Completion plans are
+transient except for the global incumbent; ancestor summaries retain no plans. A
+heuristic interrupted by the deadline retains the node's inherited upper bound.
 A completion is only a feasible lower bound; it never changes an
 inherited or LP upper certificate.
 
 Nodes carry inherited upper bounds and their parent's basis. The scheduler
 prioritizes competing regions by their largest upper bound, then their best
 node; every fourth selection permits incumbent-region improvement. Stable
-probability, depth, and candidate/node order break ties. Each live node has a
+exact greedy-completion objective (a subtree lower bound), depth, and node
+order break ties. A node without a feasible completion ranks below completed
+nodes with the same upper bounds; it is not pruned on that basis. Each live node has a
 separate basis-free ancestor summary: its capped upper bound, live child bounds,
 and maximum closed-child bound. Propagation uses
 `parentUB=min(ownLPUB,max(closedChildUB,liveChildUBs))`. Unsolved and interrupted

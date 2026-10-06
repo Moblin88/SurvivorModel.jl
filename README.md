@@ -281,8 +281,12 @@ future-objective estimate or a globally optimal schedule.
 All backends share this rule, including both Benders seeds: the second seed
 now forces the second-best feasible **local-score** pick in week one, rather
 than the second-highest mean probability. Branch-and-bound also completes
-node paths with this heuristic, preserving all fixed picks and caching exact
-schedule evaluations. These completions improve feasible lower bounds only.
+queued node paths with this heuristic, preserving all fixed picks and retaining
+only a scalar completion score and a readiness flag per node, not its schedule.
+Each node is completed at most once. Completions immediately
+improve the incumbent and their full objectives replace mean win probability
+as the node-order tie-breaker, after certified region and node upper bounds.
+They never tighten an upper bound or prune a node by themselves.
 
 ```julia
 plan = optimize_survivor_pool(

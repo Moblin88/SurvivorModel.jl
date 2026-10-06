@@ -47,6 +47,19 @@ function _bnb_config(; through_week=3, hessian_weeks=3, kwargs...)
     )
 end
 
+@testset "Greedy completion preserves its own first pick" begin
+    for repeated in (false, true), losses in 0:2, H in 0:3
+        data, inputs = _bnb_fixture(; repeated)
+        state = SurvivorPoolState(2025, 1; strikes_remaining=losses)
+        config = _bnb_config(; hessian_weeks=H)
+        greedy = BNB._survivor_greedy_selected_indices(data, state, config, inputs)
+        completion = BNB._survivor_greedy_selected_indices(
+            data, state, config, inputs; fixed_indices=[first(greedy)],
+        )
+        @test completion == greedy
+    end
+end
+
 function _bnb_exhaustive(data, inputs, state, config)
     horizon = config.through_week - state.current_week + 1
     positions = Int.(data.week) .- state.current_week .+ 1
@@ -333,11 +346,32 @@ end
         @test !isempty(completions)
         @test any(e -> e.improved, completions)
         @test any(e -> e.plan.objective_value > initial_objective + 1e-6, completions)
+        @test length(unique(e.node.id for e in completions)) == length(completions)
         for e in completions
+            @test e.node.completion_ready
+            @test e.node.completion_lower_bound == e.plan.objective_value
             @test all(tree_data.team[i] == only(e.plan.selections.team[
                 e.plan.selections.week .== tree_data.week[i],
             ]) for i in e.node.path)
             @test e.plan.objective_value <= e.node.upper + 2e-6
+        end
+        for (position, e) in enumerate(events)
+            e.kind == :basis_loaded || continue
+            @test e.node.completion_ready
+            if isfinite(e.node.completion_lower_bound)
+                completed = only(filter(c -> c.node.id == e.node.id, completions))
+                @test completed.plan.objective_value == e.node.completion_lower_bound
+                @test any(c -> c.kind == :node_completion && c.node.id == e.node.id,
+                          events[1:(position - 1)])
+            end
+            ranked = filter(e -> e.kind == :node_ranked, events)
+            @test length(unique(e.node.id for e in ranked)) == length(ranked)
+            @test all(e -> e.node.completion_ready, ranked)
+            @test fieldtype(BNB.SurvivorBranchNode, :completion_lower_bound) == Float64
+            @test !(:completion in fieldnames(BNB.SurvivorBranchNode))
+            for e in filter(e -> e.kind == :basis_loaded, events)
+                @test count(r -> r.node.id == e.node.id, ranked) == 1
+            end
         end
     end
     @test_throws ArgumentError SurvivorSelectionConfig(branch_and_bound=true, benders_weeks=0)
@@ -475,15 +509,30 @@ end
         BNB.JuMP.optimize!(tree.model)
         basis = BNB._survivor_snapshot_basis(tree.model)
         queue = [
-            BNB.SurvivorBranchNode(1, 1, [1], 4.0, basis, 0.9),
-            BNB.SurvivorBranchNode(2, 2, [2], 3.9, basis, 0.7),
-            BNB.SurvivorBranchNode(3, 2, [2, 3], 3.8, basis, 0.85),
+            BNB.SurvivorBranchNode(1, 1, [1], 4.0, basis, -Inf, false),
+            BNB.SurvivorBranchNode(2, 2, [2], 3.9, basis, -Inf, false),
+            BNB.SurvivorBranchNode(3, 2, [2, 3], 3.8, basis, -Inf, false),
         ]
         @test BNB._survivor_tree_next_node(queue, 1, 1) == 2
         @test BNB._survivor_tree_next_node(queue, 1, 4) == 1
         plan = BNB._survivor_tree_plan(tree, tree.warm_start.selected)
         @test BNB._survivor_tree_best(2, plan, 1, plan)[1] == 1
         @test BNB._survivor_tree_best(1, plan, 2, plan)[1] == 1
+        # Synthetic objectives isolate the scheduler from heuristic quality.
+        tied = [
+            BNB.SurvivorBranchNode(10, 2, [2], 4.0, basis, 2.0, true),
+            BNB.SurvivorBranchNode(11, 2, [2, 3], 4.0, basis, 3.0, true),
+        ]
+        @test BNB._survivor_tree_next_node(tied, 1, 1) == 2
+        tied[1] = BNB.SurvivorBranchNode(10, 2, [2], 4.1, basis, 2.0, true)
+        @test BNB._survivor_tree_next_node(tied, 1, 1) == 1
+        tied[1] = BNB.SurvivorBranchNode(10, 3, [3], 4.0, basis, 2.0, true)
+        @test BNB._survivor_tree_next_node(tied, 1, 1, Dict(2 => 4.0, 3 => 4.2)) == 1
+        tied[1] = BNB.SurvivorBranchNode(10, 2, [2], 4.0, basis, -Inf, true)
+        tied[2] = BNB.SurvivorBranchNode(11, 2, [2, 3], 4.0, basis, -2.0, true)
+        @test BNB._survivor_tree_next_node(tied, 1, 1) == 2
+        tied[1] = BNB.SurvivorBranchNode(10, 2, [2], 4.0, basis, -2.0, true)
+        @test BNB._survivor_tree_next_node(tied, 1, 1) == 1
     end
 
     @testset "compact parent certificates and cascading closure" begin
@@ -593,6 +642,27 @@ end
         @test last(events).upper == first(only(filter(e -> e.kind == :partition, events)).nodes).upper
         @test length(last(events).pending) == 2
         @test last(events).retained == 2
+        tree = BNB._build_survivor_full_model(data, state, _bnb_config(), inputs)
+        expired[] = false
+        events = []
+        function expire_after_completion(event)
+            push!(events, event)
+            event.kind == :node_completion && (expired[] = true)
+        end
+        @test_logs (:warn, r"first pick is unproven") BNB._optimize_survivor_branch_and_bound!(
+            tree; observer=expire_after_completion,
+            remaining_time=() -> expired[] ? 0.0 : nothing,
+        )
+        @test count(e -> e.kind == :node_completion, events) == 1
+        @test !any(e -> e.kind == :basis_loaded, events)
+        @test last(events).reason == :node_timeout
+        @test last(events).nodes == 0
+        partition = only(filter(e -> e.kind == :partition, events))
+        @test sort(last(events).pending) == sort([n.id for n in partition.nodes])
+        @test last(events).retained == length(partition.nodes)
+        @test all(==(first(partition.nodes).upper), values(last(events).root_bounds))
+        @test last(events).plan.objective_value >=
+              only(filter(e -> e.kind == :node_completion, events)).plan.objective_value
     end
 
     @testset "zero-valued first pick and Hall-infeasible region" begin
@@ -628,6 +698,11 @@ end
         @test sort(getproperty.(partition.nodes, :region)) == [1, 2]
         @test any(e -> e.kind == :node_solve && e.node.region == 1 &&
                        e.status == BNB.JuMP.MOI.INFEASIBLE, events)
+        infeasible_ranking = only(filter(
+            e -> e.kind == :node_ranked && e.node.region == 1, events,
+        ))
+        @test infeasible_ranking.node.completion_ready
+        @test infeasible_ranking.node.completion_lower_bound == -Inf
         @test last(events).proven
         @test last(events).upper == -Inf
         @test last(events).nodes == 1

@@ -5257,7 +5257,7 @@ function _optimize_survivor_expected_weeks_scalar_milp(
         loss_state in state_indices;
         init=0.0,
     )
-    @debug "survivor MILP warm start" phase=:exact_milp objective=warm_start_objective
+    @debug "survivor MILP warm start" phase=:exact_milp objective=warm_start_objective first_pick=data.team[first(warm_start.selected)] schedule=collect(zip(data.week[warm_start.selected], data.team[warm_start.selected]))
     _set_survivor_scalar_warm_start!(
         selected,
         probability,

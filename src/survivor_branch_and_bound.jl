@@ -91,7 +91,8 @@ struct SurvivorBranchNode
     path::Vector{Int}
     upper::Float64
     basis::SurvivorNativeBasis
-    probability::Float64
+    completion_lower_bound::Float64
+    completion_ready::Bool
 end
 
 function _survivor_tree_plan(tree, indices; expected_objective=nothing)
@@ -456,7 +457,7 @@ function _survivor_tree_next_node(queue, incumbent_region, iteration, roots=noth
     end
     return first(sort(candidates; by=i -> (
         -region_upper[queue[i].region], -queue[i].upper,
-        -queue[i].probability, length(queue[i].path), queue[i].id,
+        -queue[i].completion_lower_bound, length(queue[i].path), queue[i].id,
     )))
 end
 
@@ -493,6 +494,7 @@ function _optimize_survivor_branch_and_bound!(
     model = tree.model
     started = tree.budget_started_at
     incumbent = _survivor_tree_plan(tree, tree.warm_start.selected)
+    @debug "survivor branch-and-bound initial incumbent" objective=incumbent.objective_value first_pick=only(incumbent.current_pick.team) schedule=collect(zip(incumbent.selections.week, incumbent.selections.team))
     regions = _survivor_tree_candidates(tree, Int[], 1)
     incumbent_region = tree.warm_start.selected[1]
     remaining() = remaining_time()
@@ -552,7 +554,7 @@ function _optimize_survivor_branch_and_bound!(
     end
     queue = [SurvivorBranchNode(
         id, region, [region], root_upper, root_basis,
-        tree.inputs.derivatives[region].base_probability,
+        -Inf, false,
     ) for (id, region) in enumerate(regions)]
     next_id = length(queue)
     summaries = Dict(n.id => _survivor_tree_summary(0, n.region, n.upper) for n in queue)
@@ -573,6 +575,46 @@ function _optimize_survivor_branch_and_bound!(
         end
         isempty(queue) && error("survivor exhausted tree has inconsistent region certificates")
         expired() && return finish(incumbent, false, :node_timeout, competing, nodes)
+        for i in eachindex(queue)
+            node = queue[i]
+            node.completion_ready && continue
+            expired() && break
+            if node.upper <= incumbent.objective_value +
+                             _survivor_tree_tolerance(incumbent.objective_value, node.upper)
+                continue
+            end
+            completion = _survivor_greedy_selected_indices(
+                tree.data, tree.state, tree.config, tree.inputs;
+                fixed_indices=node.path, expired,
+            )
+            completion === nothing && expired() && break
+            plan = completion === nothing ? nothing : _survivor_tree_plan(tree, completion)
+            node = SurvivorBranchNode(
+                node.id, node.region, node.path, node.upper, node.basis,
+                plan === nothing ? -Inf : plan.objective_value, true,
+            )
+            queue[i] = node
+            if plan !== nothing
+                plan.objective_value <= node.upper +
+                    _survivor_tree_tolerance(plan.objective_value, node.upper) ||
+                    error("survivor node completion contradicts its inherited upper bound")
+                improved = plan.objective_value > incumbent.objective_value
+                if improved
+                    @debug "survivor branch-and-bound incumbent improved" node=node.id previous_objective=incumbent.objective_value objective=plan.objective_value fixed_indices=node.path schedule=collect(zip(plan.selections.week, plan.selections.team))
+                end
+                incumbent_region, incumbent = _survivor_tree_best(
+                    incumbent_region, incumbent, node.region, plan,
+                )
+                observer((; kind=:node_completion, node, plan, improved))
+            end
+            observer((; kind=:node_ranked, node))
+        end
+        competing = maximum((upper[a] for a in regions if a != incumbent_region); init=-Inf)
+        tolerance = _survivor_tree_tolerance(incumbent.objective_value, competing)
+        if incumbent.objective_value >= competing - tolerance
+            return finish(incumbent, true, :region_certificate, competing, nodes)
+        end
+        expired() && return finish(incumbent, false, :node_timeout, competing, nodes)
         node_index = _survivor_tree_next_node(queue, incumbent_region, nodes + 1, upper)
         node = queue[node_index]
         deleteat!(queue, node_index)
@@ -585,18 +627,7 @@ function _optimize_survivor_branch_and_bound!(
             _survivor_tree_close!(summaries, upper, node.id, -Inf)
             continue
         end
-        completion = _survivor_greedy_selected_indices(
-            tree.data, tree.state, tree.config, tree.inputs;
-            fixed_indices=node.path, expired,
-        )
-        if completion !== nothing
-            plan = _survivor_tree_plan(tree, completion)
-            improved = plan.objective_value > incumbent.objective_value
-            incumbent_region, incumbent = _survivor_tree_best(
-                incumbent_region, incumbent, node.region, plan,
-            )
-            observer((; kind=:node_completion, node, plan, improved))
-        end
+        node.completion_ready || error("survivor selected node has no completion ranking")
         _survivor_restore_basis!(model, node.basis; repair=true)
         observer((; kind=:basis_loaded, node))
         if expired()
@@ -635,7 +666,7 @@ function _optimize_survivor_branch_and_bound!(
             end
             JuMP.dual_status(model) == JuMP.MOI.INFEASIBILITY_CERTIFICATE ||
                 error("survivor infeasible node has no supported infeasibility certificate")
-            completion === nothing ||
+            !isfinite(node.completion_lower_bound) ||
                 error("survivor infeasible LP contradicts its feasible completion")
             _survivor_tree_close!(summaries, upper, node.id, -Inf)
             continue
@@ -672,7 +703,7 @@ function _optimize_survivor_branch_and_bound!(
                 push!(child_ids, next_id)
                 push!(queue, SurvivorBranchNode(
                     next_id, node.region, [node.path; i], bound, basis,
-                    tree.inputs.derivatives[i].base_probability,
+                    -Inf, false,
                 ))
             end
             _survivor_tree_branch!(summaries, upper, node.id, bound, child_ids)

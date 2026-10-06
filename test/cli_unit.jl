@@ -68,6 +68,19 @@ end
         ) == path
         @test isfile(path)
         @test filesize(path) > 0
+        plain_path = joinpath(directory, "plain.lp")
+        tree_path = joinpath(directory, "tree.lp")
+        for (output_path, branch_and_bound) in ((plain_path, false), (tree_path, true))
+            @test SurvivorModel.write_survivor_pool_lp(
+                output_path, context;
+                selection_config=SurvivorSelectionConfig(
+                    ; minimum_favorite_spread=nothing, market_guard_weeks=0,
+                    through_week=2, hessian_weeks=2, branch_and_bound,
+                ),
+                include_completed=true,
+            ) == output_path
+        end
+        @test read(plain_path, String) == read(tree_path, String)
         @test_throws ArgumentError SurvivorModel.write_survivor_pool_lp(
             joinpath(directory, "survivor_2023.mps"),
             context;
@@ -80,6 +93,18 @@ end
 @testset "survivor command-line application" begin
     @testset "argument and stdin parsing" begin
         @test SurvivorModel._parse_survivor_cli_args(
+            ["--season=2023", "--branch-and-bound", "--hessian-weeks=0"],
+        ).branch_and_bound
+        @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
+            ["--season=2023", "--branch-and-bound", "--branch-and-bound"],
+        )
+        for args in (
+            ["--branch-and-bound", "--benders-weeks=0"],
+            ["--benders-weeks", "2", "--branch-and-bound"],
+        )
+            @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(["--season=2023"; args])
+        end
+        @test SurvivorModel._parse_survivor_cli_args(
             ["--season", "2023"],
         ) == (
             show_help=false,
@@ -89,6 +114,7 @@ end
             write_model_file=nothing,
             hessian_weeks=3,
             benders_weeks=nothing,
+            branch_and_bound=false,
             timeout_seconds=nothing,
             refresh_data=false,
         )
@@ -412,6 +438,29 @@ end
 
     @testset "fixture-backed current pick" begin
         schedule, historical, current = _survivor_context_fixture()
+        for H in (0, 1, 2, 18)
+            mktempdir() do cache_directory
+                output = IOBuffer()
+                args = ["--season=2023", "--branch-and-bound", "--hessian-weeks=$H"]
+                @test SurvivorModel._parse_survivor_cli_args(args).hessian_weeks == H
+                @test SurvivorModel._run_survivor_cli(
+                    args;
+                    input=IOBuffer("A\n"), output,
+                    schedule, historical_drives=historical, current_drives=current,
+                    cache_directory, through_week=2,
+                ) == 0
+                @test String(take!(output)) in ("C\n", "D\n")
+                path = joinpath(cache_directory, "external.lp")
+                @test SurvivorModel._run_survivor_cli(
+                    [args; "--write-model"; path];
+                    input=IOBuffer(), output,
+                    schedule, historical_drives=historical, current_drives=current,
+                    cache_directory, through_week=2,
+                ) == 0
+                @test isempty(String(take!(output)))
+                @test isfile(path) && filesize(path) > 0
+            end
+        end
         mktempdir() do cache_directory
             output = IOBuffer()
             log_output = IOBuffer()

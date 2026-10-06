@@ -49,6 +49,7 @@ include("historical_cache.jl")
 include("game_forecast.jl")
 include("survivor_uncertainty.jl")
 include("survivor.jl")
+include("survivor_branch_and_bound.jl")
 include("cli.jl")
 
 end

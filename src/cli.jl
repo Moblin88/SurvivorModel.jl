@@ -20,6 +20,8 @@ function _survivor_cli_usage()
       --ban TEAMS         Comma-separated teams forbidden as the current pick.
       --benders-weeks N   Put the first N survival weeks in the Benders master
                           (default: extensive-form MILP; N is clamped to horizon).
+      --branch-and-bound  Full-LP external tree certifying the current pick;
+                          mutually exclusive with --benders-weeks.
       --write-model FILE.lp  Save the MILP with HiGHS and exit without solving.
       --strikes N         Initial strike count (default: 2).
       --hessian-weeks N  Number of future weeks with Hessian adjustments
@@ -60,6 +62,7 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
     ban_specified = false
     benders_weeks = nothing
     benders_weeks_specified = false
+    branch_and_bound = false
     write_model_file = nothing
     write_model_specified = false
     hessian_weeks = 3
@@ -84,6 +87,13 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
             break
         end
 
+        if argument == "--branch-and-bound"
+            branch_and_bound &&
+                throw(ArgumentError("--branch-and-bound may only be specified once"))
+            branch_and_bound = true
+            index += 1
+            continue
+        end
         if argument == "--refresh-data"
             refresh_data_specified &&
                 throw(ArgumentError("--refresh-data may only be specified once"))
@@ -181,6 +191,8 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
         index += 1
     end
 
+    branch_and_bound && benders_weeks_specified &&
+        throw(ArgumentError("--branch-and-bound and --benders-weeks are mutually exclusive"))
     show_help && return (
         show_help=true,
         season=0,
@@ -189,6 +201,7 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
         write_model_file=nothing,
         hessian_weeks=3,
         benders_weeks=nothing,
+        branch_and_bound=false,
         timeout_seconds=nothing,
         refresh_data=false,
     )
@@ -206,6 +219,7 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
         write_model_file=write_model_file,
         hessian_weeks=Int(hessian_weeks),
         benders_weeks,
+        branch_and_bound,
         timeout_seconds=timeout_seconds,
         refresh_data=refresh_data,
     )
@@ -454,6 +468,7 @@ function _run_survivor_cli(
         banned_first_pick_teams=options.banned_first_pick_teams,
         hessian_weeks=options.hessian_weeks,
         benders_weeks=options.benders_weeks,
+        branch_and_bound=options.branch_and_bound,
         timeout_seconds=options.timeout_seconds,
     )
     if options.write_model_file !== nothing

@@ -6,5 +6,6 @@ using Test
     include("model_unit.jl")
     include("forecast_unit.jl")
     include("survivor_unit.jl")
+    include("survivor_branch_and_bound_unit.jl")
     include("cli_unit.jl")
 end

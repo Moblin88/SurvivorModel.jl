@@ -72,7 +72,12 @@ assuming they decrease monotonically. This pruning is exact; zero-support
 states are fixed at zero.
 
 The MILP is warm-started with a deterministic feasible greedy plan that
-selects the highest posterior-mean candidate probability each week while
+selects the highest next-week survival sum plus half the Hessian state sum
+under the chosen prefix, using the shared exact probability/parameter-gradient/
+Hessian transition. Only the first `H=min(hessian_weeks,horizon)` weeks receive
+the correction; subsequent weeks rank survival alone. This is local greediness,
+not an optimization of future contributions. Assignment matching preserves a
+feasible remaining schedule while
 respecting market eligibility, current-week first-pick bans, and team
 uniqueness. The selected plan is forward-evaluated again to verify its reported
 objective.
@@ -108,8 +113,9 @@ equality shadow prices must not be used because they discard the required
 sign. Only picks and prefix probability states are master columns. An additional
 product-hull-based interval bound constrains `theta`. Two cached
 greedy schedules seed analytic recourse cuts: one greedily selects the
-highest-mean candidate each week, while the second forces the second-highest-
-mean candidate in week one. The analytic reverse-pass construction uses the existing
+highest local survival-plus-curvature score each week, while the second forces
+the second-best feasible local-score candidate in week one (a deliberate change
+from mean-probability ranking). The analytic reverse-pass construction uses the existing
 projection of tail parameter gradients onto games to limit the number of
 gradient gates. No reference/Pareto selection or core construction is used.
 
@@ -178,7 +184,129 @@ logging is enabled. Detailed initialization and final proof/timeout records
 remain available. Normal library calls stay silent.
 
 `write_survivor_pool_lp` always exports the initial extensive-form HiGHS model
-and exits without solving, regardless of `benders_weeks`.
+and exits without solving, regardless of `benders_weeks` or `branch_and_bound`.
+
+## Full-relaxation first-pick branch and bound
+
+`SurvivorSelectionConfig(branch_and_bound=true)` selects a separate external
+tree, mutually exclusive with Benders. `_build_survivor_full_model` exposes
+the same scalar formulation used by the extensive solve, LP export, and
+initial Benders relaxation; no derivative recurrence is duplicated.
+Probability states span the entire remaining horizon, while derivative
+states, gates, suffix references, and the gradient switch use
+`H=min(hessian_weeks, remaining_horizon)`. Path fixings do not change H.
+The existing constant-objective and forced-first-pick shortcuts remain.
+
+One continuous direct HiGHS model has stable rows and columns throughout the
+tree. The root uses HiPO, automatic threads, parallelism, and crossover.
+`src/survivor_branch_and_bound.jl` snapshots the native `Highs_getBasis`
+column/row statuses only after an optimal primal/dual feasible solve.
+Restore checks optimizer identity, native dimensions, row/column mappings,
+valid status codes, and basic-variable count, then checks the C return code
+from `Highs_setBasis`. These are actual bases, not primal starts. The external
+LP clears the builder's primal starts before any solve, so stale greedy values
+cannot supersede the installed basis. Children use simplex with automatic
+strategy and presolve disabled to preserve the
+original parent basis under bound and coefficient changes. Siblings restore their common
+parent's basis; grandchildren restore their immediate parent's basis.
+After coefficient changes the status pattern is only a seed: it can define a
+numerically singular matrix. HiGHS simplex repairs such bases; a rejected
+`Highs_setBasis` or numerical/other-error solve clears solver state and retries
+from a crash basis, with a warning and the remaining time budget. Mapping,
+ownership, and structural validation failures still fail explicitly.
+
+The external-tree builder records each gate's bound key, dummy, selector,
+and four product-hull rows in `model.ext[:survivor_node_hulls]`. Even root
+singleton/zero intervals keep explicit dummy columns and all four rows, so
+later coefficient updates never alter native row/column mappings. Extensive
+MILP, Benders, and LP-export builders keep their original compression.
+`_survivor_tree_apply_path!` rebuilds candidate availability from root pick
+bounds and the entire path (including non-prefix fixings), then propagates
+singleton-week team exclusions to a fixed point. An empty week or conflicting
+forced picks is structurally infeasible.
+
+The shared `_survivor_scalar_bounds` and `_pass` accept an availability mask;
+candidate recurrences still exist for every original candidate, but state
+minima/maxima range only over available picks. Team-leave-out passes further
+condition selected-branch intervals. Each child intersects these intervals
+with root bounds, not the previous child's bounds, and updates probability,
+parameter-gradient, projected-gradient, and Hessian variable intervals plus
+selected/other-branch hull coefficients and RHSs. Probability sums and
+variance-adjusted sums are updated too. Unavailable selectors use all-history
+intervals because their selected branch is unreachable. The suffix masks,
+parameter/projection switch, curvature horizon, and mathematical recurrences
+remain unchanged.
+
+Conditioned recurrence arithmetic expands each week's endpoints outward by a
+scale-aware rounding envelope before propagation, accounting for signed
+cancellation, followed by `prevfloat`/`nextfloat`. Aggregate endpoints use
+directed BigFloat summation and outward Float64 conversion. Nonfinite or
+unordered intervals fail explicitly. These relaxations may include repeated
+unfixed teams, but contain every valid branch completion; singleton propagation
+only removes assignments forced to reuse a team. A completely fixed schedule
+collapses state intervals to its recurrence values up to rounding envelopes.
+`model.ext[:survivor_node_bounds]` exposes the most recently applied intervals.
+Internal `tighten_terms=false` restores root term bounds for controlled
+baseline comparisons; it is not a user-facing backend setting.
+
+The shared curvature-aware seed uses assignment-matching look-ahead
+to avoid a locally attractive pick blocking the entire future schedule.
+An integral root is evaluated exactly and checked against its LP objective.
+Otherwise the root partitions all eligible first picks, even if week one's
+LP assignment is integral. Within each region, the earliest materially
+fractional unfixed week branches into every eligible remaining candidate,
+including zero-valued LP candidates. Every path explicitly fixes other picks
+in that week to zero and excludes chosen teams elsewhere.
+
+Before each child solve, the shared greedy builder completes the entire path,
+reserving teams for fixed future weeks as well as the prefix. Matching and
+completion honor the shared deadline. Complete schedules are
+validated/forward-evaluated exactly before updating the single global
+incumbent (objective ties prefer the smaller first-pick index). There is no
+unbounded schedule/plan cache or per-region witness history.
+A completion is only a feasible lower bound; it never changes an
+inherited or LP upper certificate.
+
+Nodes carry inherited upper bounds and their parent's basis. The scheduler
+prioritizes competing regions by their largest upper bound, then their best
+node; every fourth selection permits incumbent-region improvement. Stable
+probability, depth, and candidate/node order break ties. Each live node has a
+separate basis-free ancestor summary: its capped upper bound, live child bounds,
+and maximum closed-child bound. Propagation uses
+`parentUB=min(ownLPUB,max(closedChildUB,liveChildUBs))`. Unsolved and interrupted
+children retain inherited caps; infeasible children close with `-Inf`;
+bound-pruned children retain their certified caps. Integral leaves close with
+their exact forward objective plus an outward numerical margin. Once every
+child closes, its parent closes recursively and its record is deleted.
+Persistent region-root scalar bounds remain valid even when the global
+incumbent changes regions. No ancestor record contains a path or basis;
+frontier nodes share their immediate parent's basis and release it when no
+pending child needs it. Structural infeasibility and supported solver
+infeasibility remove only their own subtree; a solver infeasibility
+contradicting the incumbent or current feasible completion is an error.
+
+LP primal values alone are never bounds. Optimal status, primal/dual
+feasibility, objective agreement, and native maximum infeasibilities are
+checked. A separate Lagrangian upper certificate clamps row multipliers to
+valid inequality signs and maximizes every residual column coefficient over
+its finite current interval, using 128-bit BigFloat accumulation. Thus
+stationarity residuals cannot silently turn the dual objective into an
+unsafe upper bound. A `1e-8 * max(1, abs(bound), abs(primal))` outward margin
+and `nextfloat` account for floating-point arithmetic; this is numerical,
+not exact-rational certification. Child bounds are intersected with their
+inherited bounds.
+
+A first-pick witness is certified when its exact lower bound reaches every
+competing region upper bound within
+`1e-6 * max(1, abs(lower), abs(competing_upper))`. This does not require
+exhausting its own region and does not assert uniqueness or optimality of
+the complete schedule. The shared timeout starts before scalar model
+construction and is reapplied before each solve; interrupted children keep
+their inherited bounds. Timeout returns a feasible witness with an explicit
+unproven warning. Unexpected statuses, invalid basis transfers, or inconsistent
+certificates raise errors rather than falling back to another backend.
+Debug-only stderr diagnostics report root HiPO/crossover and child
+native-parent simplex costs, queue growth, and final proof/timeout accounting.
 
 ## Cache maintenance
 

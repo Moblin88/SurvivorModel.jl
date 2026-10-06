@@ -198,22 +198,22 @@ states, gates, suffix references, and the gradient switch use
 The existing constant-objective and forced-first-pick shortcuts remain.
 
 One continuous direct HiGHS model has stable rows and columns throughout the
-tree. The root uses HiPO, automatic threads, parallelism, and crossover.
-`src/survivor_branch_and_bound.jl` snapshots the native `Highs_getBasis`
-column/row statuses only after an optimal primal/dual feasible solve.
-Restore checks optimizer identity, native dimensions, row/column mappings,
-valid status codes, and basic-variable count, then checks the C return code
-from `Highs_setBasis`. These are actual bases, not primal starts. The external
-LP clears the builder's primal starts before any solve, so stale greedy values
-cannot supersede the installed basis. Children use simplex with automatic
-strategy and presolve disabled to preserve the
-original parent basis under bound and coefficient changes. Siblings restore their common
-parent's basis; grandchildren restore their immediate parent's basis.
-After coefficient changes the status pattern is only a seed: it can define a
-numerically singular matrix. HiGHS simplex repairs such bases; a rejected
-`Highs_setBasis` or numerical/other-error solve clears solver state and retries
-from a crash basis, with a warning and the remaining time budget. Mapping,
-ownership, and structural validation failures still fail explicitly.
+tree. Both root and children use HiPO, automatic threads (`threads=0`),
+parallelism, presolve enabled, and `run_crossover=off`. The tree does not
+snapshot or restore bases: primal/dual solutions suffice for branching and
+residual-safe certificates. The external LP clears the builder's primal starts
+before any solve. The shared LP factory's crossover settings for other
+backends remain unchanged. Standalone native-basis helpers remain available
+for diagnostics and their independent regression tests.
+HiGHS 1.15.1 can report `Unknown` after recovering incorrect maximization
+duals from a presolved HiPO solution without crossover. The tree solves
+the mathematically equivalent minimization of the negative objective,
+normalizing primal/dual objectives and the Lagrangian objective back to
+the original maximization convention. Some models still fail postsolve:
+numerical/error statuses with presolve on trigger a logged HiPO-only retry
+with presolve off and the remaining budget. Presolve then remains off;
+crossover remains off throughout. Time/iteration limits are not retried,
+and unexpected retry statuses still raise errors.
 
 The external-tree builder records each gate's bound key, dummy, selector,
 and four product-hull rows in `model.ext[:survivor_node_hulls]`. Even root
@@ -273,7 +273,7 @@ heuristic interrupted by the deadline retains the node's inherited upper bound.
 A completion is only a feasible lower bound; it never changes an
 inherited or LP upper certificate.
 
-Nodes carry inherited upper bounds and their parent's basis. The scheduler
+Nodes carry inherited upper bounds, a scalar completion score, and a completion-ready flag. The scheduler
 prioritizes competing regions by their largest upper bound, then their best
 node; every fourth selection permits incumbent-region improvement. Stable
 exact greedy-completion objective (a subtree lower bound), depth, and node
@@ -288,10 +288,12 @@ their exact forward objective plus an outward numerical margin. Once every
 child closes, its parent closes recursively and its record is deleted.
 Persistent region-root scalar bounds remain valid even when the global
 incumbent changes regions. No ancestor record contains a path or basis;
-frontier nodes share their immediate parent's basis and release it when no
-pending child needs it. Structural infeasibility and supported solver
+frontier nodes also contain no basis. Structural infeasibility and supported solver
 infeasibility remove only their own subtree; a solver infeasibility
 contradicting the incumbent or current feasible completion is an error.
+When HiPO supplies no infeasibility ray, a completed unsuccessful default-rank
+completion provides an independent structural certificate: its exact
+week/team matching look-ahead found no complete schedule for the path.
 
 LP primal values alone are never bounds. Optimal status, primal/dual
 feasibility, objective agreement, and native maximum infeasibilities are
@@ -303,6 +305,9 @@ unsafe upper bound. A `1e-8 * max(1, abs(bound), abs(primal))` outward margin
 and `nextfloat` account for floating-point arithmetic; this is numerical,
 not exact-rational certification. Child bounds are intersected with their
 inherited bounds.
+Row multipliers are read directly from the native solution and corrected for
+objective sense: HiGHS.jl 1.25.3 otherwise filters inequality duals using
+basis statuses even when crossover is disabled and no valid basis exists.
 
 A first-pick witness is certified when its exact lower bound reaches every
 competing region upper bound within
@@ -311,10 +316,12 @@ exhausting its own region and does not assert uniqueness or optimality of
 the complete schedule. The shared timeout starts before scalar model
 construction and is reapplied before each solve; interrupted children keep
 their inherited bounds. Timeout returns a feasible witness with an explicit
-unproven warning. Unexpected statuses, invalid basis transfers, or inconsistent
+unproven warning. Unexpected statuses or inconsistent
 certificates raise errors rather than falling back to another backend.
-Debug-only stderr diagnostics report root HiPO/crossover and child
-native-parent simplex costs, queue growth, and final proof/timeout accounting.
+The `node_start` observer event follows path tightening and precedes the
+deadline check and solve. Debug-only stderr diagnostics report root and child
+HiPO costs (IPM iterations), crossover-off settings, queue growth, and final
+proof/timeout accounting.
 
 ## Cache maintenance
 

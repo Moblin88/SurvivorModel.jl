@@ -351,23 +351,28 @@ survivor --season 2026 --benders-weeks 5 < picks.txt
 Pass `--branch-and-bound` (or set
 `SurvivorSelectionConfig(branch_and_bound=true)`) to use an external
 full-relaxation tree instead. It is mutually exclusive with `--benders-weeks`.
-The root uses HiGHS HiPO with crossover; children use simplex with the actual
-parent basis. The root partitions **every eligible first pick**, including
+The root and children use parallel HiGHS HiPO with presolve enabled and
+crossover disabled; no simplex basis is needed. The root partitions **every eligible first pick**, including
 zero-valued LP picks. Later branches select the earliest fractional week.
 Competing first-pick regions receive priority, interleaved with improvement
 of the incumbent region.
 One global exact incumbent is retained. Child certificates tighten ancestor
 bounds by their maximum, capped by the parent's LP bound. Completed subtrees
 collapse to scalar summaries; only the frontier and its necessary ancestors
-retain tree state, and only frontier nodes retain parent bases.
+retain tree state; frontier nodes carry no basis snapshots.
 Before each child solve, the fixed picks and unavailable teams tighten the
 probability, parameter-gradient, projected-gradient, and signed-curvature
 intervals, including aggregate gates. Both variable bounds and all four
 product-hull rows are updated in place; siblings recompute from root bounds
 without inheriting each other's restrictions. The curvature horizon and LP
-structure stay fixed. Parent bases seed simplex after coefficient changes;
-HiGHS repairs numerical singularity, with an explicitly logged crash-basis
-retry if the seed is rejected or the solve reports a numerical failure.
+structure stay fixed. Each relaxation is solved with HiPO after these updates;
+unexpected solver statuses or invalid numerical certificates raise errors.
+Internally, the tree minimizes the negative objective to avoid a HiGHS 1.15.1
+maximization dual-recovery issue without crossover. Reported objectives and
+upper certificates retain the original maximization convention.
+Some presolved models still hit invalid dual recovery in that version.
+Numerical/error statuses trigger a logged HiPO-only retry without presolve
+using the remaining budget; presolve then stays off, but crossover never runs.
 
 ```sh
 survivor --season 2026 --hessian-weeks 18 --branch-and-bound \
@@ -427,10 +432,10 @@ JULIA_DEBUG=SurvivorModel survivor --season 2026 < picks.txt
 ```
 
 Branch-and-bound also keeps native HiGHS output silent. Debug logs identify
-the Hessian horizon, root barrier/crossover cost, first-pick partition, and
-native-parent simplex basis provenance. Its stderr progress table reports
+the Hessian horizon, root barrier cost, first-pick partition, and
+child HiPO settings. Its stderr progress table reports
 node/region, depth, earliest fractional week, queue size, incumbent lower
-bound, competing upper bound, node bound, iterations, and solve time;
+bound, competing upper bound, node bound, IPM iterations, and solve time;
 interrupted solves retain their inherited bound in the final timeout record.
 Stdout remains one team abbreviation.
 

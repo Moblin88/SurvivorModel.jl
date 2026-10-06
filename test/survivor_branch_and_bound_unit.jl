@@ -356,7 +356,7 @@ end
             @test e.plan.objective_value <= e.node.upper + 2e-6
         end
         for (position, e) in enumerate(events)
-            e.kind == :basis_loaded || continue
+            e.kind == :node_start || continue
             @test e.node.completion_ready
             if isfinite(e.node.completion_lower_bound)
                 completed = only(filter(c -> c.node.id == e.node.id, completions))
@@ -369,7 +369,8 @@ end
             @test all(e -> e.node.completion_ready, ranked)
             @test fieldtype(BNB.SurvivorBranchNode, :completion_lower_bound) == Float64
             @test !(:completion in fieldnames(BNB.SurvivorBranchNode))
-            for e in filter(e -> e.kind == :basis_loaded, events)
+            @test !(:basis in fieldnames(BNB.SurvivorBranchNode))
+            for e in filter(e -> e.kind == :node_start, events)
                 @test count(r -> r.node.id == e.node.id, ranked) == 1
             end
         end
@@ -410,7 +411,26 @@ end
                 @test isempty(tree.parameter_gradient)
                 @test size(tree.hessian, 1) == 1
             end
-            plan = BNB._optimize_survivor_branch_and_bound!(tree; observer=e -> push!(events, e))
+            function observe_solver(event)
+                push!(events, event)
+                if event.kind in (:root, :node_start, :node_solve)
+                    for (option, value) in (
+                        ("solver", "hipo"), ("run_crossover", "off"),
+                        ("parallel", "on"), ("threads", 0),
+                    )
+                        @test BNB.JuMP.get_optimizer_attribute(tree.model, option) == value
+                    end
+                end
+                if event.kind in (:root, :node_solve)
+                    @test event.simplex_iterations == 0
+                    count = Ref{BNB.HiGHS.HighsInt}(0)
+                    @test BNB.HiGHS.Highs_getIntInfoValue(
+                        BNB.JuMP.backend(tree.model).inner, "crossover_iteration_count", count,
+                    ) == BNB.HiGHS.kHighsStatusOk
+                    @test count[] == 0
+                end
+            end
+            plan = BNB._optimize_survivor_branch_and_bound!(tree; observer=observe_solver)
             first_index = only(findall((data.week .== current) .&
                                       (data.team .== only(plan.current_pick.team))))
             @test exhaustive[first_index] >= maximum(values(exhaustive)) - 5e-6
@@ -506,12 +526,10 @@ end
         tree = BNB._build_survivor_full_model(
             data, SurvivorPoolState(2025, 1), _bnb_config(), inputs,
         )
-        BNB.JuMP.optimize!(tree.model)
-        basis = BNB._survivor_snapshot_basis(tree.model)
         queue = [
-            BNB.SurvivorBranchNode(1, 1, [1], 4.0, basis, -Inf, false),
-            BNB.SurvivorBranchNode(2, 2, [2], 3.9, basis, -Inf, false),
-            BNB.SurvivorBranchNode(3, 2, [2, 3], 3.8, basis, -Inf, false),
+            BNB.SurvivorBranchNode(1, 1, [1], 4.0, -Inf, false),
+            BNB.SurvivorBranchNode(2, 2, [2], 3.9, -Inf, false),
+            BNB.SurvivorBranchNode(3, 2, [2, 3], 3.8, -Inf, false),
         ]
         @test BNB._survivor_tree_next_node(queue, 1, 1) == 2
         @test BNB._survivor_tree_next_node(queue, 1, 4) == 1
@@ -520,18 +538,18 @@ end
         @test BNB._survivor_tree_best(1, plan, 2, plan)[1] == 1
         # Synthetic objectives isolate the scheduler from heuristic quality.
         tied = [
-            BNB.SurvivorBranchNode(10, 2, [2], 4.0, basis, 2.0, true),
-            BNB.SurvivorBranchNode(11, 2, [2, 3], 4.0, basis, 3.0, true),
+            BNB.SurvivorBranchNode(10, 2, [2], 4.0, 2.0, true),
+            BNB.SurvivorBranchNode(11, 2, [2, 3], 4.0, 3.0, true),
         ]
         @test BNB._survivor_tree_next_node(tied, 1, 1) == 2
-        tied[1] = BNB.SurvivorBranchNode(10, 2, [2], 4.1, basis, 2.0, true)
+        tied[1] = BNB.SurvivorBranchNode(10, 2, [2], 4.1, 2.0, true)
         @test BNB._survivor_tree_next_node(tied, 1, 1) == 1
-        tied[1] = BNB.SurvivorBranchNode(10, 3, [3], 4.0, basis, 2.0, true)
+        tied[1] = BNB.SurvivorBranchNode(10, 3, [3], 4.0, 2.0, true)
         @test BNB._survivor_tree_next_node(tied, 1, 1, Dict(2 => 4.0, 3 => 4.2)) == 1
-        tied[1] = BNB.SurvivorBranchNode(10, 2, [2], 4.0, basis, -Inf, true)
-        tied[2] = BNB.SurvivorBranchNode(11, 2, [2, 3], 4.0, basis, -2.0, true)
+        tied[1] = BNB.SurvivorBranchNode(10, 2, [2], 4.0, -Inf, true)
+        tied[2] = BNB.SurvivorBranchNode(11, 2, [2, 3], 4.0, -2.0, true)
         @test BNB._survivor_tree_next_node(tied, 1, 1) == 2
-        tied[1] = BNB.SurvivorBranchNode(10, 2, [2], 4.0, basis, -2.0, true)
+        tied[1] = BNB.SurvivorBranchNode(10, 2, [2], 4.0, -2.0, true)
         @test BNB._survivor_tree_next_node(tied, 1, 1) == 1
     end
 
@@ -603,11 +621,11 @@ end
             phase == :root && BNB.JuMP.set_time_limit_sec(tree.model, 1e-9)
             function observe(event)
                 push!(events, event)
-                if phase == :child && event.kind == :basis_loaded
+                if phase == :child && event.kind == :node_start
                     BNB.JuMP.set_time_limit_sec(tree.model, 1e-9)
                 end
             end
-            @test_logs (:warn, r"first pick is unproven") begin
+            @test_logs (:warn, r"first pick is unproven") match_mode=:any begin
                 plan = BNB._optimize_survivor_branch_and_bound!(tree; observer=observe)
                 @test nrow(plan.selections) == 3
             end
@@ -633,7 +651,7 @@ end
                 expired[] = true
             end
         end
-        @test_logs (:warn, r"first pick is unproven") BNB._optimize_survivor_branch_and_bound!(
+        @test_logs (:warn, r"first pick is unproven") match_mode=:any BNB._optimize_survivor_branch_and_bound!(
             tree; observer=expire_after_root,
             remaining_time=() -> expired[] ? 0.0 : nothing,
         )
@@ -649,12 +667,12 @@ end
             push!(events, event)
             event.kind == :node_completion && (expired[] = true)
         end
-        @test_logs (:warn, r"first pick is unproven") BNB._optimize_survivor_branch_and_bound!(
+        @test_logs (:warn, r"first pick is unproven") match_mode=:any BNB._optimize_survivor_branch_and_bound!(
             tree; observer=expire_after_completion,
             remaining_time=() -> expired[] ? 0.0 : nothing,
         )
         @test count(e -> e.kind == :node_completion, events) == 1
-        @test !any(e -> e.kind == :basis_loaded, events)
+        @test !any(e -> e.kind == :node_start, events)
         @test last(events).reason == :node_timeout
         @test last(events).nodes == 0
         partition = only(filter(e -> e.kind == :partition, events))
@@ -708,7 +726,7 @@ end
         @test last(events).nodes == 1
     end
 
-    @testset "debug output and unexpected simplex status" begin
+    @testset "debug output and unexpected HiPO status" begin
         data, inputs = _bnb_fixture(; repeated=false)
         state = SurvivorPoolState(2025, 1; strikes_remaining=2)
         tree = BNB._build_survivor_full_model(data, state, _bnb_config(), inputs)
@@ -742,12 +760,13 @@ end
         end
         text = String(take!(logs))
         @test occursin("hessian_weeks = 3", text)
-        @test occursin("native_parent", text)
+        @test occursin("child_solver = :hipo", text)
+        @test occursin("crossover = :off", text)
         @test occursin("first_pick_within_tolerance", text)
         tree = BNB._build_survivor_full_model(data, state, _bnb_config(), inputs)
         function limit_iterations(event)
-            event.kind == :basis_loaded &&
-                BNB.JuMP.set_optimizer_attribute(tree.model, "simplex_iteration_limit", 0)
+            event.kind == :node_start &&
+                BNB.JuMP.set_optimizer_attribute(tree.model, "ipm_iteration_limit", 0)
         end
         @test_throws ErrorException BNB._optimize_survivor_branch_and_bound!(
             tree; observer=limit_iterations,
@@ -818,6 +837,7 @@ end
             else
                 @test upper <= bounds[path[1]].upper + 1e-6
             end
+
         end
         @test any(>(0), iterations)
         saved = root.columns[1]
@@ -833,6 +853,58 @@ end
         @test_throws ErrorException BNB._survivor_restore_basis!(m, root)
         BNB.JuMP.@variable(m, extra_column)
         @test_throws ErrorException BNB._survivor_restore_basis!(m, root)
+    end
+
+    @testset "presolve remains enabled on supported HiPO models" begin
+        data, inputs = _bnb_fixture(; repeated=false)
+        tree = BNB._build_survivor_full_model(
+            data, SurvivorPoolState(2025, 1; strikes_remaining=2), _bnb_config(), inputs,
+        )
+        events = []
+        function observe_presolve(event)
+            push!(events, event)
+            if event.kind in (:root, :node_start, :node_solve)
+                @test BNB.JuMP.get_optimizer_attribute(tree.model, "presolve") == "on"
+                @test BNB.JuMP.get_optimizer_attribute(tree.model, "run_crossover") == "off"
+            end
+        end
+        BNB._optimize_survivor_branch_and_bound!(tree; observer=observe_presolve)
+        @test any(e -> e.kind == :node_solve, events)
+        @test last(events).proven
+    end
+
+    @testset "crossover-free certificates agree with parent-basis simplex" begin
+        data, inputs = _bnb_fixture()
+        for losses in 0:2, H in (0, 1, 3)
+            tree = BNB._build_survivor_full_model(
+                data, SurvivorPoolState(2025, 1; strikes_remaining=losses),
+                _bnb_config(; hessian_weeks=H), inputs,
+            )
+            m = tree.model
+            BNB.JuMP.optimize!(m)
+            parent = BNB._survivor_snapshot_basis(m)
+            for path in ([1], [2], [1, 4], [2, 3])
+                @test BNB._survivor_tree_apply_path!(tree, path)
+                BNB.JuMP.set_optimizer_attribute(m, "solver", "simplex")
+                BNB.JuMP.set_optimizer_attribute(m, "presolve", "off")
+                BNB._survivor_restore_basis!(m, parent; repair=true)
+                BNB.JuMP.optimize!(m)
+                @test BNB.JuMP.termination_status(m) == BNB.JuMP.MOI.OPTIMAL
+                objective = BNB.JuMP.objective_value(m)
+                certificate = BNB._survivor_tree_upper_bound(m)
+                BNB.JuMP.set_optimizer_attribute(m, "solver", "hipo")
+                BNB.JuMP.set_optimizer_attribute(m, "run_crossover", "off")
+                BNB.JuMP.set_optimizer_attribute(m, "hipo_system", "normaleq")
+                @test BNB.HiGHS.Highs_clearSolver(BNB.JuMP.backend(m).inner) ==
+                      BNB.HiGHS.kHighsStatusOk
+                BNB.JuMP.optimize!(m)
+                @test BNB.JuMP.termination_status(m) == BNB.JuMP.MOI.OPTIMAL
+                @test BNB.JuMP.objective_value(m) ≈ objective atol=2e-6
+                @test BNB._survivor_tree_upper_bound(m) ≈ certificate atol=2e-6
+                @test BNB._survivor_tree_upper_bound(m) >= objective - 1e-8
+                @test BNB._survivor_benders_simplex_iterations(m) == 0
+            end
+        end
     end
 
     @testset "eligibility, structural conflicts, feasibility look-ahead" begin

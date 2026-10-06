@@ -92,6 +92,22 @@ struct SurvivorBranchNode
     upper::Float64
     completion_lower_bound::Float64
     completion_ready::Bool
+    parent_basis::Union{Nothing,SurvivorNativeBasis}
+end
+
+SurvivorBranchNode(id, region, path, upper, completion_lower_bound, completion_ready) =
+    SurvivorBranchNode(id, region, path, upper, completion_lower_bound, completion_ready, nothing)
+
+function _survivor_tree_objective_cutoff(lower)
+    isfinite(lower) || error("survivor objective cutoff requires a finite incumbent")
+    return -(lower + 1e-6 * max(1.0, abs(lower)))
+end
+
+function _survivor_tree_is_cutoff(status, native_status)
+    native_status >= HiGHS.kHighsModelStatusNotset ||
+        error("HiGHS returned an invalid native model status $native_status")
+    return status == JuMP.MOI.OBJECTIVE_LIMIT &&
+           native_status == HiGHS.kHighsModelStatusObjectiveBound
 end
 
 function _survivor_tree_plan(tree, indices; expected_objective=nothing)
@@ -308,14 +324,13 @@ function _survivor_tree_upper_bound(model)
     dual = objective_sign * Float64(JuMP.dual_objective_value(model))
     isfinite(primal) && isfinite(dual) ||
         error("survivor LP returned nonfinite objectives")
-    isapprox(primal, dual; atol=2e-6, rtol=1e-7) ||
-        error("survivor LP primal and dual objectives disagree: $primal vs $dual")
     optimizer = _survivor_basis_backend(model)
+    dual_infeasibility = 0.0
     for name in ("max_primal_infeasibility", "max_dual_infeasibility")
         value = Ref{Cdouble}(0.0)
         status = HiGHS.Highs_getDoubleInfoValue(optimizer.inner, name, value)
-        status == HiGHS.kHighsStatusOk && isfinite(value[]) && 0 <= value[] <= 1e-7 ||
-            error("survivor LP has invalid $name: $(value[]) (status $status)")
+        _survivor_tree_check_infeasibility(name, value[], status)
+        name == "max_dual_infeasibility" && (dual_infeasibility = value[])
     end
     # HiGHS.jl may filter barrier row duals using invalid basis statuses.
     rows = zeros(Cdouble, HiGHS.Highs_getNumRow(optimizer.inner))
@@ -325,10 +340,32 @@ function _survivor_tree_upper_bound(model)
     upper = _survivor_tree_lagrangian_bound(
         model; row_dual=ref -> sense * rows[Int(HiGHS.row(optimizer, JuMP.index(ref))) + 1],
     )
+    bound = _survivor_tree_checked_upper_bound(primal, dual, upper)
+    if dual_infeasibility > 1e-7
+        @warn "survivor LP dual residual exceeds tolerance; using residual-corrected upper certificate" max_dual_infeasibility=dual_infeasibility certified_upper=bound
+    end
+    return bound
+end
+
+function _survivor_tree_check_infeasibility(name, value, status)
+    status == HiGHS.kHighsStatusOk && isfinite(value) && value >= 0 ||
+        error("survivor LP has invalid $name: $value (status $status)")
+    name == "max_dual_infeasibility" && return nothing
+    value <= 1e-7 ||
+        error("survivor LP has invalid $name: $value (status $status)")
+    return nothing
+end
+
+function _survivor_tree_checked_upper_bound(primal, dual, upper)
+    isfinite(primal) && isfinite(dual) ||
+        error("survivor LP returned nonfinite objectives")
     isfinite(upper) || error("survivor Lagrangian certificate is not finite")
     margin = 1e-8 * max(1.0, abs(upper), abs(primal))
     upper + margin >= primal ||
         error("survivor Lagrangian certificate contradicts the LP primal")
+    if !isapprox(primal, dual; atol=2e-6, rtol=1e-7)
+        @warn "survivor LP primal and dual objectives disagree; using residual-corrected upper certificate" primal dual gap=abs(primal - dual) certified_upper=upper
+    end
     return nextfloat(max(upper, primal) + margin)
 end
 
@@ -498,6 +535,7 @@ function _optimize_survivor_branch_and_bound!(
         tree.config, tree.budget_started_at,
     ),
     tighten_terms::Bool=true,
+    optimize_relaxation!::Function=JuMP.optimize!,
 )
     model = tree.model
     started = tree.budget_started_at
@@ -524,11 +562,13 @@ function _optimize_survivor_branch_and_bound!(
         return finish(incumbent, true, :forced_first_pick, -Inf, 0)
     expired() && return finish(incumbent, false, :build_timeout, initial_upper, 0)
     debug = _survivor_debug_logging_enabled()
+    simplex = tree.config.simplex
     JuMP.set_optimizer_attribute(model, "solver", "hipo")
     JuMP.set_optimizer_attribute(model, "threads", 0)
     JuMP.set_optimizer_attribute(model, "parallel", "on")
-    JuMP.set_optimizer_attribute(model, "run_crossover", "off")
-    JuMP.set_optimizer_attribute(model, "presolve", "on")
+    JuMP.set_optimizer_attribute(model, "run_crossover", simplex ? "on" : "off")
+    JuMP.set_optimizer_attribute(model, "presolve", "choose")
+    JuMP.set_optimizer_attribute(model, "objective_bound", Inf)
     # HiGHS 1.15.1 recovers incorrect presolved HiPO duals for maximization
     # without crossover. Equivalent minimization avoids this on many models.
     if JuMP.objective_sense(model) == JuMP.MOI.MAX_SENSE
@@ -536,28 +576,33 @@ function _optimize_survivor_branch_and_bound!(
         JuMP.set_objective_sense(model, JuMP.MOI.MIN_SENSE)
     end
     function solve_relaxation!()
-        JuMP.optimize!(model)
+        optimize_relaxation!(model)
         status = JuMP.termination_status(model)
         status in (JuMP.MOI.NUMERICAL_ERROR, JuMP.MOI.OTHER_ERROR) && expired() &&
             return JuMP.MOI.TIME_LIMIT
-        if status in (JuMP.MOI.NUMERICAL_ERROR, JuMP.MOI.OTHER_ERROR) &&
-           JuMP.get_optimizer_attribute(model, "presolve") == "on" && !expired()
-            @warn "survivor HiPO relaxation failed with presolve; retrying HiPO without presolve" status raw_status=JuMP.raw_status(model)
-            JuMP.set_optimizer_attribute(model, "presolve", "off")
+        child_simplex = JuMP.get_optimizer_attribute(model, "solver") == "simplex"
+        if status in (JuMP.MOI.NUMERICAL_ERROR, JuMP.MOI.OTHER_ERROR) && !expired() &&
+           (child_simplex || JuMP.get_optimizer_attribute(model, "presolve") != "off")
+            if child_simplex
+                @warn "survivor dual-simplex relaxation failed with parent basis; retrying dual simplex with crash basis" status raw_status=JuMP.raw_status(model)
+            else
+                @warn "survivor HiPO relaxation failed with enabled or automatic presolve; retrying HiPO without presolve" status presolve=JuMP.get_optimizer_attribute(model, "presolve") raw_status=JuMP.raw_status(model)
+                JuMP.set_optimizer_attribute(model, "presolve", "off")
+            end
             optimizer = _survivor_basis_backend(model)
             HiGHS.Highs_clearSolver(optimizer.inner) == HiGHS.kHighsStatusOk ||
-                error("HiGHS could not clear a failed HiPO solve")
+                error("HiGHS could not clear a failed survivor relaxation")
             retry_remaining = remaining()
             retry_remaining === nothing ||
                 JuMP.set_time_limit_sec(model, max(1e-9, retry_remaining))
-            JuMP.optimize!(model)
+            optimize_relaxation!(model)
         end
         status = JuMP.termination_status(model)
         status in (JuMP.MOI.NUMERICAL_ERROR, JuMP.MOI.OTHER_ERROR) && expired() &&
             return JuMP.MOI.TIME_LIMIT
         return status
     end
-    @debug "survivor branch-and-bound root" hessian_weeks=tree.curvature_weeks horizon=tree.number_of_weeks solver=:hipo crossover=:off presolve=:on variables=JuMP.num_variables(model)
+    @debug "survivor branch-and-bound root" hessian_weeks=tree.curvature_weeks horizon=tree.number_of_weeks solver=:hipo crossover=(simplex ? :on : :off) presolve=:choose variables=JuMP.num_variables(model)
     root_remaining = remaining()
     root_remaining === nothing || JuMP.set_time_limit_sec(model, max(1e-9, root_remaining))
     root_started = time_ns()
@@ -590,16 +635,46 @@ function _optimize_survivor_branch_and_bound!(
         )
         return finish(incumbent, true, :integral_root, root_upper, 0)
     end
+    root_basis = simplex ? _survivor_snapshot_basis(model) : nothing
     queue = [SurvivorBranchNode(
         id, region, [region], root_upper,
-        -Inf, false,
+        -Inf, false, root_basis,
     ) for (id, region) in enumerate(regions)]
     next_id = length(queue)
     summaries = Dict(n.id => _survivor_tree_summary(0, n.region, n.upper) for n in queue)
     upper = Dict(region => root_upper for region in regions)
     observer((kind=:partition, nodes=copy(queue)))
-    @debug "survivor branch-and-bound root partition" regions=length(regions) queue=length(queue) upper=root_upper child_solver=:hipo crossover=:off presolve=JuMP.get_optimizer_attribute(model, "presolve")
+    root_basis = nothing
+    if simplex
+        JuMP.set_optimizer_attribute(model, "solver", "simplex")
+        JuMP.set_optimizer_attribute(model, "simplex_strategy", 1)
+        JuMP.set_optimizer_attribute(model, "presolve", "choose")
+        JuMP.set_optimizer_attribute(model, "run_crossover", "off")
+    end
+    @debug "survivor branch-and-bound root partition" regions=length(regions) queue=length(queue) upper=root_upper child_solver=(simplex ? :simplex : :hipo) crossover=:off presolve=JuMP.get_optimizer_attribute(model, "presolve")
     nodes = 0
+    function progress(node, bound, week, status, solve_started)
+        debug || return nothing
+        competing = maximum((upper[a] for a in regions if a != incumbent_region); init=-Inf)
+        if nodes % 25 == 1
+            println(stderr)
+            header = _survivor_tree_progress_header(; simplex)
+            println(stderr, header)
+            println(stderr, repeat("-", length(header)))
+        end
+        println(stderr, _survivor_tree_progress_row((
+            node.id, tree.data.team[node.region], length(node.path),
+            something(week, "-"), length(queue), only(incumbent.current_pick.team),
+            _survivor_benders_progress_value(incumbent.objective_value),
+            _survivor_benders_progress_value(competing),
+            _survivor_benders_progress_value(bound), status,
+            simplex ? _survivor_benders_simplex_iterations(model) :
+                      _survivor_benders_barrier_iterations(model),
+            _survivor_benders_progress_value((time_ns() - solve_started) / 1e9),
+        )))
+        flush(stderr)
+        return nothing
+    end
     while true
         competing = maximum((upper[a] for a in regions if a != incumbent_region); init=-Inf)
         tolerance = _survivor_tree_tolerance(incumbent.objective_value, competing)
@@ -624,7 +699,7 @@ function _optimize_survivor_branch_and_bound!(
             plan = completion === nothing ? nothing : _survivor_tree_plan(tree, completion)
             node = SurvivorBranchNode(
                 node.id, node.region, node.path, node.upper,
-                plan === nothing ? -Inf : plan.objective_value, true,
+                plan === nothing ? -Inf : plan.objective_value, true, node.parent_basis,
             )
             queue[i] = node
             if plan !== nothing
@@ -661,6 +736,14 @@ function _optimize_survivor_branch_and_bound!(
             continue
         end
         node.completion_ready || error("survivor selected node has no completion ranking")
+        cutoff = Inf
+        JuMP.set_optimizer_attribute(model, "presolve", "choose")
+        if simplex
+            node.parent_basis === nothing && error("survivor simplex node has no parent basis")
+            _survivor_restore_basis!(model, node.parent_basis; repair=true)
+            cutoff = _survivor_tree_objective_cutoff(incumbent.objective_value)
+            JuMP.set_optimizer_attribute(model, "objective_bound", cutoff)
+        end
         observer((; kind=:node_start, node))
         if expired()
             push!(queue, node)
@@ -673,11 +756,22 @@ function _optimize_survivor_branch_and_bound!(
         nodes += 1
         observer((; kind=:node_solve, node, status,
                   seconds=(time_ns() - solve_started) / 1e9,
-                  iterations=_survivor_benders_barrier_iterations(model),
+                  iterations=(simplex ? _survivor_benders_simplex_iterations(model) :
+                                       _survivor_benders_barrier_iterations(model)),
                   simplex_iterations=_survivor_benders_simplex_iterations(model)))
-        if status == JuMP.MOI.TIME_LIMIT
+        native_status = HiGHS.Highs_getModelStatus(_survivor_basis_backend(model).inner)
+        if simplex && _survivor_tree_is_cutoff(status, native_status)
+            bound = min(node.upper, -cutoff)
+            _survivor_tree_close!(summaries, upper, node.id, bound)
+            observer((; kind=:node_cutoff, node, status, native_status, bound, cutoff,
+                      iterations=_survivor_benders_simplex_iterations(model),
+                      seconds=(time_ns() - solve_started) / 1e9,
+                      upper=copy(upper), retained=length(summaries)))
+            progress(node, bound, nothing, "CUTOFF_PRUNED", solve_started)
+            continue
+        elseif status == JuMP.MOI.TIME_LIMIT
             push!(queue, node)
-            @debug "survivor branch-and-bound interrupted HiPO" node=node.id region=tree.data.team[node.region] queue=length(queue) inherited_upper=node.upper seconds=(time_ns() - solve_started) / 1e9 iterations=_survivor_benders_barrier_iterations(model)
+            @debug "survivor branch-and-bound interrupted relaxation" solver=(simplex ? :simplex : :hipo) node=node.id region=tree.data.team[node.region] queue=length(queue) inherited_upper=node.upper seconds=(time_ns() - solve_started) / 1e9 iterations=(simplex ? _survivor_benders_simplex_iterations(model) : _survivor_benders_barrier_iterations(model))
             competing = maximum((upper[a] for a in regions if a != incumbent_region); init=-Inf)
             return finish(incumbent, false, :interrupted_node, competing, nodes)
         elseif status == JuMP.MOI.INFEASIBLE
@@ -723,39 +817,22 @@ function _optimize_survivor_branch_and_bound!(
             assignment.week in tree.candidate_positions[node.path] &&
                 error("survivor LP is fractional in a fixed week")
             child_ids = Int[]
+            parent_basis = simplex ? _survivor_snapshot_basis(model) : nothing
             for i in _survivor_tree_candidates(tree, node.path, assignment.week)
                 next_id += 1
                 push!(child_ids, next_id)
                 push!(queue, SurvivorBranchNode(
                     next_id, node.region, [node.path; i], bound,
-                    -Inf, false,
+                    -Inf, false, parent_basis,
                 ))
             end
             _survivor_tree_branch!(summaries, upper, node.id, bound, child_ids)
+            parent_basis = nothing
         end
         observer((kind=:queue, nodes=copy(queue), retained=length(summaries),
                   parents=Dict(id => s.parent for (id, s) in summaries),
                   upper=copy(upper)))
-        if debug
-            competing = maximum((upper[a] for a in regions if a != incumbent_region); init=-Inf)
-            if nodes % 25 == 1
-                println(stderr)
-                header = _survivor_tree_progress_header()
-                println(stderr, header)
-                println(stderr, repeat("-", length(header)))
-            end
-            println(stderr, _survivor_tree_progress_row((
-                node.id, tree.data.team[node.region], length(node.path),
-                something(assignment.week, "-"), length(queue),
-                only(incumbent.current_pick.team),
-                _survivor_benders_progress_value(incumbent.objective_value),
-                _survivor_benders_progress_value(competing),
-                _survivor_benders_progress_value(bound), status,
-                _survivor_benders_barrier_iterations(model),
-                _survivor_benders_progress_value((time_ns() - solve_started) / 1e9),
-            )))
-            flush(stderr)
-        end
+        progress(node, bound, assignment.week, status, solve_started)
     end
 end
 function _survivor_tree_progress_row(values)
@@ -768,10 +845,10 @@ function _survivor_tree_progress_row(values)
     ), " | ")
 end
 
-function _survivor_tree_progress_header()
+function _survivor_tree_progress_header(; simplex=false)
     return _survivor_tree_progress_row((
         "node", "region", "depth", "week", "queue", "first",
-        "best-LB", "other-UB", "node-UB", "status", "IPM", "seconds",
+        "best-LB", "other-UB", "node-UB", "status", simplex ? "Simplex" : "IPM", "seconds",
     ))
 end
 

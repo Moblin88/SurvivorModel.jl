@@ -351,7 +351,20 @@ survivor --season 2026 --benders-weeks 5 < picks.txt
 Pass `--branch-and-bound` (or set
 `SurvivorSelectionConfig(branch_and_bound=true)`) to use an external
 full-relaxation tree instead. It is mutually exclusive with `--benders-weeks`.
-The root and children use parallel HiGHS HiPO with presolve enabled and
+Add `--simplex` (or `SurvivorSelectionConfig(branch_and_bound=true, simplex=true)`)
+to use a HiPO root with crossover and serial dual-simplex children warmed
+from their immediate parent's optimal native basis. `--simplex` requires
+`--branch-and-bound`. Child solves stop early on HiGHS' native objective-bound
+cutoff, retaining the cutoff ceiling as the subtree bound without reading a
+primal solution. These cutoff proofs trust HiGHS' numerical comparison;
+optimal LP nodes still use independently residual-corrected certificates.
+For example, `survivor --season 2026 --hessian-weeks 18 --branch-and-bound
+--simplex < picks.txt`. This option does not change the Hessian horizon or
+the unsolved model exported by `--write-model`.
+
+Without `--simplex`:
+The root and children use parallel HiGHS HiPO with automatic presolve
+(`presolve="choose"`, letting HiGHS decide) and
 crossover disabled; no simplex basis is needed. The root partitions **every eligible first pick**, including
 zero-valued LP picks. Later branches select the earliest fractional week.
 Competing first-pick regions receive priority, interleaved with improvement
@@ -372,7 +385,11 @@ maximization dual-recovery issue without crossover. Reported objectives and
 upper certificates retain the original maximization convention.
 Some presolved models still hit invalid dual recovery in that version.
 Numerical/error statuses trigger a logged HiPO-only retry without presolve
-using the remaining budget; presolve then stays off, but crossover never runs.
+using the remaining budget. Presolve is off only for that relaxation's retry;
+every new root or child starts with `presolve="choose"`, including the
+crossed-over root and parent-basis dual-simplex children in simplex mode.
+HiGHS decides whether to presolve after the parent basis is restored.
+Default HiPO never runs crossover.
 
 ```sh
 survivor --season 2026 --hessian-weeks 18 --branch-and-bound \

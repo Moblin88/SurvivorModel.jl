@@ -198,21 +198,61 @@ states, gates, suffix references, and the gradient switch use
 The existing constant-objective and forced-first-pick shortcuts remain.
 
 One continuous direct HiGHS model has stable rows and columns throughout the
-tree. Both root and children use HiPO, automatic threads (`threads=0`),
-parallelism, presolve enabled, and `run_crossover=off`. The tree does not
+tree. By default both root and children use HiPO, automatic threads (`threads=0`),
+parallelism, automatic presolve (`presolve=choose`), and `run_crossover=off`.
+The tree does not
 snapshot or restore bases: primal/dual solutions suffice for branching and
 residual-safe certificates. The external LP clears the builder's primal starts
 before any solve. The shared LP factory's crossover settings for other
 backends remain unchanged. Standalone native-basis helpers remain available
-for diagnostics and their independent regression tests.
+for diagnostics and their independent regression tests, and for the optional
+`simplex=true` path (CLI `--simplex`, requiring `--branch-and-bound`).
+That path crosses over the HiPO root with automatic presolve, snapshots its
+checked native basis,
+then uses `solver=simplex`, `simplex_strategy=1` (serial dual simplex) and
+automatic presolve (`presolve=choose`) for children. Path bounds and conditioned
+hull coefficients are updated before restoring the immediate parent's optimal
+basis, then HiGHS decides whether to presolve. Internal presolve/postsolve does
+not change the original native model's row/column mappings; snapshots after
+optimal solves and restores check the original dimensions and mappings.
+Frontier nodes
+share parent snapshots, with checked owner, dimensions and native mappings;
+completed ancestors retain no snapshots. No sibling basis is borrowed.
+Rejected bases warn and use a crash basis. Numerical/error child statuses
+warn and retry dual simplex once with a cleared basis and the remaining
+deadline, retaining the same cutoff.
+
+The root disables `objective_bound`. Each child refreshes it after queued
+completions update the incumbent: `-(LB + 1e-6 * max(1, abs(LB)))`, for the
+equivalent minimization objective. The resulting original-objective ceiling
+obeys the existing scale-aware pruning predicate even if inherited bounds
+have larger magnitude. HiGHS 1.15.1's unperturbed phase-two dual objective
+strictly crossing this threshold returns native `kObjectiveBound`.
+Only that native status together with MOI `OBJECTIVE_LIMIT` closes a cutoff
+node; objective-target, interruption and other limit statuses are not proofs.
+As requested, cutoff proofs trust HiGHS' numerical comparison, without an
+additional residual verification or re-solve. The closing cap is
+`min(inheritedUB, -objective_bound)`, never `-Inf`. No primal picks,
+objective value or optimal basis are read on this path. `node_cutoff` exposes
+the status, threshold, retained cap, iterations and elapsed time; debug table
+rows show `CUTOFF_PRUNED`, week `-`, and a `Simplex` rather than `IPM` count.
+Optimal root/child certificates retain their independent residual checks.
 HiGHS 1.15.1 can report `Unknown` after recovering incorrect maximization
 duals from a presolved HiPO solution without crossover. The tree solves
 the mathematically equivalent minimization of the negative objective,
 normalizing primal/dual objectives and the Lagrangian objective back to
 the original maximization convention. Some models still fail postsolve:
-numerical/error statuses with presolve on trigger a logged HiPO-only retry
-with presolve off and the remaining budget. Presolve then remains off;
-crossover remains off throughout. Time/iteration limits are not retried,
+numerical/error statuses with presolve `choose` or `on` trigger a logged HiPO-only retry
+with presolve off and the remaining budget, at most once per relaxation.
+Every new root or child, including simplex children, restores
+`presolve=choose` before solving,
+letting HiGHS decide whether to presolve; the fallback does
+not disable presolve globally. Restoration happens before the next node's
+`node_start` event, not after a retry, so the solved relaxation's results
+remain intact for certificate and branching reads. Only the numerical HiPO
+retry explicitly disables presolve; a simplex crash-basis retry keeps automatic
+presolve and the same cutoff. Default HiPO crossover remains off throughout.
+Time/iteration limits are not retried,
 and unexpected retry statuses still raise errors.
 
 The external-tree builder records each gate's bound key, dummy, selector,
@@ -288,7 +328,7 @@ their exact forward objective plus an outward numerical margin. Once every
 child closes, its parent closes recursively and its record is deleted.
 Persistent region-root scalar bounds remain valid even when the global
 incumbent changes regions. No ancestor record contains a path or basis;
-frontier nodes also contain no basis. Structural infeasibility and supported solver
+default HiPO frontier nodes also contain no basis. Structural infeasibility and supported solver
 infeasibility remove only their own subtree; a solver infeasibility
 contradicting the incumbent or current feasible completion is an error.
 When HiPO supplies no infeasibility ray, a completed unsuccessful default-rank
@@ -296,8 +336,16 @@ completion provides an independent structural certificate: its exact
 week/team matching look-ahead found no complete schedule for the path.
 
 LP primal values alone are never bounds. Optimal status, primal/dual
-feasibility, objective agreement, and native maximum infeasibilities are
-checked. A separate Lagrangian upper certificate clamps row multipliers to
+feasibility statuses and native maximum infeasibilities are checked.
+Native primal infeasibility must remain at most `1e-7`. A finite nonnegative
+dual infeasibility above `1e-7` is logged after constructing a valid corrected
+certificate rather than causing an abort: its stationarity error is already
+accounted for by the finite-interval Lagrangian maximization. Invalid diagnostic
+values or failed native queries still cause errors. Primal/dual
+objective disagreement is logged, not used to reject an otherwise valid
+residual-corrected upper certificate; barrier complementarity gaps can exceed
+the objective-agreement threshold without invalidating that certificate.
+A separate Lagrangian upper certificate clamps row multipliers to
 valid inequality signs and maximizes every residual column coefficient over
 its finite current interval, using 128-bit BigFloat accumulation. Thus
 stationarity residuals cannot silently turn the dual objective into an

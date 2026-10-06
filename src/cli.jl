@@ -22,6 +22,8 @@ function _survivor_cli_usage()
                           (default: extensive-form MILP; N is clamped to horizon).
       --branch-and-bound  Full-LP external tree certifying the current pick;
                           mutually exclusive with --benders-weeks.
+      --simplex          Parent-basis dual-simplex children with early pruning;
+                          requires --branch-and-bound.
       --write-model FILE.lp  Save the MILP with HiGHS and exit without solving.
       --strikes N         Initial strike count (default: 2).
       --hessian-weeks N  Number of future weeks with Hessian adjustments
@@ -63,6 +65,7 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
     benders_weeks = nothing
     benders_weeks_specified = false
     branch_and_bound = false
+    simplex = false
     write_model_file = nothing
     write_model_specified = false
     hessian_weeks = 3
@@ -87,6 +90,12 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
             break
         end
 
+        if argument == "--simplex"
+            simplex && throw(ArgumentError("--simplex may only be specified once"))
+            simplex = true
+            index += 1
+            continue
+        end
         if argument == "--branch-and-bound"
             branch_and_bound &&
                 throw(ArgumentError("--branch-and-bound may only be specified once"))
@@ -193,6 +202,8 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
 
     branch_and_bound && benders_weeks_specified &&
         throw(ArgumentError("--branch-and-bound and --benders-weeks are mutually exclusive"))
+    simplex && !branch_and_bound &&
+        throw(ArgumentError("--simplex requires --branch-and-bound"))
     show_help && return (
         show_help=true,
         season=0,
@@ -202,6 +213,7 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
         hessian_weeks=3,
         benders_weeks=nothing,
         branch_and_bound=false,
+        simplex=false,
         timeout_seconds=nothing,
         refresh_data=false,
     )
@@ -220,6 +232,7 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
         hessian_weeks=Int(hessian_weeks),
         benders_weeks,
         branch_and_bound,
+        simplex,
         timeout_seconds=timeout_seconds,
         refresh_data=refresh_data,
     )
@@ -469,6 +482,7 @@ function _run_survivor_cli(
         hessian_weeks=options.hessian_weeks,
         benders_weeks=options.benders_weeks,
         branch_and_bound=options.branch_and_bound,
+        simplex=options.simplex,
         timeout_seconds=options.timeout_seconds,
     )
     if options.write_model_file !== nothing

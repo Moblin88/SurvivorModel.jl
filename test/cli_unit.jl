@@ -115,6 +115,7 @@ end
             hessian_weeks=3,
             benders_weeks=nothing,
             branch_and_bound=false,
+            simplex=false,
             timeout_seconds=nothing,
             refresh_data=false,
         )
@@ -159,6 +160,21 @@ end
         ) == ["KC", "SF"]
         @test SurvivorModel._parse_survivor_cli_args(["--help"]).show_help
         usage = SurvivorModel._survivor_cli_usage()
+        @test occursin("--simplex", usage)
+        for flags in (
+            ["--simplex", "--branch-and-bound"],
+            ["--branch-and-bound", "--simplex"],
+        )
+            @test SurvivorModel._parse_survivor_cli_args(["--season=2023"; flags]).simplex
+        end
+        for flags in (
+            ["--simplex"],
+            ["--branch-and-bound", "--simplex", "--simplex"],
+            ["--simplex", "--benders-weeks=0"],
+            ["--simplex", "--branch-and-bound", "--benders-weeks=0"],
+        )
+            @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(["--season=2023"; flags])
+        end
         @test !occursin("--benchmark", usage)
         @test !occursin("--clear-cache", usage)
         @test occursin("exact-milp", usage)
@@ -438,10 +454,11 @@ end
 
     @testset "fixture-backed current pick" begin
         schedule, historical, current = _survivor_context_fixture()
-        for H in (0, 1, 2, 18)
+        for H in (0, 1, 2, 18), simplex in (false, true)
             mktempdir() do cache_directory
                 output = IOBuffer()
                 args = ["--season=2023", "--branch-and-bound", "--hessian-weeks=$H"]
+                simplex && push!(args, "--simplex")
                 @test SurvivorModel._parse_survivor_cli_args(args).hessian_weeks == H
                 @test SurvivorModel._run_survivor_cli(
                     args;

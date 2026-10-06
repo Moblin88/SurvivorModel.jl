@@ -54,7 +54,9 @@ first pick within numerical tolerance, not the complete witness schedule.
 It is mutually exclusive with `benders_weeks`. Its shared timeout includes
 model construction and returns an exactly evaluated feasible witness with
 an explicit warning if the first pick remains unproven. `hessian_weeks` is
-independent of tree depth.
+independent of tree depth. `simplex=true` requires `branch_and_bound=true`;
+it uses a crossed-over HiPO root and parent-basis dual-simplex children
+with native HiGHS objective-bound early pruning.
 """
 struct SurvivorSelectionConfig
     minimum_favorite_spread::Union{Nothing,Float64}
@@ -65,6 +67,7 @@ struct SurvivorSelectionConfig
     hessian_weeks::Int
     benders_weeks::Union{Nothing,Int}
     branch_and_bound::Bool
+    simplex::Bool
     timeout_seconds::Union{Nothing,Float64}
 end
 
@@ -78,6 +81,7 @@ function SurvivorSelectionConfig(
     hessian_weeks::Integer=3,
     benders_weeks::Union{Nothing,Integer}=nothing,
     branch_and_bound::Bool=false,
+    simplex::Bool=false,
     timeout_seconds=nothing,
 )
     normalized_spread = if minimum_favorite_spread === nothing
@@ -104,6 +108,8 @@ function SurvivorSelectionConfig(
         throw(ArgumentError("hessian_weeks must be nonnegative"))
     branch_and_bound && benders_weeks !== nothing &&
         throw(ArgumentError("branch_and_bound and benders_weeks are mutually exclusive"))
+    simplex && !branch_and_bound &&
+        throw(ArgumentError("simplex requires branch_and_bound"))
     normalized_benders_weeks = if benders_weeks === nothing
         nothing
     else
@@ -135,6 +141,7 @@ function SurvivorSelectionConfig(
         Int(hessian_weeks),
         normalized_benders_weeks,
         branch_and_bound,
+        simplex,
         normalized_timeout,
     )
 end

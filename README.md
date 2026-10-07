@@ -175,47 +175,22 @@ It selects exactly one team for every week in the requested horizon and allows
 each team to be selected at most once. The covariance-aware finite-state
 formulation maximizes expected completed weeks before elimination.
 
-Set `benders_weeks=K` in `SurvivorSelectionConfig` or pass
-`--benders-weeks K` to use the meet-in-the-middle Benders solve. `K` is
-clamped to the remaining horizon; zero leaves only initial states in the master.
-The master contains all weekly assignments, survival-probability recurrences
-through week `K` only. Its objective includes prefix survival plus `theta`.
-With `H=min(hessian_weeks, remaining horizon)`, all gradient/Hessian states,
-gates, and covariance corrections remain in analytic recourse, even when
-`K` covers the full horizon.
-`hessian_weeks` still sets the correction horizon, independently of `K`.
-Omitted survival and every Hessian correction belong to `theta`. Recourse uses
-the original full-horizon parameter-to-game projection and reference pruning.
-Recourse states and their cuts are derived analytically; no recourse LP
-is built or solved during the seed or iteration loop. Cuts include pick and
-prefix-probability coefficients, with the intercept derived from the dual RHS,
-never recalibrated to an approximate objective. Before iteration, the algorithm solves the full
-linearized model relaxation to optimality (unless the shared timeout expires)
-with HiGHS HiPO, parallelism, and crossover enabled to obtain the affine dual
-cut over picks and prefix states. It then adds analytic recourse cuts
-from two greedy schedules with different first picks. Analytic dual tightness
-at the generating schedule and initial LP dual stationarity are checked;
-invalid certificates are explicit
-errors, and the initial LP and master solves share the Benders timeout.
-
-This mode certifies the optimal current-week pick by comparing its feasible
-objective value with an upper bound from a master solve that forbids that pick.
-The returned `SurvivorPoolPlan` includes a feasible full-schedule witness and
-its exact objective, but the future picks are not necessarily globally
-optimal once the current pick is certified. If the solve times out first, the
-best feasible plan is returned without an optimality proof. Omitting
-`benders_weeks` keeps the extensive-form MILP as the default. All survivor
-optimization modes use HiGHS.
-MIP solves request HiPO for basis-free LP relaxations via `mip_lp_solver`,
-with crossover enabled; node relaxations with a valid basis use simplex.
-If only one current-week candidate is eligible, that pick is forced and is
-returned with a feasible greedy schedule without building the Benders master.
+The default is the extensive-form MILP. Set
+`branch_and_bound=true` in `SurvivorSelectionConfig` or pass
+`--branch-and-bound` to use an external tree of full-model LP relaxations.
+The tree uses HiPO with crossover for its root and child solves and certifies
+the current-week pick within numerical tolerance; it does not promise that the
+remaining witness schedule is globally optimal. If only one current-week
+candidate is eligible, that pick is forced and returned with a feasible
+greedy schedule. Both modes use HiGHS and the same covariance-aware
+formulation.
 
 `plan.selections` includes each selected team's win probability, selected-team
 market spread, survival and elimination probabilities, parameter-variance
 adjustment, and objective contribution. `plan.current_pick` is the row to use
 for the current week. `plan.selection_config` records the eligibility
-policies, horizon, Hessian-prefix length, Benders prefix length, and timeout.
+policies, horizon, Hessian-prefix length, branch-and-bound selection, and
+timeout.
 `banned_first_pick_teams` excludes those abbreviations only from the current
 week's pick; they remain available in later weeks unless selected elsewhere in
 the plan.
@@ -278,15 +253,12 @@ Stable candidate order breaks ties, and assignment-matching look-ahead
 preserves a feasible remaining schedule. This is a local greedy score, not a
 future-objective estimate or a globally optimal schedule.
 
-All backends share this rule, including both Benders seeds: the second seed
-now forces the second-best feasible **local-score** pick in week one, rather
-than the second-highest mean probability. Branch-and-bound also completes
-queued node paths with this heuristic, preserving all fixed picks and retaining
-only a scalar completion score and a readiness flag per node, not its schedule.
-Each node is completed at most once. Completions immediately
-improve the incumbent and their full objectives replace mean win probability
-as the node-order tie-breaker, after certified region and node upper bounds.
-They never tighten an upper bound or prune a node by themselves.
+Branch-and-bound completes queued node paths with the same heuristic,
+preserving all fixed picks and retaining only a scalar completion score and a
+readiness flag per node, not its schedule. Each node is completed at most once.
+Completions can improve the incumbent and their full objectives are used as a
+node-order tie-breaker after certified region and node upper bounds. They do
+not tighten an upper bound or prune a node by themselves.
 
 ```julia
 plan = optimize_survivor_pool(
@@ -341,90 +313,43 @@ without excluding them from later weeks in the plan:
 survivor --season 2026 --ban KC,SF < picks.txt
 ```
 
-Pass `--benders-weeks N` to use the meet-in-the-middle Benders master instead
-of the default extensive-form MILP. `N` is clamped to the remaining horizon:
-
-```sh
-survivor --season 2026 --benders-weeks 5 < picks.txt
-```
-
 Pass `--branch-and-bound` (or set
-`SurvivorSelectionConfig(branch_and_bound=true)`) to use an external
-full-relaxation tree instead. It is mutually exclusive with `--benders-weeks`.
-Add `--simplex` (or `SurvivorSelectionConfig(branch_and_bound=true, simplex=true)`)
-to use a HiPO root with crossover and serial dual-simplex children warmed
-from their immediate parent's optimal native basis. `--simplex` requires
-`--branch-and-bound`. Simplex uses a stable hull-row pool: tighter inequalities
-are added, and dominated rows are freed or reused only when their slacks are
-basic. Active nonbasic rows are never overwritten. Shared parent snapshots
-restore row versions and exact variable bounds before each child; sibling
-changes cannot leak into its basis. If no compatible inactive basic slot is
-available, the pool grows without a hard cap or automatic rebuild.
-Child solves stop early on HiGHS' native objective-bound
-cutoff, retaining the cutoff ceiling as the subtree bound without reading a
-primal solution. These cutoff proofs trust HiGHS' numerical comparison;
-optimal LP nodes still use independently residual-corrected certificates.
-For example, `survivor --season 2026 --hessian-weeks 18 --branch-and-bound
---simplex < picks.txt`. This option does not change the Hessian horizon or
-the unsolved model exported by `--write-model`.
-
-Without `--simplex`:
-The root and children use parallel HiGHS HiPO with automatic presolve
-(`presolve="choose"`, letting HiGHS decide) and
-crossover enabled. Crossover can improve the basic solution used for residual
-certificates, at additional solve cost; the tree does not retain those bases
-as child warm starts. HiGHS 1.15.1's IPX crossover ignores `objective_bound`,
-so it cannot use that option for early pruning; default-path children are
-pruned after an optimal LP certificate. The root partitions **every eligible
-first pick**, including zero-valued LP picks. Later branches select the earliest
-fractional week.
-Competing first-pick regions receive priority, interleaved with improvement
-of the incumbent region.
-One global exact incumbent is retained. Child certificates tighten ancestor
-bounds by their maximum, capped by the parent's LP bound. Completed subtrees
-collapse to scalar summaries; only the frontier and its necessary ancestors
-retain tree state; frontier nodes carry no basis snapshots.
-Before each child solve, the fixed picks and unavailable teams tighten the
-probability, parameter-gradient, projected-gradient, and signed-curvature
-intervals, including aggregate gates. Both variable bounds and all four
-product-hull rows are updated in place; siblings recompute from root bounds
-without inheriting each other's restrictions. The curvature horizon and LP
-structure stay fixed. Each relaxation is solved with HiPO after these updates;
-unexpected solver statuses or invalid numerical certificates raise errors.
-Internally, the tree minimizes the negative objective to avoid a HiGHS 1.15.1
-presolved maximization dual-recovery issue. Reported objectives and upper
-certificates retain the original maximization convention.
-Some presolved models still hit invalid dual recovery in that version.
-Numerical/error statuses trigger a logged HiPO-only retry without presolve
-using the remaining budget. Presolve is off only for that relaxation's retry;
-every new root or child starts with `presolve="choose"`, including the
-crossed-over root and children in default HiPO mode, and the crossed-over
-root and parent-basis dual-simplex children in simplex mode. HiGHS decides
-whether to presolve after the parent basis is restored.
+`SurvivorSelectionConfig(branch_and_bound=true)`) to use the optional external
+HiPO branch-and-bound tree instead of the default extensive-form MILP:
 
 ```sh
 survivor --season 2026 --hessian-weeks 18 --branch-and-bound \
   --timeout 60 < picks.txt
 ```
 
-This mode certifies the **first pick**, not necessarily the best complete
-schedule, within `1e-6 * max(1, abs(lower_bound), abs(competing_upper_bound))`.
-Ties are deterministic and do not imply a unique optimum. The returned
-witness is feasible and its objective is evaluated from the original
-recurrences. `hessian_weeks` is independent of tree depth: fixing early picks
-never shifts or shortens the correction prefix. `0`, partial, and
-full-horizon corrections retain the same extensive-form objective.
-`--write-model` still exports the unsolved extensive-form MILP.
+The tree solves the full continuous relaxation at the root and partitions all
+eligible first-week picks, including candidates with zero LP value. Child LPs
+fix picks and tighten probability, gradient, projected-gradient, and Hessian
+intervals; the existing four product-hull inequalities are updated in place.
+Both root and child solves use HiPO with crossover and automatic presolve.
+Validated solver dual bounds may prune nodes; if a recoverable solve has no
+validated bound, the root uses the formulation-based global interval bound
+and children retain their inherited bounds while branching exhaustively.
+Primal LP values are only optional branching guidance, never upper bounds.
+The tree certifies the current first pick within a numerical tolerance, not the
+entire witness schedule. Its returned schedule is feasible and independently
+evaluated. A timeout returns the best feasible schedule with an explicit
+unproven warning.
 
-Pass `--timeout SECONDS` to limit optimization. In Benders mode the time is
-shared across the initial relaxation,
-master solves, and analytic evaluation, and the best feasible
-plan is returned if the limit is reached. Branch-and-bound shares its budget
-across model construction, root and child solves, and certification. Timeout
-returns the exact greedy or improved witness with an explicit **unproven**
-warning, retaining inherited bounds for interrupted or unsolved nodes.
-Forecast/data loading occurs before this optimization budget. The extensive-form HiGHS solve
-retains its existing behavior: it returns a feasible incumbent when available
+The default path does not retry failed HiPO solves or construct
+residual-corrected Lagrangian bounds. HiGHS' own crossover and internal
+recovery remain enabled; removing the application-level tree backend does not
+disable simplex work performed internally by HiGHS. A fallback that retains
+an inherited bound may increase the search tree; no speedup is implied.
+`--write-model` continues to export the unsolved extensive-form MILP,
+regardless of the selected solve mode.
+
+Pass `--timeout SECONDS` to limit optimization. Branch-and-bound shares its
+budget across model construction, root and child solves, and certification.
+On timeout it returns the exact greedy or improved witness, retains valid
+bounds for interrupted or unsolved nodes, and warns if the first pick remains
+unproven. Forecast and data loading occur before this optimization budget.
+The extensive-form HiGHS solve returns a feasible incumbent when available
 and reports an error if no feasible incumbent exists. Omit the option for an
 unlimited solve:
 
@@ -439,39 +364,15 @@ strikes. Use `--strikes N` to choose a different initial strike count. The
 effective week is one plus the number of supplied picks; games at or after
 that week are treated as future games even when the schedule already contains
 their results, which allows replaying an earlier week of a completed season.
-The selected team is logged at Info level to stderr and also printed as its
+The selected team is logged at Info level to stderr and printed as its
 abbreviation with a newline to stdout, so stdout remains suitable for a picks
-file. Phase timings and detailed optimizer diagnostics are Debug-level logs;
-enable them for this package with `JULIA_DEBUG=SurvivorModel`. For the default
-extensive-form optimizer this also enables HiGHS root and
-branch-and-bound progress reporting. Benders keeps native HiGHS output silent
-and instead reports the master model size and initial LP solver statistics,
-then prints one plain progress table row per master and forbidden-pick solve.
-The `cuts` column counts cuts present at each solve: the alternative row
-includes the main-schedule cut, and a continued iteration's next master row
-includes both new cuts. The table tracks the chosen and banned first picks,
-best feasible lower bound, master objective and upper bound, exact schedule
-objective, recourse correction, cut count, and solve time. Its header repeats
-every 20 rows. Detailed initialization and final proof/timeout records remain
-available:
-
-```sh
-JULIA_DEBUG=SurvivorModel survivor --season 2026 < picks.txt
-```
-
-Branch-and-bound keeps native HiGHS output silent normally. With
-`--branch-and-bound --simplex` and `JULIA_DEBUG=SurvivorModel`, native relaxation
-logs are enabled on stderr, including developer-level solver information.
-Each root/child solve and numerical-recovery retry is labeled, so basis
-repair, simplex phases, infeasibility progress, and cutoff termination can
-be compared between fast and slow nodes. Default HiPO tree solves remain silent.
-Debug logs identify
-the Hessian horizon, root barrier cost, first-pick partition, and
-child HiPO settings. Its stderr progress table reports
-node/region, depth, earliest fractional week, queue size, incumbent lower
-bound, competing upper bound, node bound, IPM iterations, and solve time;
-interrupted solves retain their inherited bound in the final timeout record.
-Stdout remains one team abbreviation.
+file. Phase timings and optimizer diagnostics are Debug-level logs; enable them
+with `JULIA_DEBUG=SurvivorModel`. Branch-and-bound emits an aligned progress
+table to stderr, including root and final rows, node actions, bound sources,
+reasons, incumbent and competing bounds, IPM and crossover iterations, and
+timing. Important fallback and proof information stays in the table while it
+is enabled instead of appearing as interleaved logger messages. Native HiGHS
+output remains silent for the external tree.
 
 For example, redirect stdout and stderr separately to save the next pick and
 diagnostics to different files:
@@ -481,12 +382,6 @@ JULIA_DEBUG=SurvivorModel survivor --season 2026 \
   < picks.txt > next-pick.txt 2> survivor.log
 ```
 
-Add `--branch-and-bound --simplex` to that command to include native relaxation
-logs along with the tree table.
-Simplex debug records also report total, active/inactive, added, reused,
-deactivated, and peak hull-pool rows. Pooling preserves dual feasibility in
-exact arithmetic, not a floating-point stability or speedup guarantee; it can
-increase memory and solve time. Default HiPO and other backends are unchanged.
 
 Use `--refresh-data` (or set `SURVIVORMODEL_REFRESH_DATA=true`) for an explicit
 data refresh. This clears NFLData's raw-data cache and rebuilds the package's
@@ -512,9 +407,8 @@ full data refresh is desired.
 
 The weekly planner uses the covariance-aware expected-weeks MILP described
 above. `SurvivorSelectionConfig` controls the market guard, missing-line
-policy, planning horizon, `hessian_weeks`, the optional `benders_weeks` prefix
-or `branch_and_bound` backend,
-and `timeout_seconds`.
+policy, planning horizon, `hessian_weeks`, whether the optional
+`branch_and_bound` tree is selected, and `timeout_seconds`.
 `hessian_weeks` defaults to three, allows zero for posterior-mean probability
 terms only, and is clamped to the available horizon. `timeout_seconds` limits
 the HiGHS solve and defaults to unlimited. The default market policy protects

@@ -8,8 +8,8 @@ end
 function _survivor_cli_usage()
     return """
     Usage:
-      survivor --season YEAR [--ban TEAM1,TEAM2] [--benders-weeks N] [--write-model FILE.lp] [--strikes N] [--hessian-weeks N] [--timeout SECONDS] < picks.txt
-      julia --project=. -m SurvivorModel --season YEAR [--ban TEAM1,TEAM2] [--benders-weeks N] [--write-model FILE.lp] [--strikes N] [--hessian-weeks N] [--timeout SECONDS] < picks.txt
+      survivor --season YEAR [--ban TEAM1,TEAM2] [--branch-and-bound] [--write-model FILE.lp] [--strikes N] [--hessian-weeks N] [--timeout SECONDS] < picks.txt
+      julia --project=. -m SurvivorModel --season YEAR [--ban TEAM1,TEAM2] [--branch-and-bound] [--write-model FILE.lp] [--strikes N] [--hessian-weeks N] [--timeout SECONDS] < picks.txt
 
     Input:
       One team abbreviation per nonblank line, starting with week 1.
@@ -18,12 +18,8 @@ function _survivor_cli_usage()
     Options:
       --season YEAR       Target season (required).
       --ban TEAMS         Comma-separated teams forbidden as the current pick.
-      --benders-weeks N   Put the first N survival weeks in the Benders master
-                          (default: extensive-form MILP; N is clamped to horizon).
       --branch-and-bound  Full-LP external tree certifying the current pick;
-                          mutually exclusive with --benders-weeks.
-      --simplex          Parent-basis dual-simplex children with early pruning;
-                          requires --branch-and-bound.
+                          HiPO with crossover is used for root and child LPs.
       --write-model FILE.lp  Save the MILP with HiGHS and exit without solving.
       --strikes N         Initial strike count (default: 2).
       --hessian-weeks N  Number of future weeks with Hessian adjustments
@@ -62,10 +58,7 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
     strikes_specified = false
     banned_first_pick_teams = String[]
     ban_specified = false
-    benders_weeks = nothing
-    benders_weeks_specified = false
     branch_and_bound = false
-    simplex = false
     write_model_file = nothing
     write_model_specified = false
     hessian_weeks = 3
@@ -90,12 +83,6 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
             break
         end
 
-        if argument == "--simplex"
-            simplex && throw(ArgumentError("--simplex may only be specified once"))
-            simplex = true
-            index += 1
-            continue
-        end
         if argument == "--branch-and-bound"
             branch_and_bound &&
                 throw(ArgumentError("--branch-and-bound may only be specified once"))
@@ -117,7 +104,6 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
             argument == "--ban" ||
             argument == "--write-model" ||
             argument == "--strikes" ||
-            argument == "--benders-weeks" ||
             argument == "--hessian-weeks" ||
             argument == "--timeout"
             option = argument
@@ -137,9 +123,6 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
         elseif startswith(argument, "--strikes=")
             option = "--strikes"
             value = argument[length("--strikes=") + 1:end]
-        elseif startswith(argument, "--benders-weeks=")
-            option = "--benders-weeks"
-            value = argument[length("--benders-weeks=") + 1:end]
         elseif startswith(argument, "--hessian-weeks=")
             option = "--hessian-weeks"
             value = argument[length("--hessian-weeks=") + 1:end]
@@ -175,15 +158,6 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
                 throw(ArgumentError("--strikes may only be specified once"))
             initial_strikes = parsed
             strikes_specified = true
-        elseif option == "--benders-weeks"
-            benders_weeks_specified &&
-                throw(ArgumentError(
-                    "--benders-weeks may only be specified once",
-                ))
-            benders_weeks = _parse_survivor_cli_integer(value, option)
-            benders_weeks >= 0 ||
-                throw(ArgumentError("--benders-weeks must be nonnegative"))
-            benders_weeks_specified = true
         elseif option == "--hessian-weeks"
             hessian_weeks_specified &&
                 throw(ArgumentError("--hessian-weeks may only be specified once"))
@@ -200,10 +174,6 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
         index += 1
     end
 
-    branch_and_bound && benders_weeks_specified &&
-        throw(ArgumentError("--branch-and-bound and --benders-weeks are mutually exclusive"))
-    simplex && !branch_and_bound &&
-        throw(ArgumentError("--simplex requires --branch-and-bound"))
     show_help && return (
         show_help=true,
         season=0,
@@ -211,9 +181,7 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
         banned_first_pick_teams=String[],
         write_model_file=nothing,
         hessian_weeks=3,
-        benders_weeks=nothing,
         branch_and_bound=false,
-        simplex=false,
         timeout_seconds=nothing,
         refresh_data=false,
     )
@@ -230,9 +198,7 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
         banned_first_pick_teams=banned_first_pick_teams,
         write_model_file=write_model_file,
         hessian_weeks=Int(hessian_weeks),
-        benders_weeks,
         branch_and_bound,
-        simplex,
         timeout_seconds=timeout_seconds,
         refresh_data=refresh_data,
     )
@@ -480,9 +446,7 @@ function _run_survivor_cli(
         through_week=through_week,
         banned_first_pick_teams=options.banned_first_pick_teams,
         hessian_weeks=options.hessian_weeks,
-        benders_weeks=options.benders_weeks,
         branch_and_bound=options.branch_and_bound,
-        simplex=options.simplex,
         timeout_seconds=options.timeout_seconds,
     )
     if options.write_model_file !== nothing

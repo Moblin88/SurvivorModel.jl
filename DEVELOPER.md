@@ -82,336 +82,84 @@ respecting market eligibility, current-week first-pick bans, and team
 uniqueness. The selected plan is forward-evaluated again to verify its reported
 objective.
 
-## Benders backend
+## HiPO branch-and-bound
 
-`SurvivorSelectionConfig(benders_weeks=K)` enables a meet-in-the-middle
-decomposition. `K` is clamped to the remaining horizon. The HiGHS direct
-master contains every binary pick, all one-pick-per-week and team-once
-constraints, and the survival-probability recurrence through the first `K`
-weeks only. All parameter/projected-gradient and Hessian states and gates
-remain in fully analytic recourse. The gradient switch and reference pruning
-use the original full correction horizon, independently of `K`.
+`SurvivorSelectionConfig(branch_and_bound=true)` selects an external tree that
+certifies the current first pick. The default remains the extensive-form MILP.
+`_build_survivor_full_model` and the normal extensive-form solve share the
+scalar recurrence builder; branch-and-bound does not duplicate probability,
+gradient, projected-gradient, or Hessian recurrences. The model contains all
+pick variables and the one-pick-per-week/team-once constraints. Probability
+states span the full remaining horizon, while derivative states and Hessian
+corrections use `H=min(hessian_weeks, remaining_horizon)`. Fixing path picks
+does not shift or shorten H. `--write-model` continues to export the unsolved
+extensive-form MILP.
 
-The master objective is survival through `K` plus `theta`. Its upper bound
-sums omitted survival and all Hessian interval upper bounds, including when
-`K` covers the full horizon. Shorter prefixes retain a
-`1e-8 * max(1,abs(bound))` numerical
-margin. `hessian_weeks` semantics do not change. Tail recurrences are
-evaluated analytically from a selected schedule; no recourse LP is built or
-solved in the seed or iteration loop.
+The external tree uses one direct continuous HiGHS model. It solves the root
+relaxation, partitions every eligible first-week pick (including zero-valued
+LP candidates), and adds path fixings through variable bounds. Before each
+child solve, availability and fixed picks tighten probability,
+parameter-gradient, projected-gradient, and signed-curvature intervals. The
+four existing product-hull rows are rewritten in place from those intervals;
+model rows and columns remain fixed, and siblings recompute from root bounds.
+The full objective is maximized by minimizing its negative in this tree, then
+solver bounds are normalized back to the original maximization convention.
 
-The initial master cut is derived from the dual of the full extensive-form LP
-relaxation. Rows containing recourse variables provide the dual-feasible
-projection onto pick and prefix-state variables; master-only assignment and
-prefix constraints remain in the master. This LP is solved to optimality,
-unless the shared timeout expires, using HiGHS HiPO with `parallel=on`,
-automatic thread selection (`threads=0`), and `run_crossover=on`; these
-settings are limited to the initial LP relaxation, not the master MIPs. The
-solver's dual status and omitted-column stationarity are checked before
-constructing the cut. Signed maximization multipliers are `-JuMP.dual(row)`;
-equality shadow prices must not be used because they discard the required
-sign. Only picks and prefix probability states are master columns. An additional
-product-hull-based interval bound constrains `theta`. Two cached
-greedy schedules seed analytic recourse cuts: one greedily selects the
-highest local survival-plus-curvature score each week, while the second forces
-the second-best feasible local-score candidate in week one (a deliberate change
-from mean-probability ranking). The analytic reverse-pass construction uses the existing
-projection of tail parameter gradients onto games to limit the number of
-gradient gates. No reference/Pareto selection or core construction is used.
+Root and child relaxations set `solver=hipo`, `threads=0`, `parallel=on`,
+`presolve=choose`, and `run_crossover=on`. HiGHS native output remains silent.
+The tree accepts a solver upper bound only when a fresh MOI result reports a
+feasible dual and the native HiGHS dual status agrees. For nonoptimal results,
+the current dual-infeasibility and stationarity diagnostics must also pass
+the configured tolerances. Optimal results with feasible dual status are
+trusted within HiGHS' tolerances even if crossover leaves some residual fields
+unavailable. A finite objective-bound value alone is not sufficient, and a
+primal objective is never treated as an upper bound. The accepted bound is
+not independently residual-corrected.
 
-At each schedule, forward recurrences supply the exact states. The reverse
-pass propagates recourse objective adjoints through the probability,
-parameter/projected-gradient, Hessian and product-hull recurrences, initialized
-with omitted survival terms and `0.5` on every Hessian objective state.
-All derivative recurrences propagate through the full correction horizon;
-only probability propagation stops at the master split, producing explicit
-prefix-probability coefficients alongside pick coefficients. Initial-state and gate RHS
-contributions produce the dual intercept. The cut is
-`theta <= intercept + pick_slopes'picks + probability_slopes'prefix_probabilities`.
-Its intercept comes from the dual RHS, never from subtracting slopes from
-an evaluated objective. The existing scale-dependent Benders objective
-tolerance checks dual tightness at the generating schedule; a failed
-certificate raises an explicit error. Seeds, main schedules and alternative
-schedules all use this same analytic cut construction.
-Their prefix objectives contain survival only. Master warm starts cover
-picks, `theta`, and prefix probabilities; scalar extensive-model warm starts
-remain unchanged. Alternative solve results, including the prefix survival
-objective, are captured before restoring
-forbidden-pick bounds or starts.
+If a recoverable root solve has no validated dual bound, every first-pick
+region inherits the formulation-based global interval upper bound. A child
+uses the tighter of a validated solver bound and its inherited bound; without
+a validated solver bound it keeps the inherited bound and branches over all
+eligible choices in an unfixed week. A feasible primal assignment is only
+branching guidance. A complete assignment can improve the incumbent after
+independent exact evaluation, but does not close an unfixed subtree. A fully
+path-fixed schedule is evaluated exactly and closes its singleton. Supported
+infeasibility certificates may prune infeasible paths; unexpected statuses
+and contradictions with known feasible schedules remain errors.
 
-For a gate adjoint `a`, the certificate uses the selected recurrence upper
-side if `a>0`, the lower side if `a<0`, and the corresponding unselected
-pick bounds; collapsed gates are affine pick terms. Reverse substitution
-cancels every omitted state column and leaves retained state slopes. All
-chosen rows are tight at the generating binary schedule, so RHS-derived
-intercept plus slopes equals exact recourse and certifies dual optimality.
-The unit suite checks global-cut stationarity, analytic cut tightness and
-validity exhaustively over feasible schedules, and intercept invariance
-under small objective perturbations. It
-covers `K=0`, full `K`, `H=0`, all relative split/horizon positions, both
-gradient representations and switch boundaries, and multiple loss states.
+The root and descendants share a deterministic feasible greedy incumbent.
+Node completions preserve fixed picks and only provide a lower bound for
+ranking/incumbent updates. Competing first-pick regions are prioritized, with
+incumbent-region work interleaved. The current first pick is proven when its
+feasible objective is at least the best competing-region upper bound within
+the scale-aware `1e-6` tolerance. The returned full schedule is feasible and
+its objective is independently evaluated, but future picks are not promised
+globally optimal after the first pick is certified. The timeout covers model
+construction, relaxations, and certification; on timeout the best feasible
+schedule is returned with an explicit unproven warning and pending bounds
+retained.
 
-At each iteration, the master is solved to optimality and its selected
-schedule is evaluated exactly. A zero recourse correction certifies that
-schedule as globally optimal. Otherwise its exact objective is a feasible
-lower bound; a second master solve forbids its first pick, and its bound is an
-upper bound for all alternatives. Comparing those bounds can certify the
-current-week pick without proving that the returned future schedule is
-globally optimal. If the bounds intersect, an analytic optimality cut is
-added and the loop continues. The mode therefore guarantees the optimal
-current-week pick, not necessarily the globally optimal complete schedule. If
-only one current-week candidate is eligible, the pick is forced and its
-feasible greedy witness is returned without constructing the master.
+The default HiPO tree performs no application-level retry with presolve off
+and does not build residual-corrected Lagrangian certificates. HiGHS' internal
+recovery and IPX crossover remain enabled. Crossover can add solve cost, and
+inherited-bound fallback can increase the number of processed nodes; neither
+fewer retries nor crossover alone implies an end-to-end speedup. The table's
+`XO` column reports the solver's simplex-iteration statistic as a crossover
+diagnostic; there is no application-selected simplex tree backend or basis
+transfer between nodes. Removing that application-level backend does not
+disable simplex work used internally by HiGHS during solver cleanup or
+crossover.
 
-`SurvivorSelectionConfig(timeout_seconds=...)` provides a shared solve budget
-for the full LP relaxation and Benders master MIPs. Model construction, deterministic recurrence
-evaluation and cut generation also count toward elapsed time; the remaining
-budget is reapplied before each solve. The best
-feasible full schedule is retained, so timeout returns it without claiming an
-optimality proof.
-Unexpected LP statuses or failed numerical certificates raise explicit
-errors. All survivor optimizations use HiGHS; callers cannot supply a
-custom optimizer. Debug logging reports LP-cut provenance, master sizes,
-the initial LP solver and barrier/crossover iterations, and a plain progress
-table with one row per master or forbidden-pick solve. The `cuts` column
-counts cuts present at solve time: the alternative row includes the
-main-schedule cut, and the next master row includes both new cuts when bounds
-overlap. The table shows each solve's status, selected and forbidden first
-picks, best feasible lower bound, master objective and upper bound, exact
-schedule objective, recourse correction, cut count, and solve time. Its header
-repeats every 20 rows. The table is written to stderr only when package Debug
-logging is enabled. Detailed initialization and final proof/timeout records
-remain available. Normal library calls stay silent.
-
-`write_survivor_pool_lp` always exports the initial extensive-form HiGHS model
-and exits without solving, regardless of `benders_weeks` or `branch_and_bound`.
-
-## Full-relaxation first-pick branch and bound
-
-`SurvivorSelectionConfig(branch_and_bound=true)` selects a separate external
-tree, mutually exclusive with Benders. `_build_survivor_full_model` exposes
-the same scalar formulation used by the extensive solve, LP export, and
-initial Benders relaxation; no derivative recurrence is duplicated.
-Probability states span the entire remaining horizon, while derivative
-states, gates, suffix references, and the gradient switch use
-`H=min(hessian_weeks, remaining_horizon)`. Path fixings do not change H.
-The existing constant-objective and forced-first-pick shortcuts remain.
-
-One continuous direct HiGHS model has stable rows and columns throughout the
-tree. By default both root and children use HiPO, automatic threads (`threads=0`),
-parallelism, automatic presolve (`presolve=choose`), and `run_crossover=on`.
-Crossover may improve the basic LP solution and residual-safe certificates,
-at additional solve cost. The tree does not snapshot or retain crossover bases
-for child warm starts: primal/dual solutions suffice for branching and
-certificates. The external LP clears the builder's primal starts
-before any solve. The shared LP factory's crossover settings for other
-backends remain unchanged. Standalone native-basis helpers remain available
-for diagnostics and their independent regression tests, and for the optional
-`simplex=true` path (CLI `--simplex`, requiring `--branch-and-bound`).
-That path crosses over the HiPO root with automatic presolve, snapshots its
-checked native basis,
-then uses `solver=simplex`, `simplex_strategy=1` (serial dual simplex) and
-automatic presolve (`presolve=choose`) for children. Simplex first restores the
-immediate parent's versioned hull formulation and exact variable intervals,
-then its basis; only afterward are child bounds and hull inequalities tightened.
-HiGHS decides whether to presolve. Internal presolve/postsolve does
-not change the original native model's row/column mappings; snapshots after
-optimal solves and restores check the original dimensions and mappings.
-Frontier nodes
-share parent snapshots, with checked owner, dimensions and native mappings;
-completed ancestors retain no snapshots. No sibling basis is borrowed.
-Rejected bases warn and use a crash basis. Numerical/error child statuses
-warn and retry dual simplex once with a cleared basis and the remaining
-deadline, retaining the same cutoff.
-
-Simplex uses `SurvivorHullPool`, seeded from the original four inequalities per
-gate. Each slot keeps its native row identity and GE/LE type. Disabled GE rows
-have RHS `-Inf`, disabled LE rows RHS `Inf`, through JuMP/MOI (never a native-only
-edit). Immutable descriptors reference shared original expression templates.
-Only inactive basic-slack slots of compatible direction may change coefficients;
-otherwise a new row is appended with a basic zero-cost slack. A dominated basic
-row may be freed and immediately reused for its stronger replacement. Nonbasic
-old rows remain active. Dominance accounts for selector fixings and does not
-assume every recomputed rounded endpoint narrows monotonically.
-
-Parent snapshots include all slot versions, including inactive nonbasic rows,
-and finite variable intervals, but no numerical matrix copies or permanent
-closed-subtree history. Siblings share snapshots; frontier release allows them
-to be collected. Restoration frees slots created after a snapshot and extends
-only registered pool rows as basic slacks, checking every original row identity
-and unchanged column mapping. Generic basis validation remains strict.
-After optimal certificate/assignment reads, basic dominated rows can be freed
-using the already verified basis witness: relaxing a basic zero-cost slack row
-preserves primal and dual feasibility. No stale MOI solution reads follow that
-cleanup. Free rows are skipped before multiplier/RHS arithmetic in certificates.
-
-The pool has no cap or rebuild policy. Debug `hull_pool` observer events and
-stderr records report total, active/inactive, added, reused, deactivated and peak
-slots; solved/final debug records include cleanup. Deadline checks cover row
-preparation as well as solves. Internal `hull_pool=false` permits controlled
-replacement benchmarks, not a public option. In exact arithmetic these edits
-preserve dual feasibility; numerical recovery remains explicit and no speedup
-is promised.
-
-In optional `simplex=true` mode, the root disables `objective_bound`. Each
-dual-simplex child refreshes it after queued
-completions update the incumbent: `-(LB + 1e-6 * max(1, abs(LB)))`, for the
-equivalent minimization objective. The resulting original-objective ceiling
-obeys the existing scale-aware pruning predicate even if inherited bounds
-have larger magnitude. HiGHS 1.15.1's unperturbed phase-two dual objective
-strictly crossing this threshold returns native `kObjectiveBound`.
-Only that native status together with MOI `OBJECTIVE_LIMIT` closes a cutoff
-node; objective-target, interruption and other limit statuses are not proofs.
-As requested, cutoff proofs trust HiGHS' numerical comparison, without an
-additional residual verification or re-solve. The closing cap is
-`min(inheritedUB, -objective_bound)`, never `-Inf`. No primal picks,
-objective value or optimal basis are read on this path. `node_cutoff` exposes
-the status, threshold, retained cap, iterations and elapsed time; debug table
-rows show `CUTOFF_PRUNED`, week `-`, and a `Simplex` rather than `IPM` count.
-Optimal root/child certificates retain their independent residual checks.
-HiGHS 1.15.1 can report `Unknown` after recovering incorrect maximization
-duals from a presolved HiPO solution. The tree solves
-the mathematically equivalent minimization of the negative objective,
-normalizing primal/dual objectives and the Lagrangian objective back to
-the original maximization convention. Some models still fail postsolve:
-numerical/error statuses with presolve `choose` or `on` trigger a logged HiPO-only retry
-with presolve off and the remaining budget, at most once per relaxation.
-Every new root or child, including simplex children, restores
-`presolve=choose` before solving,
-letting HiGHS decide whether to presolve; the fallback does
-not disable presolve globally. Restoration happens before the next node's
-`node_start` event, not after a retry, so the solved relaxation's results
-remain intact for certificate and branching reads. Only the numerical HiPO
-retry explicitly disables presolve; a simplex crash-basis retry keeps automatic
-presolve and the same cutoff. Default HiPO uses crossover for both root and
-child solves, but HiGHS 1.15.1's IPX crossover does not honor
-`objective_bound`; default HiPO children are pruned only after their LP
-certificates are computed.
-Time/iteration limits are not retried,
-and unexpected retry statuses still raise errors.
-
-The external-tree builder records each gate's bound key, dummy, selector,
-and four product-hull rows in `model.ext[:survivor_node_hulls]`. Even root
-singleton/zero intervals keep explicit dummy columns and all four rows, so
-later coefficient updates never alter native row/column mappings. Extensive
-MILP, Benders, and LP-export builders keep their original compression.
-`_survivor_tree_apply_path!` rebuilds candidate availability from root pick
-bounds and the entire path (including non-prefix fixings), then propagates
-singleton-week team exclusions to a fixed point. An empty week or conflicting
-forced picks is structurally infeasible.
-
-The shared `_survivor_scalar_bounds` and `_pass` accept an availability mask;
-candidate recurrences still exist for every original candidate, but state
-minima/maxima range only over available picks. Team-leave-out passes further
-condition selected-branch intervals. Each child intersects these intervals
-with root bounds, not the previous child's bounds, and updates probability,
-parameter-gradient, projected-gradient, and Hessian variable intervals plus
-selected/other-branch hull coefficients and RHSs on default HiPO, or basis-safe
-pooled inequalities on simplex. Probability sums and
-variance-adjusted sums are updated too. Unavailable selectors use all-history
-intervals because their selected branch is unreachable. The suffix masks,
-parameter/projection switch, curvature horizon, and mathematical recurrences
-remain unchanged.
-
-Conditioned recurrence arithmetic expands each week's endpoints outward by a
-scale-aware rounding envelope before propagation, accounting for signed
-cancellation, followed by `prevfloat`/`nextfloat`. Aggregate endpoints use
-directed BigFloat summation and outward Float64 conversion. Nonfinite or
-unordered intervals fail explicitly. These relaxations may include repeated
-unfixed teams, but contain every valid branch completion; singleton propagation
-only removes assignments forced to reuse a team. A completely fixed schedule
-collapses state intervals to its recurrence values up to rounding envelopes.
-`model.ext[:survivor_node_bounds]` exposes the most recently applied intervals.
-Internal `tighten_terms=false` restores root term bounds for controlled
-baseline comparisons; it is not a user-facing backend setting.
-
-The shared curvature-aware seed uses assignment-matching look-ahead
-to avoid a locally attractive pick blocking the entire future schedule.
-An integral root is evaluated exactly and checked against its LP objective.
-Otherwise the root partitions all eligible first picks, even if week one's
-LP assignment is integral. Within each region, the earliest materially
-fractional unfixed week branches into every eligible remaining candidate,
-including zero-valued LP candidates. Every path explicitly fixes other picks
-in that week to zero and excludes chosen teams elsewhere.
-
-Before selecting a queued node, the shared greedy builder completes each new
-unpruned path,
-reserving teams for fixed future weeks as well as the prefix. Matching and
-completion honor the shared deadline. Complete schedules are
-validated/forward-evaluated exactly before updating the single global
-incumbent (objective ties prefer the smaller first-pick index). There is no
-unbounded schedule/plan cache or per-region witness history. Each queued node
-retains only its scalar completion lower bound and a ranking-ready flag;
-`-Inf` denotes no feasible completion. Selection never reruns an already
-attempted heuristic, including unsuccessful attempts. Completion plans are
-transient except for the global incumbent; ancestor summaries retain no plans. A
-heuristic interrupted by the deadline retains the node's inherited upper bound.
-A completion is only a feasible lower bound; it never changes an
-inherited or LP upper certificate.
-
-Nodes carry inherited upper bounds, a scalar completion score, and a completion-ready flag. The scheduler
-prioritizes competing regions by their largest upper bound, then their best
-node; every fourth selection permits incumbent-region improvement. Stable
-exact greedy-completion objective (a subtree lower bound), depth, and node
-order break ties. A node without a feasible completion ranks below completed
-nodes with the same upper bounds; it is not pruned on that basis. Each live node has a
-separate basis-free ancestor summary: its capped upper bound, live child bounds,
-and maximum closed-child bound. Propagation uses
-`parentUB=min(ownLPUB,max(closedChildUB,liveChildUBs))`. Unsolved and interrupted
-children retain inherited caps; infeasible children close with `-Inf`;
-bound-pruned children retain their certified caps. Integral leaves close with
-their exact forward objective plus an outward numerical margin. Once every
-child closes, its parent closes recursively and its record is deleted.
-Persistent region-root scalar bounds remain valid even when the global
-incumbent changes regions. No ancestor record contains a path or basis;
-default HiPO frontier nodes also contain no basis. Structural infeasibility and supported solver
-infeasibility remove only their own subtree; a solver infeasibility
-contradicting the incumbent or current feasible completion is an error.
-When HiPO supplies no infeasibility ray, a completed unsuccessful default-rank
-completion provides an independent structural certificate: its exact
-week/team matching look-ahead found no complete schedule for the path.
-
-LP primal values alone are never bounds. Optimal status, primal/dual
-feasibility statuses and native maximum infeasibilities are checked.
-Native primal infeasibility must remain at most `1e-7`. A finite nonnegative
-dual infeasibility above `1e-7` is logged after constructing a valid corrected
-certificate rather than causing an abort: its stationarity error is already
-accounted for by the finite-interval Lagrangian maximization. Invalid diagnostic
-values or failed native queries still cause errors. Primal/dual
-objective disagreement is logged, not used to reject an otherwise valid
-residual-corrected upper certificate; barrier complementarity gaps can exceed
-the objective-agreement threshold without invalidating that certificate.
-A separate Lagrangian upper certificate clamps row multipliers to
-valid inequality signs and maximizes every residual column coefficient over
-its finite current interval, using 128-bit BigFloat accumulation. Thus
-stationarity residuals cannot silently turn the dual objective into an
-unsafe upper bound. A `1e-8 * max(1, abs(bound), abs(primal))` outward margin
-and `nextfloat` account for floating-point arithmetic; this is numerical,
-not exact-rational certification. Child bounds are intersected with their
-inherited bounds.
-Row multipliers are read directly from the native solution and corrected for
-objective sense: HiGHS.jl 1.25.3 otherwise filters inequality duals using
-basis statuses even when crossover is disabled and no valid basis exists.
-
-A first-pick witness is certified when its exact lower bound reaches every
-competing region upper bound within
-`1e-6 * max(1, abs(lower), abs(competing_upper))`. This does not require
-exhausting its own region and does not assert uniqueness or optimality of
-the complete schedule. The shared timeout starts before scalar model
-construction and is reapplied before each solve; interrupted children keep
-their inherited bounds. Timeout returns a feasible witness with an explicit
-unproven warning. Unexpected statuses or inconsistent
-certificates raise errors rather than falling back to another backend.
-The `node_start` observer event follows path tightening and precedes the
-deadline check and solve. Debug-only stderr diagnostics report root and child HiPO IPM iterations,
-crossover-on settings, queue growth, and final proof/timeout accounting.
-In optional simplex mode, Debug logging additionally enables native HiGHS
-relaxation output with `log_dev_level=1`, routed through the existing native
-stderr log-file convention rather than console stdout. Root, child, and retry
-headings identify the solve; child headings include node, region, depth, and
-the normalized objective cutoff. Ordinary simplex runs and default HiPO tree
-runs retain silent native output. The aligned summary table remains separate
-from native solver messages.
+When Debug logging is enabled, B&B diagnostics are rendered as a live,
+aligned stderr table rather than separate debug messages. Root and final rows
+use the same renderer as node actions. Columns include first-pick region,
+depth, branch week, queue size, incumbent lower bound, competing/node upper
+bounds, action, bound source, diagnostic reason, IPM and crossover iterations,
+and elapsed time. Fallbacks, rejected bounds/guidance, exact closure, pruning,
+timeouts, and proof status appear in these rows. Important warnings remain
+immediate when the table is disabled; stdout remains reserved for the selected
+team abbreviation. Observer events remain available to tests and internal
+callers.
 
 ## Cache maintenance
 

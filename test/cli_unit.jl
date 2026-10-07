@@ -56,7 +56,6 @@ end
         market_guard_weeks=0,
         through_week=2,
         hessian_weeks=2,
-        benders_weeks=1,
     )
     mktempdir() do directory
         path = joinpath(directory, "survivor_2023.lp")
@@ -98,11 +97,21 @@ end
         @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
             ["--season=2023", "--branch-and-bound", "--branch-and-bound"],
         )
-        for args in (
-            ["--branch-and-bound", "--benders-weeks=0"],
-            ["--benders-weeks", "2", "--branch-and-bound"],
+        for flags in (
+            ["--simplex"],
+            ["--simplex", "--branch-and-bound"],
+            ["--branch-and-bound", "--simplex"],
+            ["--simplex=on"],
+            ["--branch-and-bound", "--simplex=on"],
+            ["--benders-weeks", "2"],
+            ["--benders-weeks=2"],
+            ["--branch-and-bound", "--benders-weeks", "2"],
+            ["--branch-and-bound", "--benders-weeks=2"],
+            ["--benders-weeks=2", "--branch-and-bound"],
         )
-            @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(["--season=2023"; args])
+            @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
+                ["--season=2023"; flags],
+            )
         end
         @test SurvivorModel._parse_survivor_cli_args(
             ["--season", "2023"],
@@ -113,21 +122,10 @@ end
             banned_first_pick_teams=String[],
             write_model_file=nothing,
             hessian_weeks=3,
-            benders_weeks=nothing,
             branch_and_bound=false,
-            simplex=false,
             timeout_seconds=nothing,
             refresh_data=false,
         )
-        @test SurvivorModel._parse_survivor_cli_args(
-            ["--season=2023", "--benders-weeks", "5"],
-        ).benders_weeks == 5
-        @test SurvivorModel._parse_survivor_cli_args(
-            ["--season=2023", "--benders-weeks=5"],
-        ).benders_weeks == 5
-        @test SurvivorModel._parse_survivor_cli_args(
-            ["--season=2023", "--benders-weeks=0"],
-        ).benders_weeks == 0
         @test SurvivorModel._parse_survivor_cli_args(
             ["--season=2023", "--strikes=4"],
         ).initial_strikes == 4
@@ -160,21 +158,7 @@ end
         ) == ["KC", "SF"]
         @test SurvivorModel._parse_survivor_cli_args(["--help"]).show_help
         usage = SurvivorModel._survivor_cli_usage()
-        @test occursin("--simplex", usage)
-        for flags in (
-            ["--simplex", "--branch-and-bound"],
-            ["--branch-and-bound", "--simplex"],
-        )
-            @test SurvivorModel._parse_survivor_cli_args(["--season=2023"; flags]).simplex
-        end
-        for flags in (
-            ["--simplex"],
-            ["--branch-and-bound", "--simplex", "--simplex"],
-            ["--simplex", "--benders-weeks=0"],
-            ["--simplex", "--branch-and-bound", "--benders-weeks=0"],
-        )
-            @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(["--season=2023"; flags])
-        end
+        @test !occursin("--simplex", usage)
         @test !occursin("--benchmark", usage)
         @test !occursin("--clear-cache", usage)
         @test occursin("exact-milp", usage)
@@ -182,8 +166,7 @@ end
         @test !occursin("--timings", usage)
         @test occursin("--timeout", usage)
         @test occursin("--ban", usage)
-        @test occursin("--benders-weeks", usage)
-        @test !occursin("--benders ", usage)
+        @test !occursin("--benders", usage)
         @test occursin("--write-model", usage)
         @test occursin("--hessian-weeks", usage)
         @test !occursin("--objective", usage)
@@ -210,22 +193,10 @@ end
             ["--season", "2023", "--timeout", "2", "--timeout", "3"],
         )
         @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
-            ["--season", "2023", "--benders"],
+            ["--season", "2023", "--simplex"],
         )
         @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
             ["--season", "2023", "--benders-weeks"],
-        )
-        @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
-            ["--season", "2023", "--benders-weeks", "-1"],
-        )
-        @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
-            [
-                "--season",
-                "2023",
-                "--benders-weeks",
-                "2",
-                "--benders-weeks=3",
-            ],
         )
         @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
             ["--season", "2023", "--ban"],
@@ -454,11 +425,11 @@ end
 
     @testset "fixture-backed current pick" begin
         schedule, historical, current = _survivor_context_fixture()
-        for H in (0, 1, 2, 18), simplex in (false, true)
+        for H in (0, 1, 2, 18), branch_and_bound in (false, true)
             mktempdir() do cache_directory
                 output = IOBuffer()
-                args = ["--season=2023", "--branch-and-bound", "--hessian-weeks=$H"]
-                simplex && push!(args, "--simplex")
+                args = ["--season=2023", "--hessian-weeks=$H"]
+                branch_and_bound && push!(args, "--branch-and-bound")
                 @test SurvivorModel._parse_survivor_cli_args(args).hessian_weeks == H
                 @test SurvivorModel._run_survivor_cli(
                     args;
@@ -477,37 +448,6 @@ end
                 @test isempty(String(take!(output)))
                 @test isfile(path) && filesize(path) > 0
             end
-        end
-        mktempdir() do cache_directory
-            output = IOBuffer()
-            log_output = IOBuffer()
-            exit_code = SurvivorModel.Logging.with_logger(
-                SurvivorModel.Logging.SimpleLogger(
-                    log_output,
-                    SurvivorModel.Logging.Debug,
-                ),
-            ) do
-                SurvivorModel._run_survivor_cli(
-                    ["--season", "2023", "--benders-weeks", "1"];
-                    input=IOBuffer("A\n"),
-                    output=output,
-                    schedule=schedule,
-                    historical_drives=historical,
-                    current_drives=current,
-                    cache_directory=cache_directory,
-                    through_week=2,
-                )
-            end
-            @test exit_code == 0
-            selected_team = strip(String(take!(output)))
-            @test selected_team in ("C", "D")
-            log_text = String(take!(log_output))
-            @test occursin("survivor pick selected", log_text)
-            @test occursin("team = $selected_team", log_text)
-            @test occursin("survivor phase complete", log_text)
-            @test occursin("optimize_start", log_text)
-            @test occursin("optimize", log_text)
-            @test occursin("survivor Benders first pick forced", log_text)
         end
 
         mktempdir() do cache_directory
@@ -535,8 +475,6 @@ end
                     "2023",
                     "--hessian-weeks",
                     "2",
-                    "--benders-weeks",
-                    "1",
                     "--write-model",
                     model_path,
                 ];

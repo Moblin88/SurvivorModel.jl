@@ -164,12 +164,28 @@ callers.
 ## Cache maintenance
 
 Historical prior caches are fingerprinted and refresh automatically when
-their inputs change. Manual cache clearing is reserved for maintenance and
-tests:
+their inputs change. The helper's default clears the package-owned Scratch.jl
+cache; a `cache_directory` override removes only `historical_prior_*.jls`
+files in that directory and leaves unrelated or summarized-drive cache files
+untouched:
 
 ```julia
 SurvivorModel.clear_historical_prior_cache!()
+SurvivorModel.clear_historical_prior_cache!(; cache_directory="/path/to/cache")
 ```
 
-For a normal weekly run, use the CLI's `--refresh-data` option instead of
-clearing caches manually.
+Use the CLI's `--refresh-priors` to clear fitted prior caches, either alone or
+before a season-based run. Standalone `--refresh-data` clears NFLData's raw
+cache and all summarized historical-drive caches, then exits without
+rebuilding them; with `--season`, it refreshes data and continues the run.
+`--refresh-data` leaves prior fits intact, and `--refresh-priors` leaves data
+caches intact. Combine them to clear both cache groups.
+
+`fit_empirical_bayes_prior` emits Debug-level structured diagnostics only after
+both cause fits and their reset mixtures are complete.
+`_cached_historical_prior` uses the same diagnostic logger for cache hits, with
+`source=:cache` and the cache path; misses are logged once by the fitter. Each
+acquisition produces a summary and one record per cause, including fitted
+parameters and the selected optimizer result. Iteration and function-evaluation
+counts belong to the selected converged initialization, not the aggregate cost
+of all starts.

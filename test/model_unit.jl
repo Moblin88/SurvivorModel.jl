@@ -6,6 +6,52 @@ using Random
 using Test
 import SurvivorModel: ScoreMarks, fit_score_marks, hazard_theta
 
+mutable struct PriorDiagnosticTestLogger <: SurvivorModel.Logging.AbstractLogger
+    minimum_level::SurvivorModel.Logging.LogLevel
+    records::Vector{NamedTuple}
+end
+
+PriorDiagnosticTestLogger(
+    minimum_level::SurvivorModel.Logging.LogLevel=SurvivorModel.Logging.Debug,
+) = PriorDiagnosticTestLogger(minimum_level, NamedTuple[])
+
+SurvivorModel.Logging.min_enabled_level(logger::PriorDiagnosticTestLogger) =
+    logger.minimum_level
+
+function SurvivorModel.Logging.shouldlog(
+    logger::PriorDiagnosticTestLogger,
+    level,
+    _module,
+    group,
+    id,
+)
+    return level >= logger.minimum_level
+end
+
+SurvivorModel.Logging.catch_exceptions(::PriorDiagnosticTestLogger) = false
+
+function SurvivorModel.Logging.handle_message(
+    logger::PriorDiagnosticTestLogger,
+    level,
+    message,
+    _module,
+    group,
+    id,
+    file,
+    line;
+    kwargs...,
+)
+    push!(
+        logger.records,
+        (
+            level=level,
+            message=message,
+            metadata=(; kwargs...),
+        ),
+    )
+    return nothing
+end
+
 function _make_drives()
     n = 5
     return DataFrame(
@@ -235,11 +281,30 @@ end
 
     @testset "empirical-Bayes Weibull shapes and reset mixtures" begin
         historical = _synthetic_weibull_drives()
-        prior = fit_empirical_bayes_prior(
-            historical;
-            max_seasons=4,
-            current_season=2025,
-        )
+        fit_logger = PriorDiagnosticTestLogger()
+        fit_result, cached_result, cache_logger = mktempdir() do cache_directory
+            fresh_result = SurvivorModel.Logging.with_logger(fit_logger) do
+                SurvivorModel._cached_historical_prior(
+                    historical;
+                    current_season=2025,
+                    max_seasons=4,
+                    cache_directory=cache_directory,
+                )
+            end
+            hit_logger = PriorDiagnosticTestLogger()
+            hit_result = SurvivorModel.Logging.with_logger(hit_logger) do
+                SurvivorModel._cached_historical_prior(
+                    historical;
+                    current_season=2025,
+                    max_seasons=4,
+                    cache_directory=cache_directory,
+                )
+            end
+            return fresh_result, hit_result, hit_logger
+        end
+        prior = fit_result.prior
+        @test !fit_result.cache_hit
+        @test cached_result.cache_hit
         @test prior.historical_seasons == collect(2021:2024)
         @test 1.5 < weibull_shape(prior, :td) < 2.7
         @test 0.9 < weibull_shape(prior, :defensive) < 1.9
@@ -264,10 +329,202 @@ end
         @test prior.td_team_mixtures["A"].source_seasons ==
             [2021, 2022, 2023, 2024, 2025]
 
-        @test_throws ArgumentError fit_empirical_bayes_prior(
-            historical;
-            max_seasons=0,
+        @test length(fit_logger.records) == 3
+        summary = only(filter(
+            record -> record.message ==
+                "historical empirical-Bayes prior summary",
+            fit_logger.records,
+        ))
+        @test summary.level == SurvivorModel.Logging.Debug
+        @test summary.metadata.source == :fit
+        @test summary.metadata.cache_path === nothing
+        @test summary.metadata.historical_seasons == prior.historical_seasons
+        @test summary.metadata.team_counts == (
+            touchdown=length(prior.td_team_mixtures),
+            defensive=length(prior.defensive_team_mixtures),
         )
+        @test summary.metadata.duration_unit == :minutes
+        @test length(cache_logger.records) == 3
+        cache_summary = only(filter(
+            record -> record.message ==
+                "historical empirical-Bayes prior summary",
+            cache_logger.records,
+        ))
+        @test cache_summary.metadata.source == :cache
+        @test cache_summary.metadata.cache_path == cached_result.path
+        for (cause, hyperparameter) in (
+            (:td, prior.td_hyperparameters),
+            (:defensive, prior.defensive_hyperparameters),
+        )
+            record = only(filter(
+                record ->
+                    record.message ==
+                        "historical empirical-Bayes prior cause diagnostics" &&
+                    record.metadata.cause === cause,
+                fit_logger.records,
+            ))
+            diagnostics = likelihood_fit_diagnostics(prior, cause)
+            @test record.metadata.source == :fit
+            @test record.metadata.diagnostics_source == :fresh_fit
+            @test record.metadata.weibull_shape == weibull_shape(prior, cause)
+            @test record.metadata.gamma_shape == hyperparameter.shape
+            @test record.metadata.gamma_rate == hyperparameter.rate
+            @test record.metadata.gamma_mean_cumulative_hazard ≈
+                hyperparameter.shape / hyperparameter.rate
+            @test record.metadata.home_multiplier == home_multiplier(prior, cause)
+            @test record.metadata.persistence_probability ==
+                hazard_persistence(prior, cause)
+            @test record.metadata.reset_probability ≈
+                1.0 - hazard_persistence(prior, cause)
+            @test record.metadata.diagnostics_available
+            @test record.metadata.log_likelihood == diagnostics.log_likelihood
+            @test record.metadata.converged == diagnostics.converged
+            @test record.metadata.status == diagnostics.status
+            @test record.metadata.iterations == diagnostics.iterations
+            @test record.metadata.function_evaluations ==
+                diagnostics.function_evaluations
+            @test record.metadata.boundary_parameters ==
+                diagnostics.boundary_parameters
+            cache_record = only(filter(
+                record ->
+                    record.message ==
+                        "historical empirical-Bayes prior cause diagnostics" &&
+                    record.metadata.cause === cause,
+                cache_logger.records,
+            ))
+            @test cache_record.metadata.source == :cache
+            @test cache_record.metadata.diagnostics_source == :stored
+            @test cache_record.metadata.cache_path == cached_result.path
+            @test cache_record.metadata.weibull_shape ==
+                record.metadata.weibull_shape
+            @test cache_record.metadata.gamma_shape == record.metadata.gamma_shape
+            @test cache_record.metadata.gamma_rate == record.metadata.gamma_rate
+            @test cache_record.metadata.gamma_mean_cumulative_hazard ==
+                record.metadata.gamma_mean_cumulative_hazard
+            @test cache_record.metadata.home_multiplier ==
+                record.metadata.home_multiplier
+            @test cache_record.metadata.persistence_probability ==
+                record.metadata.persistence_probability
+            @test cache_record.metadata.reset_probability ==
+                record.metadata.reset_probability
+            @test cache_record.metadata.log_likelihood ==
+                record.metadata.log_likelihood
+            @test cache_record.metadata.iterations == record.metadata.iterations
+            @test cache_record.metadata.function_evaluations ==
+                record.metadata.function_evaluations
+            @test cache_record.metadata.boundary_parameters ==
+                record.metadata.boundary_parameters
+        end
+
+        missing_diagnostics_logger = PriorDiagnosticTestLogger()
+        SurvivorModel.Logging.with_logger(missing_diagnostics_logger) do
+            SurvivorModel._log_historical_prior_diagnostics(
+                _test_prior();
+                source=:cache,
+                cache_path="cached-without-diagnostics.jls",
+            )
+        end
+        @test length(missing_diagnostics_logger.records) == 3
+        for record in filter(
+            record -> record.message ==
+                "historical empirical-Bayes prior cause diagnostics",
+            missing_diagnostics_logger.records,
+        )
+            @test !record.metadata.diagnostics_available
+            @test record.metadata.log_likelihood === nothing
+            @test record.metadata.converged === nothing
+            @test record.metadata.status === nothing
+            @test record.metadata.iterations === nothing
+            @test record.metadata.function_evaluations === nothing
+            @test record.metadata.boundary_parameters === nothing
+        end
+
+        known_diagnostics = LikelihoodFitDiagnostics(
+            -42.5,
+            true,
+            7,
+            31,
+            :converged,
+            [:weibull_shape_upper],
+        )
+        known_prior = HazardPrior(
+            2.0,
+            1.5,
+            GammaParams(2.0, 4.0),
+            GammaParams(3.0, 6.0),
+            Dict{String,GammaMixture}(),
+            Dict{String,GammaMixture}(),
+            1.25,
+            1.5,
+            0.4,
+            0.8,
+            [2022, 2023],
+            known_diagnostics,
+            known_diagnostics,
+        )
+        known_diagnostics_logger = PriorDiagnosticTestLogger()
+        SurvivorModel.Logging.with_logger(known_diagnostics_logger) do
+            SurvivorModel._log_historical_prior_diagnostics(
+                known_prior;
+                source=:fit,
+            )
+        end
+        for (cause, hyperparameter) in (
+            (:td, known_prior.td_hyperparameters),
+            (:defensive, known_prior.defensive_hyperparameters),
+        )
+            record = only(filter(
+                record ->
+                    record.message ==
+                        "historical empirical-Bayes prior cause diagnostics" &&
+                    record.metadata.cause === cause,
+                known_diagnostics_logger.records,
+            ))
+            @test record.metadata.gamma_shape == hyperparameter.shape
+            @test record.metadata.gamma_rate == hyperparameter.rate
+            @test record.metadata.log_likelihood == -42.5
+            @test record.metadata.iterations == 7
+            @test record.metadata.function_evaluations == 31
+            @test record.metadata.boundary_parameters ==
+                [:weibull_shape_upper]
+        end
+
+        quiet_logger = PriorDiagnosticTestLogger(SurvivorModel.Logging.Info)
+        SurvivorModel.Logging.with_logger(quiet_logger) do
+            SurvivorModel._log_historical_prior_diagnostics(
+                prior;
+                source=:fit,
+            )
+        end
+        @test isempty(quiet_logger.records)
+
+        failure_logger = PriorDiagnosticTestLogger()
+        @test_throws ArgumentError SurvivorModel.Logging.with_logger(
+            failure_logger,
+        ) do
+            fit_empirical_bayes_prior(
+                historical;
+                max_seasons=0,
+            )
+        end
+        @test isempty(failure_logger.records)
+
+        no_defensive_events = copy(historical)
+        no_defensive_events.drive_result[
+            no_defensive_events.drive_result .== "Interception"
+        ] .= "End of half"
+        partial_fit_failure_logger = PriorDiagnosticTestLogger()
+        @test_throws ArgumentError SurvivorModel.Logging.with_logger(
+            partial_fit_failure_logger,
+        ) do
+            fit_empirical_bayes_prior(
+                no_defensive_events;
+                max_seasons=4,
+                current_season=2025,
+            )
+        end
+        @test isempty(partial_fit_failure_logger.records)
+
         @test_throws ArgumentError fit_empirical_bayes_prior(
             historical;
             current_season=2024,

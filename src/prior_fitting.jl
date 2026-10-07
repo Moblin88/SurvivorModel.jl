@@ -403,6 +403,59 @@ function _build_reset_team_mixtures(
     return mixtures
 end
 
+function _log_historical_prior_diagnostics(
+    prior::HazardPrior;
+    source::Symbol,
+    cache_path::Union{Nothing,AbstractString}=nothing,
+)
+    @debug(
+        "historical empirical-Bayes prior summary",
+        source=source,
+        cache_path=cache_path,
+        historical_seasons=copy(prior.historical_seasons),
+        team_counts=(
+            touchdown=length(prior.td_team_mixtures),
+            defensive=length(prior.defensive_team_mixtures),
+        ),
+        duration_unit=:minutes,
+    )
+
+    for cause in (:td, :defensive)
+        hyperparameter = cause === :td ?
+            prior.td_hyperparameters :
+            prior.defensive_hyperparameters
+        diagnostics = likelihood_fit_diagnostics(prior, cause)
+        persistence_probability = hazard_persistence(prior, cause)
+        @debug(
+            "historical empirical-Bayes prior cause diagnostics",
+            cause=cause,
+            source=source,
+            diagnostics_source=source === :cache ? :stored : :fresh_fit,
+            cache_path=cache_path,
+            weibull_shape=weibull_shape(prior, cause),
+            gamma_shape=hyperparameter.shape,
+            gamma_rate=hyperparameter.rate,
+            gamma_mean_cumulative_hazard=hyperparameter.shape / hyperparameter.rate,
+            home_multiplier=home_multiplier(prior, cause),
+            persistence_probability=persistence_probability,
+            reset_probability=1.0 - persistence_probability,
+            diagnostics_available=diagnostics !== nothing,
+            log_likelihood=diagnostics === nothing ?
+                nothing : diagnostics.log_likelihood,
+            converged=diagnostics === nothing ?
+                nothing : diagnostics.converged,
+            status=diagnostics === nothing ? nothing : diagnostics.status,
+            iterations=diagnostics === nothing ?
+                nothing : diagnostics.iterations,
+            function_evaluations=diagnostics === nothing ?
+                nothing : diagnostics.function_evaluations,
+            boundary_parameters=diagnostics === nothing ?
+                nothing : copy(diagnostics.boundary_parameters),
+        )
+    end
+    return nothing
+end
+
 """
     fit_empirical_bayes_prior(historical_drives; kwargs...) -> HazardPrior
 
@@ -459,7 +512,7 @@ function fit_empirical_bayes_prior(
         defensive_fit.persistence,
         defensive_fit.shape,
     )
-    return HazardPrior(
+    prior = HazardPrior(
         td_fit.shape,
         defensive_fit.shape,
         td_fit.hyperparameter,
@@ -474,4 +527,6 @@ function fit_empirical_bayes_prior(
         td_fit.diagnostics,
         defensive_fit.diagnostics,
     )
+    _log_historical_prior_diagnostics(prior; source=:fit)
+    return prior
 end

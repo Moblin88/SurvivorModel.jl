@@ -125,6 +125,7 @@ end
             branch_and_bound=false,
             timeout_seconds=nothing,
             refresh_data=false,
+            refresh_priors=false,
         )
         @test SurvivorModel._parse_survivor_cli_args(
             ["--season=2023", "--strikes=4"],
@@ -169,14 +170,65 @@ end
         @test !occursin("--benders", usage)
         @test occursin("--write-model", usage)
         @test occursin("--hessian-weeks", usage)
+        @test occursin("--refresh-priors", usage)
         @test !occursin("--objective", usage)
         @test !occursin("--prove-first-pick", usage)
         @test SurvivorModel._parse_survivor_cli_args(
+            ["--refresh-data"],
+        ) == (
+            show_help=false,
+            season=nothing,
+            initial_strikes=2,
+            banned_first_pick_teams=String[],
+            write_model_file=nothing,
+            hessian_weeks=3,
+            branch_and_bound=false,
+            timeout_seconds=nothing,
+            refresh_data=true,
+            refresh_priors=false,
+        )
+        @test SurvivorModel._parse_survivor_cli_args(
+            ["--refresh-priors"],
+        ).refresh_priors
+        @test SurvivorModel._parse_survivor_cli_args(
+            ["--refresh-data", "--refresh-priors"],
+        ).refresh_priors
+        @test SurvivorModel._parse_survivor_cli_args(
+            ["--refresh-data", "--"],
+        ).season === nothing
+        @test SurvivorModel._parse_survivor_cli_args(
             ["--season", "2023", "--refresh-data"],
         ).refresh_data
+        @test SurvivorModel._parse_survivor_cli_args(
+            ["--season", "2023", "--refresh-priors"],
+        ).refresh_priors
         @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
             ["--refresh-data", "--refresh-data"],
         )
+        @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
+            ["--refresh-priors", "--refresh-priors"],
+        )
+        @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
+            ["--refresh-priors=true"],
+        )
+        @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
+            ["--refresh-priors", "true"],
+        )
+        @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
+            String[],
+        )
+        for run_options in (
+            ["--ban=KC"],
+            ["--branch-and-bound"],
+            ["--write-model", "survivor.lp"],
+            ["--strikes", "2"],
+            ["--hessian-weeks", "3"],
+            ["--timeout", "1"],
+        )
+            @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
+                ["--refresh-priors"; run_options],
+            )
+        end
         @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
             ["--season", "2023", "--timings"],
         )
@@ -393,6 +445,60 @@ end
         end
     end
 
+    @testset "historical prior cache clearing" begin
+        mktempdir() do cache_directory
+            current_cache = SurvivorModel._historical_prior_cache_path(
+                cache_directory,
+                2023,
+                12,
+                "current-fingerprint",
+            )
+            old_schema_cache = joinpath(
+                cache_directory,
+                "historical_prior_v3_season2022_window8_dataold-fingerprint.jls",
+            )
+            drive_cache = joinpath(
+                cache_directory,
+                "drive_summaries_v1_season2022.jls",
+            )
+            unrelated_file = joinpath(cache_directory, "keep.txt")
+            cache_named_directory = joinpath(
+                cache_directory,
+                "historical_prior_v2_directory.jls",
+            )
+            for path in (
+                current_cache,
+                old_schema_cache,
+                drive_cache,
+                unrelated_file,
+            )
+                write(path, "cached")
+            end
+            mkpath(cache_named_directory)
+            nested_file = joinpath(cache_named_directory, "nested.jls")
+            write(nested_file, "cached")
+
+            @test SurvivorModel.clear_historical_prior_cache!(
+                ; cache_directory=cache_directory,
+            ) === nothing
+            @test !isfile(current_cache)
+            @test !isfile(old_schema_cache)
+            @test isfile(drive_cache)
+            @test isfile(unrelated_file)
+            @test isdir(cache_named_directory)
+            @test isfile(nested_file)
+            @test SurvivorModel.clear_historical_prior_cache!(
+                ; cache_directory=cache_directory,
+            ) === nothing
+
+            missing_directory = joinpath(cache_directory, "missing")
+            @test SurvivorModel.clear_historical_prior_cache!(
+                ; cache_directory=missing_directory,
+            ) === nothing
+            @test !ispath(missing_directory)
+        end
+    end
+
     @testset "historical drive summary cache integration" begin
         _, historical, _ = _survivor_context_fixture()
         summarized = DataFrame(historical, copycols=true)
@@ -420,6 +526,152 @@ end
             )
             @test calls[] == 1
             @test first == second
+        end
+    end
+
+    @testset "standalone cache refresh" begin
+        seed_cache_files = function (cache_directory)
+            paths = (
+                prior=joinpath(
+                    cache_directory,
+                    "historical_prior_v4_season2023_window12_datafingerprint.jls",
+                ),
+                old_prior=joinpath(
+                    cache_directory,
+                    "historical_prior_v3_season2022_window8_dataother-fingerprint.jls",
+                ),
+                drive_2022=joinpath(
+                    cache_directory,
+                    "drive_summaries_v1_season2022.jls",
+                ),
+                drive_2023=joinpath(
+                    cache_directory,
+                    "drive_summaries_v2_season2023.jls",
+                ),
+                unrelated=joinpath(cache_directory, "keep.txt"),
+            )
+            for path in paths
+                write(path, "cached")
+            end
+            return paths
+        end
+        never_load_schedule = () -> error("standalone refresh loaded a schedule")
+
+        mktempdir() do cache_directory
+            files = seed_cache_files(cache_directory)
+            input = IOBuffer("A\n")
+            output = IOBuffer()
+            raw_cache_clears = Ref(0)
+            @test SurvivorModel._run_survivor_cli(
+                ["--refresh-priors"];
+                input,
+                output,
+                cache_directory,
+                schedule_loader=never_load_schedule,
+                clear_data_cache=() -> (raw_cache_clears[] += 1),
+            ) == 0
+            @test position(input) == 0
+            @test isempty(String(take!(output)))
+            @test raw_cache_clears[] == 0
+            @test !isfile(files.prior)
+            @test !isfile(files.old_prior)
+            @test isfile(files.drive_2022)
+            @test isfile(files.drive_2023)
+            @test isfile(files.unrelated)
+
+            files = seed_cache_files(cache_directory)
+            input = IOBuffer("A\n")
+            output = IOBuffer()
+            @test SurvivorModel._run_survivor_cli(
+                ["--help", "--refresh-priors", "--refresh-data"];
+                input,
+                output,
+                cache_directory,
+                schedule_loader=never_load_schedule,
+                clear_data_cache=() -> error("help cleared the raw cache"),
+            ) == 0
+            @test position(input) == 0
+            @test occursin("--refresh-priors", String(take!(output)))
+            @test isfile(files.prior)
+            @test isfile(files.drive_2022)
+
+            raw_cache_clears = Ref(0)
+            withenv("SURVIVORMODEL_REFRESH_DATA" => "true") do
+                @test_throws ArgumentError SurvivorModel._run_survivor_cli(
+                    String[];
+                    cache_directory,
+                    schedule_loader=never_load_schedule,
+                    clear_data_cache=() -> (raw_cache_clears[] += 1),
+                )
+            end
+            @test raw_cache_clears[] == 0
+            @test isfile(files.prior)
+            @test isfile(files.drive_2022)
+
+            @test_throws ArgumentError SurvivorModel._run_survivor_cli(
+                ["--refresh-data", "--strikes", "2"];
+                cache_directory,
+                schedule_loader=never_load_schedule,
+                clear_data_cache=() -> error("invalid arguments cleared the raw cache"),
+            )
+            @test isfile(files.prior)
+            @test isfile(files.drive_2022)
+        end
+
+        mktempdir() do cache_directory
+            files = seed_cache_files(cache_directory)
+            input = IOBuffer("A\n")
+            output = IOBuffer()
+            raw_cache_clears = Ref(0)
+            @test SurvivorModel._run_survivor_cli(
+                ["--refresh-data"];
+                input,
+                output,
+                cache_directory,
+                schedule_loader=never_load_schedule,
+                clear_data_cache=() -> (raw_cache_clears[] += 1),
+            ) == 0
+            @test position(input) == 0
+            @test isempty(String(take!(output)))
+            @test raw_cache_clears[] == 1
+            @test isfile(files.prior)
+            @test isfile(files.old_prior)
+            @test !isfile(files.drive_2022)
+            @test !isfile(files.drive_2023)
+            @test isfile(files.unrelated)
+
+            @test SurvivorModel._run_survivor_cli(
+                ["--refresh-data"];
+                input,
+                output,
+                cache_directory,
+                schedule_loader=never_load_schedule,
+                clear_data_cache=() -> (raw_cache_clears[] += 1),
+            ) == 0
+            @test raw_cache_clears[] == 2
+        end
+
+        mktempdir() do cache_directory
+            files = seed_cache_files(cache_directory)
+            input = IOBuffer("A\n")
+            output = IOBuffer()
+            raw_cache_clears = Ref(0)
+            @test SurvivorModel._run_survivor_cli(
+                ["--refresh-priors", "--refresh-data"];
+                input,
+                output,
+                cache_directory,
+                schedule_loader=never_load_schedule,
+                clear_data_cache=() -> (raw_cache_clears[] += 1),
+            ) == 0
+            @test position(input) == 0
+            @test isempty(String(take!(output)))
+            @test raw_cache_clears[] == 1
+            @test !isfile(files.prior)
+            @test !isfile(files.old_prior)
+            @test !isfile(files.drive_2022)
+            @test !isfile(files.drive_2023)
+            @test isfile(files.unrelated)
         end
     end
 
@@ -469,27 +721,109 @@ end
         mktempdir() do cache_directory
             output = IOBuffer()
             model_path = joinpath(cache_directory, "survivor_2023.lp")
-            exit_code = SurvivorModel._run_survivor_cli(
-                [
-                    "--season",
-                    "2023",
-                    "--hessian-weeks",
-                    "2",
-                    "--write-model",
-                    model_path,
-                ];
-                input=IOBuffer(),
-                output=output,
-                schedule=schedule,
-                historical_drives=historical,
-                current_drives=current,
-                cache_directory=cache_directory,
-                through_week=2,
+            normalized_schedule = SurvivorModel.load_schedule(schedule)
+            cli_historical = SurvivorModel._survivor_cli_historical_drives(
+                normalized_schedule,
+                2023,
+                historical,
             )
+            cached = SurvivorModel._cached_historical_prior(
+                cli_historical;
+                current_season=2023,
+                cache_directory=cache_directory,
+            )
+            open(cached.path, "w") do io
+                write(io, "not a serialized cache")
+            end
+            drive_cache_path = joinpath(
+                cache_directory,
+                "drive_summaries_v1_season2022.jls",
+            )
+            write(drive_cache_path, "keep")
+            raw_cache_clears = Ref(0)
+            debug_log = IOBuffer()
+            debug_logger = SurvivorModel.Logging.ConsoleLogger(
+                debug_log,
+                SurvivorModel.Logging.Debug,
+            )
+            exit_code = withenv("SURVIVORMODEL_REFRESH_DATA" => "false") do
+                SurvivorModel.Logging.with_logger(debug_logger) do
+                    SurvivorModel._run_survivor_cli(
+                        [
+                            "--season",
+                            "2023",
+                            "--refresh-priors",
+                            "--hessian-weeks",
+                            "2",
+                            "--write-model",
+                            model_path,
+                        ];
+                        input=IOBuffer(),
+                        output=output,
+                        schedule=schedule,
+                        historical_drives=historical,
+                        current_drives=current,
+                        cache_directory=cache_directory,
+                        through_week=2,
+                        clear_data_cache=() -> (raw_cache_clears[] += 1),
+                    )
+                end
+            end
+            debug_output = String(take!(debug_log))
             @test exit_code == 0
             @test isfile(model_path)
             @test filesize(model_path) > 0
             @test isempty(strip(String(take!(output))))
+            @test occursin(
+                "historical empirical-Bayes prior cause diagnostics",
+                debug_output,
+            )
+            @test occursin("weibull_shape", debug_output)
+            @test occursin("gamma_mean_cumulative_hazard", debug_output)
+            @test raw_cache_clears[] == 0
+            @test isfile(drive_cache_path)
+            @test SurvivorModel._cached_historical_prior(
+                cli_historical;
+                current_season=2023,
+                cache_directory=cache_directory,
+            ).cache_hit
+
+            combined_model_path = joinpath(
+                cache_directory,
+                "survivor_2023_refreshed.lp",
+            )
+            combined_raw_cache_clears = Ref(0)
+            combined_exit_code = withenv(
+                "SURVIVORMODEL_REFRESH_DATA" => "false",
+            ) do
+                SurvivorModel._run_survivor_cli(
+                    [
+                        "--season",
+                        "2023",
+                        "--refresh-data",
+                        "--refresh-priors",
+                        "--write-model",
+                        combined_model_path,
+                    ];
+                    input=IOBuffer(),
+                    output=output,
+                    schedule=schedule,
+                    historical_drives=historical,
+                    current_drives=current,
+                    cache_directory=cache_directory,
+                    through_week=2,
+                    clear_data_cache=() -> (combined_raw_cache_clears[] += 1),
+                )
+            end
+            @test combined_exit_code == 0
+            @test isfile(combined_model_path)
+            @test combined_raw_cache_clears[] == 1
+            @test isfile(drive_cache_path)
+            @test SurvivorModel._cached_historical_prior(
+                cli_historical;
+                current_season=2023,
+                cache_directory=cache_directory,
+            ).cache_hit
         end
 
         completed_schedule = copy(schedule)

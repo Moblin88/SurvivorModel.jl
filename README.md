@@ -75,6 +75,15 @@ substituting a default prior. Inspect
 `likelihood_fit_diagnostics(prior, :td)` or
 `likelihood_fit_diagnostics(prior, :defensive)` for the maximized likelihood,
 convergence, iteration and evaluation counts, and boundary parameters.
+At Debug level, each completed prior fit also logs a compact summary and one
+parameter record per cause. The `source` field distinguishes new fits from
+cached priors; cache records report the stored optimizer diagnostics, not a
+new optimization. Records include the Weibull shape, Gamma shape/rate and
+mean cumulative-hazard coefficient, home multiplier, persistence and reset
+probabilities, and fit diagnostics. Durations are measured in minutes, so
+mean cumulative-hazard coefficients have cause-specific units of
+minutes^(-Weibull shape) and should not be compared directly across causes.
+Iteration and evaluation counts describe the selected converged initialization.
 
 Competing-Weibull probabilities and drive-time moments are evaluated with
 one-dimensional numerical integration via QuadGK. Score-spread moments are
@@ -366,8 +375,10 @@ that week are treated as future games even when the schedule already contains
 their results, which allows replaying an earlier week of a completed season.
 The selected team is logged at Info level to stderr and printed as its
 abbreviation with a newline to stdout, so stdout remains suitable for a picks
-file. Phase timings and optimizer diagnostics are Debug-level logs; enable them
-with `JULIA_DEBUG=SurvivorModel`. Branch-and-bound emits an aligned progress
+file. Phase timings, final prior-fit parameters and optimizer diagnostics are
+Debug-level logs; enable them with `JULIA_DEBUG=SurvivorModel`. Prior records
+are emitted only after the full prior is built and identify whether the values
+come from a fresh fit or cache. Branch-and-bound emits an aligned progress
 table to stderr, including root and final rows, node actions, bound sources,
 reasons, incumbent and competing bounds, IPM and crossover iterations, and
 timing. Important fallback and proof information stays in the table while it
@@ -383,27 +394,41 @@ JULIA_DEBUG=SurvivorModel survivor --season 2026 \
 ```
 
 
-Use `--refresh-data` (or set `SURVIVORMODEL_REFRESH_DATA=true`) for an explicit
-data refresh. This clears NFLData's raw-data cache and rebuilds the package's
-summarized historical-drive cache before running; normal invocations reuse
-summarized historical seasons while still loading the current season through
-the normal NFLData path:
+With `--season`, `--refresh-data` (or `SURVIVORMODEL_REFRESH_DATA=true`) clears
+NFLData's raw-data cache and rebuilds summarized historical-drive data before
+running. Without `--season`, it clears the raw cache and all summarized
+historical-drive caches, then exits without downloading or rebuilding data.
+It leaves fitted prior caches intact. Normal invocations reuse summarized
+historical seasons while still loading the current season through the normal
+NFLData path:
 
 ```sh
 survivor --refresh-data --season 2026 < picks.txt
+survivor --refresh-data
 ```
 
 Historical empirical-Bayes priors are stored in the package's Scratch.jl
 space and keyed by model-cache schema, season, historical-window length, and
-a fingerprint of the historical drive data used for the fit.
-If that data changes, the cached prior is recomputed. current-season drives and the survivor optimization are refreshed on each
-invocation. An opening-week forecast can run before NFLData publishes
+a fingerprint of the historical drive data used for the fit. If that data
+changes, the cached prior is recomputed. Current-season drives and the
+survivor optimization are refreshed on each invocation. Use `--refresh-priors`
+to remove all cached historical prior fits without clearing any data caches;
+by itself it clears the prior cache and exits, or with `--season` it clears
+before running and refits as needed:
+
+```sh
+survivor --refresh-priors
+survivor --refresh-priors --season 2026 < picks.txt
+survivor --refresh-data --refresh-priors
+survivor --refresh-data --refresh-priors --season 2026 < picks.txt
+```
+
+An opening-week forecast can run before NFLData publishes
 target-season PBP and uses historical drives only. Once prior picks imply week
 2 or later, target-season PBP must be available so the current-season update is
 not omitted. If a cached schedule still marks a supplied previous pick as
 uncompleted, the CLI automatically clears NFLData's cache and retries the
-schedule validation once. `--refresh-data` remains available when an explicit
-full data refresh is desired.
+schedule validation once.
 
 The weekly planner uses the covariance-aware expected-weeks MILP described
 above. `SurvivorSelectionConfig` controls the market guard, missing-line

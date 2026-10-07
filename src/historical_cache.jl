@@ -127,13 +127,19 @@ function _cached_historical_prior(
         max_seasons,
         data_fingerprint,
     )
-    cached_prior !== nothing &&
+    if cached_prior !== nothing
+        _log_historical_prior_diagnostics(
+            cached_prior;
+            source=:cache,
+            cache_path=path,
+        )
         return (
             prior=cached_prior,
             cache_hit=true,
             path=path,
             data_fingerprint=data_fingerprint,
         )
+    end
 
     prior = fit_empirical_bayes_prior(
         historical_drives;
@@ -158,11 +164,29 @@ function _cached_historical_prior(
 end
 
 """
-    clear_historical_prior_cache!()
+    clear_historical_prior_cache!(; cache_directory=nothing)
 
-Remove the package-owned historical empirical-Bayes fit cache.
+Remove cached historical empirical-Bayes fits. By default, delete the
+package-owned Scratch.jl cache; with `cache_directory`, delete only matching
+prior-fit cache files in that directory.
 """
-function clear_historical_prior_cache!()
-    Scratch.delete_scratch!(@__MODULE__, "historical_priors")
+function clear_historical_prior_cache!(
+    ;
+    cache_directory::Union{Nothing,AbstractString}=nothing,
+)
+    if cache_directory === nothing
+        Scratch.delete_scratch!(@__MODULE__, "historical_priors")
+    else
+        directory = String(cache_directory)
+        if isdir(directory)
+            for path in readdir(directory; join=true)
+                filename = basename(path)
+                startswith(filename, "historical_prior_") || continue
+                endswith(filename, ".jls") || continue
+                isfile(path) || continue
+                rm(path; force=true)
+            end
+        end
+    end
     return nothing
 end

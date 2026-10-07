@@ -10,13 +10,17 @@ function _survivor_cli_usage()
     Usage:
       survivor --season YEAR [--ban TEAM1,TEAM2] [--branch-and-bound] [--write-model FILE.lp] [--strikes N] [--hessian-weeks N] [--timeout SECONDS] < picks.txt
       julia --project=. -m SurvivorModel --season YEAR [--ban TEAM1,TEAM2] [--branch-and-bound] [--write-model FILE.lp] [--strikes N] [--hessian-weeks N] [--timeout SECONDS] < picks.txt
+      survivor --refresh-priors
+      survivor --refresh-data [--refresh-priors]
+      julia --project=. -m SurvivorModel --refresh-priors
+      julia --project=. -m SurvivorModel --refresh-data [--refresh-priors]
 
     Input:
       One team abbreviation per nonblank line, starting with week 1.
       The next pick is inferred from the number of nonblank lines.
 
     Options:
-      --season YEAR       Target season (required).
+      --season YEAR       Target season (required unless refreshing caches).
       --ban TEAMS         Comma-separated teams forbidden as the current pick.
       --branch-and-bound  Full-LP external tree certifying the current pick;
                           HiPO with crossover is used for root and child LPs.
@@ -26,7 +30,11 @@ function _survivor_cli_usage()
                           for exact-milp (default: 3; 0 is linear-only).
       --timeout SECONDS  Optimization time limit in seconds (default: unlimited).
       --refresh-data      Clear NFLData's raw cache and refresh summarized
-                          historical drive data before running.
+                          historical drive data before running. Without
+                          --season, clear raw-data and summarized-drive
+                          caches and exit.
+      --refresh-priors    Clear cached historical prior fits. Without
+                          --season, clear the cache and exit.
       --help              Show this help.
     """
 end
@@ -67,6 +75,8 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
     timeout_specified = false
     refresh_data = false
     refresh_data_specified = false
+    refresh_priors = false
+    refresh_priors_specified = false
     show_help = false
     index = 1
 
@@ -95,6 +105,14 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
                 throw(ArgumentError("--refresh-data may only be specified once"))
             refresh_data = true
             refresh_data_specified = true
+            index += 1
+            continue
+        end
+        if argument == "--refresh-priors"
+            refresh_priors_specified &&
+                throw(ArgumentError("--refresh-priors may only be specified once"))
+            refresh_priors = true
+            refresh_priors_specified = true
             index += 1
             continue
         end
@@ -176,7 +194,7 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
 
     show_help && return (
         show_help=true,
-        season=0,
+        season=nothing,
         initial_strikes=2,
         banned_first_pick_teams=String[],
         write_model_file=nothing,
@@ -184,16 +202,32 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
         branch_and_bound=false,
         timeout_seconds=nothing,
         refresh_data=false,
+        refresh_priors=false,
     )
-    season === nothing && throw(ArgumentError("--season is required"))
-    season > 0 || throw(ArgumentError("--season must be positive"))
+    if season === nothing
+        (refresh_data || refresh_priors) ||
+            throw(ArgumentError(
+                "--season is required unless --refresh-data or " *
+                "--refresh-priors is specified",
+            ))
+        (
+            ban_specified ||
+            branch_and_bound ||
+            write_model_specified ||
+            strikes_specified ||
+            hessian_weeks_specified ||
+            timeout_specified
+        ) && throw(ArgumentError("run options require --season"))
+    else
+        season > 0 || throw(ArgumentError("--season must be positive"))
+    end
     initial_strikes >= 0 ||
         throw(ArgumentError("--strikes must be nonnegative"))
     hessian_weeks >= 0 ||
         throw(ArgumentError("--hessian-weeks must be nonnegative"))
     return (
         show_help=false,
-        season=Int(season),
+        season=season === nothing ? nothing : Int(season),
         initial_strikes=Int(initial_strikes),
         banned_first_pick_teams=banned_first_pick_teams,
         write_model_file=write_model_file,
@@ -201,6 +235,7 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
         branch_and_bound,
         timeout_seconds=timeout_seconds,
         refresh_data=refresh_data,
+        refresh_priors=refresh_priors,
     )
 end
 
@@ -386,6 +421,26 @@ function _run_survivor_cli(
     if options.show_help
         print(output, _survivor_cli_usage())
         return 0
+    end
+    if options.season === nothing
+        if options.refresh_priors
+            clear_historical_prior_cache!(; cache_directory=cache_directory)
+            @info "historical prior cache cleared"
+        end
+        if options.refresh_data
+            clear_data_cache()
+            @info "NFLData raw cache cleared"
+            summarized_cache_entries =
+                _clear_drive_cache!(; cache_directory=cache_directory)
+            @info "summarized historical-drive cache cleared" summarized_cache_entries
+        end
+        log_phase_timing(:cache_clear)
+        return 0
+    end
+
+    if options.refresh_priors
+        clear_historical_prior_cache!(; cache_directory=cache_directory)
+        @info "historical prior cache cleared"
     end
     refresh_data = options.refresh_data || _survivor_cli_refresh_data_enabled()
     refresh_data && clear_data_cache()

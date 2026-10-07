@@ -199,10 +199,11 @@ The existing constant-objective and forced-first-pick shortcuts remain.
 
 One continuous direct HiGHS model has stable rows and columns throughout the
 tree. By default both root and children use HiPO, automatic threads (`threads=0`),
-parallelism, automatic presolve (`presolve=choose`), and `run_crossover=off`.
-The tree does not
-snapshot or restore bases: primal/dual solutions suffice for branching and
-residual-safe certificates. The external LP clears the builder's primal starts
+parallelism, automatic presolve (`presolve=choose`), and `run_crossover=on`.
+Crossover may improve the basic LP solution and residual-safe certificates,
+at additional solve cost. The tree does not snapshot or retain crossover bases
+for child warm starts: primal/dual solutions suffice for branching and
+certificates. The external LP clears the builder's primal starts
 before any solve. The shared LP factory's crossover settings for other
 backends remain unchanged. Standalone native-basis helpers remain available
 for diagnostics and their independent regression tests, and for the optional
@@ -210,9 +211,10 @@ for diagnostics and their independent regression tests, and for the optional
 That path crosses over the HiPO root with automatic presolve, snapshots its
 checked native basis,
 then uses `solver=simplex`, `simplex_strategy=1` (serial dual simplex) and
-automatic presolve (`presolve=choose`) for children. Path bounds and conditioned
-hull coefficients are updated before restoring the immediate parent's optimal
-basis, then HiGHS decides whether to presolve. Internal presolve/postsolve does
+automatic presolve (`presolve=choose`) for children. Simplex first restores the
+immediate parent's versioned hull formulation and exact variable intervals,
+then its basis; only afterward are child bounds and hull inequalities tightened.
+HiGHS decides whether to presolve. Internal presolve/postsolve does
 not change the original native model's row/column mappings; snapshots after
 optimal solves and restores check the original dimensions and mappings.
 Frontier nodes
@@ -222,7 +224,37 @@ Rejected bases warn and use a crash basis. Numerical/error child statuses
 warn and retry dual simplex once with a cleared basis and the remaining
 deadline, retaining the same cutoff.
 
-The root disables `objective_bound`. Each child refreshes it after queued
+Simplex uses `SurvivorHullPool`, seeded from the original four inequalities per
+gate. Each slot keeps its native row identity and GE/LE type. Disabled GE rows
+have RHS `-Inf`, disabled LE rows RHS `Inf`, through JuMP/MOI (never a native-only
+edit). Immutable descriptors reference shared original expression templates.
+Only inactive basic-slack slots of compatible direction may change coefficients;
+otherwise a new row is appended with a basic zero-cost slack. A dominated basic
+row may be freed and immediately reused for its stronger replacement. Nonbasic
+old rows remain active. Dominance accounts for selector fixings and does not
+assume every recomputed rounded endpoint narrows monotonically.
+
+Parent snapshots include all slot versions, including inactive nonbasic rows,
+and finite variable intervals, but no numerical matrix copies or permanent
+closed-subtree history. Siblings share snapshots; frontier release allows them
+to be collected. Restoration frees slots created after a snapshot and extends
+only registered pool rows as basic slacks, checking every original row identity
+and unchanged column mapping. Generic basis validation remains strict.
+After optimal certificate/assignment reads, basic dominated rows can be freed
+using the already verified basis witness: relaxing a basic zero-cost slack row
+preserves primal and dual feasibility. No stale MOI solution reads follow that
+cleanup. Free rows are skipped before multiplier/RHS arithmetic in certificates.
+
+The pool has no cap or rebuild policy. Debug `hull_pool` observer events and
+stderr records report total, active/inactive, added, reused, deactivated and peak
+slots; solved/final debug records include cleanup. Deadline checks cover row
+preparation as well as solves. Internal `hull_pool=false` permits controlled
+replacement benchmarks, not a public option. In exact arithmetic these edits
+preserve dual feasibility; numerical recovery remains explicit and no speedup
+is promised.
+
+In optional `simplex=true` mode, the root disables `objective_bound`. Each
+dual-simplex child refreshes it after queued
 completions update the incumbent: `-(LB + 1e-6 * max(1, abs(LB)))`, for the
 equivalent minimization objective. The resulting original-objective ceiling
 obeys the existing scale-aware pruning predicate even if inherited bounds
@@ -238,7 +270,7 @@ the status, threshold, retained cap, iterations and elapsed time; debug table
 rows show `CUTOFF_PRUNED`, week `-`, and a `Simplex` rather than `IPM` count.
 Optimal root/child certificates retain their independent residual checks.
 HiGHS 1.15.1 can report `Unknown` after recovering incorrect maximization
-duals from a presolved HiPO solution without crossover. The tree solves
+duals from a presolved HiPO solution. The tree solves
 the mathematically equivalent minimization of the negative objective,
 normalizing primal/dual objectives and the Lagrangian objective back to
 the original maximization convention. Some models still fail postsolve:
@@ -251,7 +283,10 @@ not disable presolve globally. Restoration happens before the next node's
 `node_start` event, not after a retry, so the solved relaxation's results
 remain intact for certificate and branching reads. Only the numerical HiPO
 retry explicitly disables presolve; a simplex crash-basis retry keeps automatic
-presolve and the same cutoff. Default HiPO crossover remains off throughout.
+presolve and the same cutoff. Default HiPO uses crossover for both root and
+child solves, but HiGHS 1.15.1's IPX crossover does not honor
+`objective_bound`; default HiPO children are pruned only after their LP
+certificates are computed.
 Time/iteration limits are not retried,
 and unexpected retry statuses still raise errors.
 
@@ -271,7 +306,8 @@ minima/maxima range only over available picks. Team-leave-out passes further
 condition selected-branch intervals. Each child intersects these intervals
 with root bounds, not the previous child's bounds, and updates probability,
 parameter-gradient, projected-gradient, and Hessian variable intervals plus
-selected/other-branch hull coefficients and RHSs. Probability sums and
+selected/other-branch hull coefficients and RHSs on default HiPO, or basis-safe
+pooled inequalities on simplex. Probability sums and
 variance-adjusted sums are updated too. Unavailable selectors use all-history
 intervals because their selected branch is unreachable. The suffix masks,
 parameter/projection switch, curvature horizon, and mathematical recurrences
@@ -367,9 +403,15 @@ their inherited bounds. Timeout returns a feasible witness with an explicit
 unproven warning. Unexpected statuses or inconsistent
 certificates raise errors rather than falling back to another backend.
 The `node_start` observer event follows path tightening and precedes the
-deadline check and solve. Debug-only stderr diagnostics report root and child
-HiPO costs (IPM iterations), crossover-off settings, queue growth, and final
-proof/timeout accounting.
+deadline check and solve. Debug-only stderr diagnostics report root and child HiPO IPM iterations,
+crossover-on settings, queue growth, and final proof/timeout accounting.
+In optional simplex mode, Debug logging additionally enables native HiGHS
+relaxation output with `log_dev_level=1`, routed through the existing native
+stderr log-file convention rather than console stdout. Root, child, and retry
+headings identify the solve; child headings include node, region, depth, and
+the normalized objective cutoff. Ordinary simplex runs and default HiPO tree
+runs retain silent native output. The aligned summary table remains separate
+from native solver messages.
 
 ## Cache maintenance
 

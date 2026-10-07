@@ -490,6 +490,7 @@ end
     end
 
     @testset "H horizon and exact first-pick certificates" begin
+        crossed_over_basis = Ref(false)
         for current in (1, 16), losses in (0, 2), H in (0, 1, 2, 3, 20), simplex in (false, true)
             data, inputs = _bnb_fixture(; current_week=current)
             state = SurvivorPoolState(2025, current; strikes_remaining=losses)
@@ -510,19 +511,22 @@ end
                 if event.kind in (:root, :node_start, :node_solve)
                     for (option, value) in (
                         ("solver", simplex && event.kind != :root ? "simplex" : "hipo"),
-                        ("run_crossover", simplex && event.kind == :root ? "on" : "off"),
+                        ("run_crossover", simplex && event.kind != :root ? "off" : "on"),
                         ("parallel", "on"), ("threads", 0),
                     )
                         @test BNB.JuMP.get_optimizer_attribute(tree.model, option) == value
                     end
                 end
                 if !simplex && event.kind in (:root, :node_solve)
-                    @test event.simplex_iterations == 0
-                    count = Ref{BNB.HiGHS.HighsInt}(0)
+                    @test BNB.JuMP.get_optimizer_attribute(tree.model, "objective_bound") == Inf
+                    basis_validity = Ref{BNB.HiGHS.HighsInt}(0)
                     @test BNB.HiGHS.Highs_getIntInfoValue(
-                        BNB.JuMP.backend(tree.model).inner, "crossover_iteration_count", count,
+                        BNB.JuMP.backend(tree.model).inner, "basis_validity", basis_validity,
                     ) == BNB.HiGHS.kHighsStatusOk
-                    @test count[] == 0
+                    if basis_validity[] > 0
+                        BNB._survivor_snapshot_basis(tree.model)
+                        crossed_over_basis[] = true
+                    end
                 end
                 if simplex && event.kind == :node_start
                     @test BNB.JuMP.get_optimizer_attribute(tree.model, "simplex_strategy") == 1
@@ -558,6 +562,85 @@ end
             )
             @test extensive.objective_value ≈ maximum(values(exhaustive)) atol=2e-6
         end
+        @test crossed_over_basis[]
+    end
+
+    @testset "HiPO crossover on/off certificates and cost" begin
+        data, inputs = _bnb_fixture()
+        state = SurvivorPoolState(2025, 1; strikes_remaining=2)
+        config = _bnb_config(; hessian_weeks=2)
+        crossed_over_basis = Ref(false)
+        for path in ([1], [1, 4])
+            results = Dict{String,NamedTuple}()
+            for crossover in ("off", "on")
+                tree = BNB._build_survivor_full_model(data, state, config, inputs)
+                @test BNB._survivor_tree_apply_path!(tree, path)
+                model = tree.model
+                JuMP = BNB.JuMP
+                JuMP.set_objective_function(model, -JuMP.objective_function(model))
+                JuMP.set_objective_sense(model, JuMP.MOI.MIN_SENSE)
+                for (option, value) in (
+                    ("solver", "hipo"), ("run_crossover", crossover),
+                    ("parallel", "on"), ("threads", 0), ("presolve", "off"),
+                    ("objective_bound", Inf),
+                )
+                    JuMP.set_optimizer_attribute(model, option, value)
+                end
+                seconds = @elapsed JuMP.optimize!(model)
+                @test JuMP.termination_status(model) == JuMP.MOI.OPTIMAL
+                @test JuMP.primal_status(model) == JuMP.MOI.FEASIBLE_POINT
+                @test JuMP.dual_status(model) == JuMP.MOI.FEASIBLE_POINT
+                objective = -JuMP.objective_value(model)
+                upper = BNB._survivor_tree_upper_bound(model)
+                @test upper >= objective - 1e-8
+                residuals = Dict{String,Float64}()
+                for name in ("max_primal_infeasibility", "max_dual_infeasibility")
+                    value = Ref{Cdouble}(0.0)
+                    @test BNB.HiGHS.Highs_getDoubleInfoValue(
+                        JuMP.backend(model).inner, name, value,
+                    ) == BNB.HiGHS.kHighsStatusOk
+                    residuals[name] = value[]
+                end
+                iterations = Dict{String,Int}()
+                for name in ("ipm_iteration_count", "crossover_iteration_count")
+                    value = Ref{BNB.HiGHS.HighsInt}(0)
+                    @test BNB.HiGHS.Highs_getIntInfoValue(
+                        JuMP.backend(model).inner, name, value,
+                    ) == BNB.HiGHS.kHighsStatusOk
+                    iterations[name] = Int(value[])
+                end
+                basis_validity = Ref{BNB.HiGHS.HighsInt}(0)
+                @test BNB.HiGHS.Highs_getIntInfoValue(
+                    JuMP.backend(model).inner, "basis_validity", basis_validity,
+                ) == BNB.HiGHS.kHighsStatusOk
+                if crossover == "on"
+                    @test basis_validity[] > 0
+                    BNB._survivor_snapshot_basis(model)
+                    crossed_over_basis[] = true
+                end
+                results[crossover] = (;
+                    seconds, objective, upper, residuals, iterations,
+                    primal_status=JuMP.primal_status(model),
+                    dual_status=JuMP.dual_status(model),
+                )
+                comparison = (;
+                    path, crossover, seconds, objective, upper,
+                    bound_gap=upper - objective,
+                    primal_status=JuMP.primal_status(model),
+                    dual_status=JuMP.dual_status(model),
+                    primal_residual=residuals["max_primal_infeasibility"],
+                    dual_residual=residuals["max_dual_infeasibility"],
+                    ipm_iterations=iterations["ipm_iteration_count"],
+                    crossover_iterations=iterations["crossover_iteration_count"],
+                    basis_validity=Int(basis_validity[]),
+                )
+                @info "HiPO crossover comparison" comparison
+            end
+            @test results["on"].objective ≈ results["off"].objective atol=2e-6
+            @test results["on"].upper >= results["on"].objective - 1e-8
+            @test results["off"].upper >= results["off"].objective - 1e-8
+        end
+        @test crossed_over_basis[]
     end
 
     @testset "exhaustive partition, earliest fractional week, interleaving" begin
@@ -568,7 +651,7 @@ end
             tree = BNB._build_survivor_full_model(data, state, config, inputs)
             events = []
             seen_branch = Ref(false)
-            parent_bases = Dict{Int,BNB.SurvivorNativeBasis}()
+            parent_bases = Dict{Int,BNB.SurvivorHullParent}()
             cutoffs = []
             latest_lower = Ref(-Inf)
             function observe(event)
@@ -632,7 +715,7 @@ end
                                 parent_bases[previous.node.id] = first(children).parent_basis
                                 @test all(n -> n.parent_basis === first(children).parent_basis, children)
                                 @test first(children).parent_basis !== previous.node.parent_basis
-                                basis = first(children).parent_basis
+                                basis = first(children).parent_basis.basis
                                 optimizer = BNB.JuMP.backend(tree.model)
                                 @test length(basis.columns) == BNB.HiGHS.Highs_getNumCol(optimizer.inner)
                                 @test length(basis.rows) == BNB.HiGHS.Highs_getNumRow(optimizer.inner)
@@ -665,7 +748,7 @@ end
             @test plan.objective_value <= maximum(values(_bnb_exhaustive(data, inputs, state, config))) + 2e-6
             losses == 2 && @test seen_branch[]
             if simplex
-                losses == 0 && @test !isempty(cutoffs)
+                losses == 0 && @test any(e -> e.kind in (:node_cutoff, :node_optimum), events)
                 for event in cutoffs
                     objectives = [_bnb_independent_objective(collect(raw), inputs, state, config)
                                   for raw in Iterators.product([1, 2], [3, 4], [5, 6])
@@ -896,7 +979,7 @@ end
                             redirect_stderr(progress) do
                                 BNB.Logging.with_logger(BNB.Logging.ConsoleLogger(logs, BNB.Logging.Debug)) do
                                     plan = BNB._optimize_survivor_branch_and_bound!(
-                                        tree; tighten_terms=!simplex,
+                                        tree; tighten_terms=!simplex, hull_pool=false,
                                     )
                                     @test nrow(plan.selections) == 3
                                 end
@@ -915,19 +998,41 @@ end
                 @test occursin(header, progress)
                 @test occursin(repeat("-", length(header)), progress)
                 header_separators = findall(==('|'), header)
-                rows = filter(line -> occursin('|', line), split(progress, '\n'))
+                rows = filter(line -> startswith(line, "   node |") ||
+                    occursin(r"^\s+\d+\s+\|", line), split(progress, '\n'))
                 @test length(rows) > 1
                 @test all(row -> findall(==('|'), row) == header_separators, rows)
                 @test all(row -> length(row) == length(header), rows)
-                @test !occursin("Running HiGHS", progress)
+                if simplex
+                    @test occursin("--- HiGHS relaxation: root", progress)
+                    @test occursin("--- HiGHS relaxation: node", progress)
+                    @test occursin("Using dual simplex solver", progress)
+                    @test occursin(r"Simplex\s+iterations", progress)
+                    @test BNB.JuMP.get_optimizer_attribute(tree.model, "output_flag")
+                    @test !BNB.JuMP.get_optimizer_attribute(tree.model, "log_to_console")
+                    @test BNB.JuMP.get_optimizer_attribute(tree.model, "log_dev_level") == 1
+                else
+                    @test !occursin("Running HiGHS", progress)
+                    @test !occursin("--- HiGHS relaxation:", progress)
+                end
             end
             text = String(take!(logs))
             @test occursin("hessian_weeks = 3", text)
             @test occursin("presolve = :choose", text)
             @test occursin(simplex ? "child_solver = :simplex" : "child_solver = :hipo", text)
-            @test occursin("crossover = :off", text)
-            simplex && @test occursin("crossover = :on", text)
+            @test occursin(simplex ? "crossover = :off" : "crossover = :on", text)
+            @test occursin("crossover = :on", text)
             @test occursin("first_pick_within_tolerance", text)
+            quiet_tree = BNB._build_survivor_full_model(
+                data, debug_state, _bnb_config(; simplex), inputs,
+            )
+            BNB.Logging.with_logger(BNB.Logging.NullLogger()) do
+                BNB._optimize_survivor_branch_and_bound!(
+                    quiet_tree; tighten_terms=!simplex,
+                )
+            end
+            @test !BNB.JuMP.get_optimizer_attribute(quiet_tree.model, "output_flag")
+            @test BNB.JuMP.get_optimizer_attribute(quiet_tree.model, "log_dev_level") == 0
         end
         for simplex in (false, true)
             tree = BNB._build_survivor_full_model(data, state, _bnb_config(; simplex), inputs)
@@ -1025,7 +1130,7 @@ end
         @test_throws ErrorException BNB._survivor_restore_basis!(m, root)
     end
 
-    @testset "HiGHS chooses presolve on fresh HiPO relaxations" begin
+    @testset "HiPO crossover and HiGHS presolve on fresh relaxations" begin
         data, inputs = _bnb_fixture(; repeated=false)
         tree = BNB._build_survivor_full_model(
             data, SurvivorPoolState(2025, 1; strikes_remaining=2), _bnb_config(), inputs,
@@ -1035,7 +1140,7 @@ end
             push!(events, event)
             if event.kind in (:root, :node_start, :node_solve)
                 @test BNB.JuMP.get_optimizer_attribute(tree.model, "presolve") == "choose"
-                @test BNB.JuMP.get_optimizer_attribute(tree.model, "run_crossover") == "off"
+                @test BNB.JuMP.get_optimizer_attribute(tree.model, "run_crossover") == "on"
             end
         end
         BNB._optimize_survivor_branch_and_bound!(tree; observer=observe_presolve)
@@ -1125,7 +1230,7 @@ end
         @test attempts == ["choose", "off"]
     end
 
-    @testset "crossover-free certificates agree with parent-basis simplex" begin
+    @testset "uncrossed HiPO certificates agree with parent-basis simplex" begin
         data, inputs = _bnb_fixture()
         for losses in 0:2, H in (0, 1, 3)
             tree = BNB._build_survivor_full_model(
@@ -1285,3 +1390,5 @@ end
         @test isfinite(last(events).upper)
     end
 end
+
+include("survivor_hull_pool_unit.jl")

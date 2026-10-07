@@ -85,6 +85,265 @@ function _survivor_restore_basis!(model, basis::SurvivorNativeBasis; repair=fals
     return nothing
 end
 
+struct SurvivorHullVersion
+    gate::Int
+    kind::Int
+    endpoint::Float64
+    enabled::Bool
+end
+
+mutable struct SurvivorHullPool
+    refs::Vector{JuMP.ConstraintRef}
+    versions::Vector{SurvivorHullVersion}
+    templates::Vector{NTuple{4,JuMP.AffExpr}}
+    selected::Vector{JuMP.VariableRef}
+    by_gate::Vector{Vector{Int}}
+    native_rows::Vector{Int}
+    added::Int
+    reused::Int
+    deactivated::Int
+    peak::Int
+end
+
+struct SurvivorHullParent
+    basis::SurvivorNativeBasis
+    versions::Vector{SurvivorHullVersion}
+    path::Vector{Int}
+    tighten::Bool
+    variable_bounds::Vector{Tuple{Float64,Float64}}
+end
+
+function _survivor_hull_pool(tree)
+    refs = JuMP.ConstraintRef[]
+    versions = SurvivorHullVersion[]
+    templates = NTuple{4,JuMP.AffExpr}[]
+    selected = JuMP.VariableRef[]
+    by_gate = Vector{Int}[]
+    optimizer = _survivor_basis_backend(tree.model)
+    for (gate, hull) in enumerate(tree.model.ext[:survivor_node_hulls])
+        rows = (hull.lower_row, hull.upper_row, hull.other_upper_row, hull.other_lower_row)
+        expressions = map(rows) do ref
+            expression = copy(JuMP.constraint_object(ref).func)
+            JuMP.add_to_expression!(expression, -JuMP.coefficient(expression, hull.selected), hull.selected)
+            expression
+        end
+        push!(templates, expressions)
+        push!(selected, hull.selected)
+        slots = Int[]
+        for (kind, ref) in enumerate(rows)
+            push!(refs, ref)
+            endpoint = -JuMP.normalized_coefficient(ref, hull.selected)
+            push!(versions, SurvivorHullVersion(gate, kind, endpoint, true))
+            push!(slots, length(refs))
+        end
+        push!(by_gate, slots)
+    end
+    native_rows = [Int(HiGHS.row(optimizer, JuMP.index(ref))) + 1 for ref in refs]
+    return SurvivorHullPool(refs, versions, templates, selected, by_gate,
+                            native_rows, 0, 0, 0, length(refs))
+end
+
+_survivor_hull_lower(kind) = kind in (1, 3)
+_survivor_hull_rhs(version) = version.kind <= 2 ? 0.0 : -version.endpoint
+_survivor_hull_free(kind) = _survivor_hull_lower(kind) ? -Inf : Inf
+
+function _survivor_hull_expression(pool, version)
+    expression = copy(pool.templates[version.gate][version.kind])
+    JuMP.add_to_expression!(expression, -version.endpoint, pool.selected[version.gate])
+    return expression
+end
+
+function _survivor_hull_write!(model, pool, slot, version)
+    ref = pool.refs[slot]
+    old = pool.versions[slot]
+    _survivor_hull_lower(old.kind) == _survivor_hull_lower(version.kind) ||
+        error("survivor hull slot has an incompatible inequality direction")
+    if (old.gate, old.kind, old.endpoint) != (version.gate, version.kind, version.endpoint)
+        if (old.gate, old.kind) == (version.gate, version.kind)
+            JuMP.set_normalized_coefficient(ref, pool.selected[version.gate], -version.endpoint)
+        else
+            expression = _survivor_hull_expression(pool, version)
+            for (_, variable) in JuMP.linear_terms(JuMP.constraint_object(ref).func)
+                JuMP.set_normalized_coefficient(ref, variable, 0.0)
+            end
+            for (coefficient, variable) in JuMP.linear_terms(expression)
+                JuMP.set_normalized_coefficient(ref, variable, coefficient)
+            end
+        end
+    end
+    JuMP.set_normalized_rhs(ref, version.enabled ?
+                            _survivor_hull_rhs(version) : _survivor_hull_free(version.kind))
+    pool.versions[slot] = version
+    return nothing
+end
+
+function _survivor_hull_reindex!(pool)
+    foreach(empty!, pool.by_gate)
+    for (slot, version) in enumerate(pool.versions)
+        push!(pool.by_gate[version.gate], slot)
+    end
+    return nothing
+end
+
+function _survivor_hull_extend_basis(model, pool, basis)
+    optimizer = _survivor_basis_backend(model)
+    optimizer === basis.owner && basis.mapping == _survivor_basis_mapping(model, optimizer) ||
+        error("survivor pool basis owner or columns changed")
+    current = _survivor_basis_row_mapping(model, optimizer)
+    old = Dict(basis.row_mapping)
+    current_indices = Dict(current)
+    registered = Dict(JuMP.index(ref) => slot for (slot, ref) in enumerate(pool.refs))
+    length(current) >= length(old) || error("survivor pool rows were removed")
+    for (index, row) in current
+        if haskey(old, index)
+            old[index] == row || error("survivor pool native row identity changed")
+        else
+            slot = get(registered, index, 0)
+            slot != 0 && !pool.versions[slot].enabled && row >= length(basis.rows) ||
+                error("survivor basis extension contains an unrelated or active row")
+        end
+    end
+    all(pair -> get(current_indices, first(pair), -1) == last(pair), basis.row_mapping) ||
+        error("survivor basis extension lost an original row")
+    rows = [basis.rows; fill(HiGHS.kHighsBasisStatusBasic, length(current) - length(basis.rows))]
+    _survivor_validate_basis(basis.columns, rows)
+    return SurvivorNativeBasis(optimizer, copy(basis.columns), rows, basis.mapping, current)
+end
+
+function _survivor_hull_restore!(tree, pool, parent; expired=() -> false)
+    parent.basis.owner === _survivor_basis_backend(tree.model) &&
+        parent.basis.mapping == _survivor_basis_mapping(tree.model, parent.basis.owner) ||
+        error("survivor pool parent owner or columns changed")
+    expired() && return nothing
+    length(parent.versions) <= length(pool.versions) ||
+        error("survivor parent hull snapshot exceeds pool size")
+    for slot in eachindex(pool.versions)
+        slot % 256 == 0 && expired() && return nothing
+        version = slot <= length(parent.versions) ? parent.versions[slot] :
+            SurvivorHullVersion(pool.versions[slot].gate, pool.versions[slot].kind,
+                                pool.versions[slot].endpoint, false)
+        pool.versions[slot] === version || _survivor_hull_write!(tree.model, pool, slot, version)
+    end
+    _survivor_hull_reindex!(pool)
+    basis = _survivor_hull_extend_basis(tree.model, pool, parent.basis)
+    variables = JuMP.all_variables(tree.model)
+    length(variables) == length(parent.variable_bounds) ||
+        error("survivor parent variable intervals have changed dimension")
+    for (variable, (lower, upper)) in zip(variables, parent.variable_bounds)
+        JuMP.set_lower_bound(variable, lower)
+        JuMP.set_upper_bound(variable, upper)
+    end
+    _survivor_restore_basis!(tree.model, basis; repair=true)
+    return basis
+end
+
+function _survivor_hull_dominates(pool, newer, older)
+    newer.gate == older.gate && newer.kind == older.kind || return false
+    selected = pool.selected[newer.gate]
+    if (newer.kind <= 2 && JuMP.upper_bound(selected) == 0.0) ||
+       (newer.kind >= 3 && JuMP.lower_bound(selected) == 1.0)
+        return true
+    end
+    return newer.kind in (1, 4) ? newer.endpoint >= older.endpoint :
+                                 newer.endpoint <= older.endpoint
+end
+
+function _survivor_hull_deactivate!(model, pool, rows)
+    for slots in pool.by_gate, slot in slots
+        old = pool.versions[slot]
+        old.enabled && rows[pool.native_rows[slot]] == HiGHS.kHighsBasisStatusBasic ||
+            continue
+        any(other -> other != slot && pool.versions[other].enabled &&
+            _survivor_hull_dominates(pool, pool.versions[other], old), slots) || continue
+        _survivor_hull_write!(model, pool, slot,
+            SurvivorHullVersion(old.gate, old.kind, old.endpoint, false))
+        pool.deactivated += 1
+    end
+    return nothing
+end
+
+function _survivor_hull_strengthen!(tree, pool, basis; expired=() -> false)
+    expired() && return nothing
+    model = tree.model
+    rows = copy(basis.rows)
+    pool.added = pool.reused = pool.deactivated = 0
+    reusable = (Int[], Int[])
+    for slot in eachindex(pool.refs)
+        !pool.versions[slot].enabled &&
+            rows[pool.native_rows[slot]] == HiGHS.kHighsBasisStatusBasic &&
+            push!(reusable[_survivor_hull_lower(pool.versions[slot].kind) ? 1 : 2], slot)
+    end
+    bounds = model.ext[:survivor_node_bounds]
+    for (gate, hull) in enumerate(model.ext[:survivor_node_hulls])
+        gate % 256 == 0 && expired() && return nothing
+        lower, upper, all_lower, all_upper =
+            _survivor_tree_hull_interval(bounds, hull.key, hull.index)
+        endpoints = (lower, upper, all_upper, all_lower)
+        for kind in 1:4
+            version = SurvivorHullVersion(gate, kind, endpoints[kind], true)
+            any(slot -> pool.versions[slot].enabled &&
+                _survivor_hull_dominates(pool, pool.versions[slot], version),
+                pool.by_gate[gate]) && continue
+            superseded = findfirst(pool.by_gate[gate]) do slot
+                old = pool.versions[slot]
+                old.enabled && rows[pool.native_rows[slot]] == HiGHS.kHighsBasisStatusBasic &&
+                    _survivor_hull_dominates(pool, version, old)
+            end
+            if superseded !== nothing
+                slot = pool.by_gate[gate][superseded]
+                old = pool.versions[slot]
+                _survivor_hull_write!(model, pool, slot,
+                    SurvivorHullVersion(old.gate, old.kind, old.endpoint, false))
+                pool.deactivated += 1
+                push!(reusable[_survivor_hull_lower(kind) ? 1 : 2], slot)
+            end
+            available = reusable[_survivor_hull_lower(kind) ? 1 : 2]
+            slot = isempty(available) ? nothing : pop!(available)
+            if slot === nothing
+                expression = _survivor_hull_expression(pool, version)
+                set = _survivor_hull_lower(kind) ?
+                    JuMP.MOI.GreaterThan(_survivor_hull_rhs(version)) :
+                    JuMP.MOI.LessThan(_survivor_hull_rhs(version))
+                ref = JuMP.add_constraint(model, JuMP.ScalarConstraint(expression, set))
+                push!(pool.refs, ref)
+                push!(pool.versions, version)
+                push!(pool.native_rows, Int(HiGHS.row(basis.owner, JuMP.index(ref))) + 1)
+                push!(rows, HiGHS.kHighsBasisStatusBasic)
+                slot = length(pool.refs)
+                pool.added += 1
+                pool.peak = max(pool.peak, length(pool.refs))
+            else
+                old_gate = pool.versions[slot].gate
+                filter!(!=(slot), pool.by_gate[old_gate])
+                _survivor_hull_write!(model, pool, slot, version)
+                pool.reused += 1
+            end
+            push!(pool.by_gate[gate], slot)
+        end
+    end
+    _survivor_hull_deactivate!(model, pool, rows)
+    pool.peak = max(pool.peak, length(pool.refs))
+    updated = SurvivorNativeBasis(basis.owner, basis.columns, rows, basis.mapping,
+                                  _survivor_basis_row_mapping(model, basis.owner))
+    _survivor_restore_basis!(model, updated; repair=true)
+    return updated
+end
+
+function _survivor_hull_parent(tree, pool, path, tighten)
+    # Capture the verified optimal witness before freeing basic slack rows.
+    basis = _survivor_snapshot_basis(tree.model)
+    _survivor_hull_deactivate!(tree.model, pool, basis.rows)
+    intervals = [(JuMP.lower_bound(variable), JuMP.upper_bound(variable))
+                 for variable in JuMP.all_variables(tree.model)]
+    return SurvivorHullParent(basis, copy(pool.versions), copy(path), tighten, intervals)
+end
+
+function _survivor_hull_metrics(pool)
+    active = count(version -> version.enabled, pool.versions)
+    return (; total=length(pool.refs), active, inactive=length(pool.refs) - active,
+            added=pool.added, reused=pool.reused, deactivated=pool.deactivated, peak=pool.peak)
+end
+
 struct SurvivorBranchNode
     id::Int
     region::Int
@@ -92,7 +351,7 @@ struct SurvivorBranchNode
     upper::Float64
     completion_lower_bound::Float64
     completion_ready::Bool
-    parent_basis::Union{Nothing,SurvivorNativeBasis}
+    parent_basis::Union{Nothing,SurvivorNativeBasis,SurvivorHullParent}
 end
 
 SurvivorBranchNode(id, region, path, upper, completion_lower_bound, completion_ready) =
@@ -172,7 +431,7 @@ function _survivor_tree_hull_interval(bounds, key, index)
             other.lower[slots...], other.upper[slots...])
 end
 
-function _survivor_tree_update_terms!(tree, available)
+function _survivor_tree_update_terms!(tree, available; rewrite_hulls=true)
     conditioned = available === nothing ? deepcopy(tree.bounds) : _survivor_scalar_bounds(
         tree.inputs, tree.candidate_positions, tree.number_of_weeks,
         tree.losses_to_elimination;
@@ -246,6 +505,7 @@ function _survivor_tree_update_terms!(tree, available)
             error("survivor conditioned hull intervals must be finite, ordered, and nested")
         JuMP.set_lower_bound(hull.dummy, min(0.0, lower))
         JuMP.set_upper_bound(hull.dummy, max(0.0, upper))
+        rewrite_hulls || continue
         JuMP.set_normalized_coefficient(hull.lower_row, hull.selected, -lower)
         JuMP.set_normalized_coefficient(hull.upper_row, hull.selected, -upper)
         JuMP.set_normalized_coefficient(hull.other_upper_row, hull.selected, -all_upper)
@@ -257,7 +517,7 @@ function _survivor_tree_update_terms!(tree, available)
     return nothing
 end
 
-function _survivor_tree_apply_path!(tree, path; tighten=true)
+function _survivor_tree_apply_path!(tree, path; tighten=true, rewrite_hulls=true)
     positions = tree.candidate_positions[path]
     length(unique(positions)) == length(path) &&
         length(unique(tree.data.team[path])) == length(path) || return false
@@ -304,9 +564,9 @@ function _survivor_tree_apply_path!(tree, path; tighten=true)
                 end
             end
         end
-        _survivor_tree_update_terms!(tree, available)
+        _survivor_tree_update_terms!(tree, available; rewrite_hulls)
     else
-        _survivor_tree_update_terms!(tree, nothing)
+        _survivor_tree_update_terms!(tree, nothing; rewrite_hulls)
     end
     return true
 end
@@ -379,6 +639,9 @@ function _survivor_tree_lagrangian_bound(model; row_dual::Function=JuMP.dual)
             F == JuMP.AffExpr || continue
             for ref in JuMP.all_constraints(model, F, S)
                 object = JuMP.constraint_object(ref)
+                ((object.set isa JuMP.MOI.LessThan && object.set.upper == Inf) ||
+                 (object.set isa JuMP.MOI.GreaterThan && object.set.lower == -Inf)) &&
+                    continue
                 multiplier = Float64(row_dual(ref))
                 isfinite(multiplier) || error("survivor LP returned a nonfinite multiplier")
                 rhs = if object.set isa JuMP.MOI.LessThan
@@ -536,6 +799,7 @@ function _optimize_survivor_branch_and_bound!(
     ),
     tighten_terms::Bool=true,
     optimize_relaxation!::Function=JuMP.optimize!,
+    hull_pool::Bool=true,
 )
     model = tree.model
     started = tree.budget_started_at
@@ -553,6 +817,10 @@ function _optimize_survivor_branch_and_bound!(
     summaries = Dict{Int,SurvivorBranchSummary}()
     queue = SurvivorBranchNode[]
     function finish(plan, proven, reason, competing_upper, nodes)
+        if tree.config.simplex && hull_pool && @isdefined(pool) && pool !== nothing
+            metrics = _survivor_hull_metrics(pool)
+            @debug "survivor simplex hull pool final" metrics...
+        end
         observer((; kind=:finish, proven, reason, upper=competing_upper, nodes, plan,
                   retained=length(summaries), pending=[n.id for n in queue],
                   root_bounds=copy(upper)))
@@ -563,10 +831,17 @@ function _optimize_survivor_branch_and_bound!(
     expired() && return finish(incumbent, false, :build_timeout, initial_upper, 0)
     debug = _survivor_debug_logging_enabled()
     simplex = tree.config.simplex
+    pool = simplex && hull_pool ? _survivor_hull_pool(tree) : nothing
+    solver_logs = debug && simplex
+    JuMP.set_optimizer_attribute(model, "output_flag", solver_logs)
+    JuMP.set_optimizer_attribute(model, "log_to_console", false)
+    JuMP.set_optimizer_attribute(model, "log_file",
+                                 solver_logs ? (Sys.iswindows() ? "CON" : "/dev/stderr") : "")
+    JuMP.set_optimizer_attribute(model, "log_dev_level", solver_logs ? 1 : 0)
     JuMP.set_optimizer_attribute(model, "solver", "hipo")
     JuMP.set_optimizer_attribute(model, "threads", 0)
     JuMP.set_optimizer_attribute(model, "parallel", "on")
-    JuMP.set_optimizer_attribute(model, "run_crossover", simplex ? "on" : "off")
+    JuMP.set_optimizer_attribute(model, "run_crossover", "on")
     JuMP.set_optimizer_attribute(model, "presolve", "choose")
     JuMP.set_optimizer_attribute(model, "objective_bound", Inf)
     # HiGHS 1.15.1 recovers incorrect presolved HiPO duals for maximization
@@ -575,7 +850,11 @@ function _optimize_survivor_branch_and_bound!(
         JuMP.set_objective_function(model, -JuMP.objective_function(model))
         JuMP.set_objective_sense(model, JuMP.MOI.MIN_SENSE)
     end
-    function solve_relaxation!()
+    function solve_relaxation!(label)
+        if solver_logs
+            println(stderr, "\n--- HiGHS relaxation: $label ---")
+            flush(stderr)
+        end
         optimize_relaxation!(model)
         status = JuMP.termination_status(model)
         status in (JuMP.MOI.NUMERICAL_ERROR, JuMP.MOI.OTHER_ERROR) && expired() &&
@@ -595,6 +874,10 @@ function _optimize_survivor_branch_and_bound!(
             retry_remaining = remaining()
             retry_remaining === nothing ||
                 JuMP.set_time_limit_sec(model, max(1e-9, retry_remaining))
+            if solver_logs
+                println(stderr, "\n--- HiGHS retry: $label ---")
+                flush(stderr)
+            end
             optimize_relaxation!(model)
         end
         status = JuMP.termination_status(model)
@@ -602,11 +885,11 @@ function _optimize_survivor_branch_and_bound!(
             return JuMP.MOI.TIME_LIMIT
         return status
     end
-    @debug "survivor branch-and-bound root" hessian_weeks=tree.curvature_weeks horizon=tree.number_of_weeks solver=:hipo crossover=(simplex ? :on : :off) presolve=:choose variables=JuMP.num_variables(model)
+    @debug "survivor branch-and-bound root" hessian_weeks=tree.curvature_weeks horizon=tree.number_of_weeks solver=:hipo crossover=:on presolve=:choose variables=JuMP.num_variables(model)
     root_remaining = remaining()
     root_remaining === nothing || JuMP.set_time_limit_sec(model, max(1e-9, root_remaining))
     root_started = time_ns()
-    status = solve_relaxation!()
+    status = solve_relaxation!("root (HiPO with crossover)")
     @debug "survivor branch-and-bound root solved" status seconds=(time_ns() - root_started) / 1e9 barrier_iterations=_survivor_benders_barrier_iterations(model) simplex_iterations=_survivor_benders_simplex_iterations(model)
     observer((; kind=:root, status, seconds=(time_ns() - started) / 1e9,
               barrier_iterations=_survivor_benders_barrier_iterations(model),
@@ -635,7 +918,8 @@ function _optimize_survivor_branch_and_bound!(
         )
         return finish(incumbent, true, :integral_root, root_upper, 0)
     end
-    root_basis = simplex ? _survivor_snapshot_basis(model) : nothing
+    root_basis = !simplex ? nothing : pool === nothing ? _survivor_snapshot_basis(model) :
+        _survivor_hull_parent(tree, pool, Int[], tighten_terms)
     queue = [SurvivorBranchNode(
         id, region, [region], root_upper,
         -Inf, false, root_basis,
@@ -651,9 +935,9 @@ function _optimize_survivor_branch_and_bound!(
         JuMP.set_optimizer_attribute(model, "presolve", "choose")
         JuMP.set_optimizer_attribute(model, "run_crossover", "off")
     end
-    @debug "survivor branch-and-bound root partition" regions=length(regions) queue=length(queue) upper=root_upper child_solver=(simplex ? :simplex : :hipo) crossover=:off presolve=JuMP.get_optimizer_attribute(model, "presolve")
+    @debug "survivor branch-and-bound root partition" regions=length(regions) queue=length(queue) upper=root_upper child_solver=(simplex ? :simplex : :hipo) crossover=(simplex ? :off : :on) presolve=JuMP.get_optimizer_attribute(model, "presolve")
     nodes = 0
-    function progress(node, bound, week, status, solve_started)
+    function progress(node, bound, week, status, solve_started, iterations)
         debug || return nothing
         competing = maximum((upper[a] for a in regions if a != incumbent_region); init=-Inf)
         if nodes % 25 == 1
@@ -668,8 +952,7 @@ function _optimize_survivor_branch_and_bound!(
             _survivor_benders_progress_value(incumbent.objective_value),
             _survivor_benders_progress_value(competing),
             _survivor_benders_progress_value(bound), status,
-            simplex ? _survivor_benders_simplex_iterations(model) :
-                      _survivor_benders_barrier_iterations(model),
+            iterations,
             _survivor_benders_progress_value((time_ns() - solve_started) / 1e9),
         )))
         flush(stderr)
@@ -731,7 +1014,15 @@ function _optimize_survivor_branch_and_bound!(
             _survivor_tree_close!(summaries, upper, node.id, node.upper)
             continue
         end
-        if !_survivor_tree_apply_path!(tree, node.path; tighten=tighten_terms)
+        preparation_started = time_ns()
+        parent_basis = pool === nothing ? nothing :
+            _survivor_hull_restore!(tree, pool, node.parent_basis; expired)
+        if pool !== nothing && parent_basis === nothing
+            push!(queue, node)
+            return finish(incumbent, false, :node_timeout, competing, nodes)
+        end
+        if !_survivor_tree_apply_path!(tree, node.path; tighten=tighten_terms,
+                                      rewrite_hulls=pool === nothing)
             _survivor_tree_close!(summaries, upper, node.id, -Inf)
             continue
         end
@@ -740,7 +1031,19 @@ function _optimize_survivor_branch_and_bound!(
         JuMP.set_optimizer_attribute(model, "presolve", "choose")
         if simplex
             node.parent_basis === nothing && error("survivor simplex node has no parent basis")
-            _survivor_restore_basis!(model, node.parent_basis; repair=true)
+            if pool === nothing
+                _survivor_restore_basis!(model, node.parent_basis; repair=true)
+            else
+                prepared = _survivor_hull_strengthen!(tree, pool, parent_basis; expired)
+                if prepared === nothing
+                    push!(queue, node)
+                    return finish(incumbent, false, :node_timeout, competing, nodes)
+                end
+                metrics = _survivor_hull_metrics(pool)
+                preparation_seconds = (time_ns() - preparation_started) / 1e9
+                @debug "survivor simplex hull pool" node=node.id preparation_seconds metrics...
+                observer((; kind=:hull_pool, node=node.id, preparation_seconds, metrics...))
+            end
             cutoff = _survivor_tree_objective_cutoff(incumbent.objective_value)
             JuMP.set_optimizer_attribute(model, "objective_bound", cutoff)
         end
@@ -752,8 +1055,12 @@ function _optimize_survivor_branch_and_bound!(
         end
         remaining() === nothing || JuMP.set_time_limit_sec(model, max(1e-9, remaining()))
         solve_started = time_ns()
-        status = solve_relaxation!()
+        status = solve_relaxation!(
+            "node $(node.id), region $(tree.data.team[node.region]), depth $(length(node.path)), cutoff $cutoff",
+        )
         nodes += 1
+        node_iterations = simplex ? _survivor_benders_simplex_iterations(model) :
+                                    _survivor_benders_barrier_iterations(model)
         observer((; kind=:node_solve, node, status,
                   seconds=(time_ns() - solve_started) / 1e9,
                   iterations=(simplex ? _survivor_benders_simplex_iterations(model) :
@@ -767,7 +1074,7 @@ function _optimize_survivor_branch_and_bound!(
                       iterations=_survivor_benders_simplex_iterations(model),
                       seconds=(time_ns() - solve_started) / 1e9,
                       upper=copy(upper), retained=length(summaries)))
-            progress(node, bound, nothing, "CUTOFF_PRUNED", solve_started)
+            progress(node, bound, nothing, "CUTOFF_PRUNED", solve_started, node_iterations)
             continue
         elseif status == JuMP.MOI.TIME_LIMIT
             push!(queue, node)
@@ -817,7 +1124,8 @@ function _optimize_survivor_branch_and_bound!(
             assignment.week in tree.candidate_positions[node.path] &&
                 error("survivor LP is fractional in a fixed week")
             child_ids = Int[]
-            parent_basis = simplex ? _survivor_snapshot_basis(model) : nothing
+            parent_basis = !simplex ? nothing : pool === nothing ? _survivor_snapshot_basis(model) :
+                _survivor_hull_parent(tree, pool, node.path, tighten_terms)
             for i in _survivor_tree_candidates(tree, node.path, assignment.week)
                 next_id += 1
                 push!(child_ids, next_id)
@@ -832,7 +1140,11 @@ function _optimize_survivor_branch_and_bound!(
         observer((kind=:queue, nodes=copy(queue), retained=length(summaries),
                   parents=Dict(id => s.parent for (id, s) in summaries),
                   upper=copy(upper)))
-        progress(node, bound, assignment.week, status, solve_started)
+        if pool !== nothing
+            metrics = _survivor_hull_metrics(pool)
+            @debug "survivor simplex hull pool solved" node=node.id metrics...
+        end
+        progress(node, bound, assignment.week, status, solve_started, node_iterations)
     end
 end
 function _survivor_tree_progress_row(values)

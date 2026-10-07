@@ -354,7 +354,13 @@ full-relaxation tree instead. It is mutually exclusive with `--benders-weeks`.
 Add `--simplex` (or `SurvivorSelectionConfig(branch_and_bound=true, simplex=true)`)
 to use a HiPO root with crossover and serial dual-simplex children warmed
 from their immediate parent's optimal native basis. `--simplex` requires
-`--branch-and-bound`. Child solves stop early on HiGHS' native objective-bound
+`--branch-and-bound`. Simplex uses a stable hull-row pool: tighter inequalities
+are added, and dominated rows are freed or reused only when their slacks are
+basic. Active nonbasic rows are never overwritten. Shared parent snapshots
+restore row versions and exact variable bounds before each child; sibling
+changes cannot leak into its basis. If no compatible inactive basic slot is
+available, the pool grows without a hard cap or automatic rebuild.
+Child solves stop early on HiGHS' native objective-bound
 cutoff, retaining the cutoff ceiling as the subtree bound without reading a
 primal solution. These cutoff proofs trust HiGHS' numerical comparison;
 optimal LP nodes still use independently residual-corrected certificates.
@@ -365,8 +371,13 @@ the unsolved model exported by `--write-model`.
 Without `--simplex`:
 The root and children use parallel HiGHS HiPO with automatic presolve
 (`presolve="choose"`, letting HiGHS decide) and
-crossover disabled; no simplex basis is needed. The root partitions **every eligible first pick**, including
-zero-valued LP picks. Later branches select the earliest fractional week.
+crossover enabled. Crossover can improve the basic solution used for residual
+certificates, at additional solve cost; the tree does not retain those bases
+as child warm starts. HiGHS 1.15.1's IPX crossover ignores `objective_bound`,
+so it cannot use that option for early pruning; default-path children are
+pruned after an optimal LP certificate. The root partitions **every eligible
+first pick**, including zero-valued LP picks. Later branches select the earliest
+fractional week.
 Competing first-pick regions receive priority, interleaved with improvement
 of the incumbent region.
 One global exact incumbent is retained. Child certificates tighten ancestor
@@ -381,15 +392,15 @@ without inheriting each other's restrictions. The curvature horizon and LP
 structure stay fixed. Each relaxation is solved with HiPO after these updates;
 unexpected solver statuses or invalid numerical certificates raise errors.
 Internally, the tree minimizes the negative objective to avoid a HiGHS 1.15.1
-maximization dual-recovery issue without crossover. Reported objectives and
-upper certificates retain the original maximization convention.
+presolved maximization dual-recovery issue. Reported objectives and upper
+certificates retain the original maximization convention.
 Some presolved models still hit invalid dual recovery in that version.
 Numerical/error statuses trigger a logged HiPO-only retry without presolve
 using the remaining budget. Presolve is off only for that relaxation's retry;
 every new root or child starts with `presolve="choose"`, including the
-crossed-over root and parent-basis dual-simplex children in simplex mode.
-HiGHS decides whether to presolve after the parent basis is restored.
-Default HiPO never runs crossover.
+crossed-over root and children in default HiPO mode, and the crossed-over
+root and parent-basis dual-simplex children in simplex mode. HiGHS decides
+whether to presolve after the parent basis is restored.
 
 ```sh
 survivor --season 2026 --hessian-weeks 18 --branch-and-bound \
@@ -448,7 +459,13 @@ available:
 JULIA_DEBUG=SurvivorModel survivor --season 2026 < picks.txt
 ```
 
-Branch-and-bound also keeps native HiGHS output silent. Debug logs identify
+Branch-and-bound keeps native HiGHS output silent normally. With
+`--branch-and-bound --simplex` and `JULIA_DEBUG=SurvivorModel`, native relaxation
+logs are enabled on stderr, including developer-level solver information.
+Each root/child solve and numerical-recovery retry is labeled, so basis
+repair, simplex phases, infeasibility progress, and cutoff termination can
+be compared between fast and slow nodes. Default HiPO tree solves remain silent.
+Debug logs identify
 the Hessian horizon, root barrier cost, first-pick partition, and
 child HiPO settings. Its stderr progress table reports
 node/region, depth, earliest fractional week, queue size, incumbent lower
@@ -463,6 +480,13 @@ diagnostics to different files:
 JULIA_DEBUG=SurvivorModel survivor --season 2026 \
   < picks.txt > next-pick.txt 2> survivor.log
 ```
+
+Add `--branch-and-bound --simplex` to that command to include native relaxation
+logs along with the tree table.
+Simplex debug records also report total, active/inactive, added, reused,
+deactivated, and peak hull-pool rows. Pooling preserves dual feasibility in
+exact arithmetic, not a floating-point stability or speedup guarantee; it can
+increase memory and solve time. Default HiPO and other backends are unchanged.
 
 Use `--refresh-data` (or set `SURVIVORMODEL_REFRESH_DATA=true`) for an explicit
 data refresh. This clears NFLData's raw-data cache and rebuilds the package's

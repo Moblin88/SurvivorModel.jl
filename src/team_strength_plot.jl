@@ -70,7 +70,7 @@ end
     _team_strength_plot_data(context)
 
 Return a team-sorted `DataFrame` of neutral-site posterior mean rates and
-central 80% posterior interval endpoints for touchdown offense and
+central 50% posterior interval endpoints for touchdown offense and
 defensive events.
 """
 function _team_strength_plot_data(
@@ -109,13 +109,13 @@ function _team_strength_plot_data(
         intervals = (
             (
                 :td,
-                _gamma_mixture_quantile(offense, 0.1),
-                _gamma_mixture_quantile(offense, 0.9),
+                _gamma_mixture_quantile(offense, 0.25),
+                _gamma_mixture_quantile(offense, 0.75),
             ),
             (
                 :defensive,
-                _gamma_mixture_quantile(defense, 0.1),
-                _gamma_mixture_quantile(defense, 0.9),
+                _gamma_mixture_quantile(defense, 0.25),
+                _gamma_mixture_quantile(defense, 0.75),
             ),
         )
         for (cause, lower, upper) in intervals
@@ -257,7 +257,7 @@ function _team_strength_figure(
     makie.ylims!(axis, 0, 100)
     makie.Label(
         figure[2, 1],
-        "Neutral-site mean rates and central 80% posterior intervals from full team mixtures.\n" *
+        "Neutral-site mean rates and central 50% posterior intervals from full team mixtures.\n" *
         "Mapped to cause-specific league Gamma prior percentiles; higher is stronger.",
         tellwidth=false,
         fontsize=13,

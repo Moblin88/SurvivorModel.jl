@@ -166,8 +166,8 @@ callers.
 The internal `_team_strength_plot_data` helper derives a sorted row for every
 team in the target-season regular-season schedule from the forecast context.
 The plot uses the neutral-site posterior means of the touchdown and defensive
-event cumulative-hazard coefficients, with central 80% posterior intervals.
-`_gamma_mixture_quantile` computes the 10th and 90th percentiles of the full
+event cumulative-hazard coefficients, with central 50% posterior intervals.
+`_gamma_mixture_quantile` computes the 25th and 75th percentiles of the full
 Gamma mixture through Distributions' shape/scale parameterization, ignoring
 zero-weight components. These are posterior rate intervals, not
 future-observation prediction intervals.

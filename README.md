@@ -325,9 +325,9 @@ reference distribution is shared across teams, not a team-specific mixture
 or a ranking of the current teams. Points transform the posterior mean rates
 through these prior CDFs.
 
-Bars show the central 80% posterior rate interval, from the 10th to the 90th
+Bars show the central 50% posterior rate interval, from the 25th to the 75th
 percentile of the full team Gamma mixture, with each endpoint mapped to the
-same league-prior percentile scale. They are not necessarily 10%-90% on the
+same league-prior percentile scale. They are not necessarily 25%-75% on the
 plot axes. These intervals describe uncertainty in the team's rate, not a
 prediction interval for a future drive or uncertainty in the fitted league
 hyperparameters. They can be asymmetric, and a sufficiently skewed mixture's

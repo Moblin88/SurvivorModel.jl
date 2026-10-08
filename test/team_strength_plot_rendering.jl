@@ -83,7 +83,7 @@ end
     @test limits == ((0, 100), (0, 100))
     @test axis.xticks[][2] == ["$value%" for value in 0:10:100]
     @test axis.yticks[][2] == ["$value%" for value in 0:10:100]
-    @test occursin("central 80% posterior intervals", figure.content[2].text[])
+    @test occursin("central 50% posterior intervals", figure.content[2].text[])
     @test occursin("Neutral-site mean rates", figure.content[2].text[])
     @test occursin("league Gamma prior percentiles", figure.content[2].text[])
     @test occursin("league touchdown Gamma prior", axis.xlabel[])
@@ -177,11 +177,11 @@ defense_distribution = SurvivorModel.Gamma(defense_reference.shape, inv(defense_
 dense_data = DataFrame(
     team=teams,
     offense_rate=fill(offense_reference.shape / offense_reference.rate, 32),
-    offense_lower=fill(SurvivorModel.quantile(offense_distribution, 0.1), 32),
-    offense_upper=fill(SurvivorModel.quantile(offense_distribution, 0.9), 32),
+    offense_lower=fill(SurvivorModel.quantile(offense_distribution, 0.25), 32),
+    offense_upper=fill(SurvivorModel.quantile(offense_distribution, 0.75), 32),
     defense_rate=fill(defense_reference.shape / defense_reference.rate, 32),
-    defense_lower=fill(SurvivorModel.quantile(defense_distribution, 0.1), 32),
-    defense_upper=fill(SurvivorModel.quantile(defense_distribution, 0.9), 32),
+    defense_lower=fill(SurvivorModel.quantile(defense_distribution, 0.25), 32),
+    defense_upper=fill(SurvivorModel.quantile(defense_distribution, 0.75), 32),
 )
 dense_figure = SurvivorModel._team_strength_figure(GLMakie, dense_data, context)
 dense_axis = dense_figure.content[1]

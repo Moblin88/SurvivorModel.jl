@@ -235,15 +235,15 @@ end
                 @test row.offense_rate ≈
                     SurvivorModel._gamma_mixture_mean(offense)
                 @test row.offense_lower ≈
-                    SurvivorModel._gamma_mixture_quantile(offense, 0.1)
+                    SurvivorModel._gamma_mixture_quantile(offense, 0.25)
                 @test row.offense_upper ≈
-                    SurvivorModel._gamma_mixture_quantile(offense, 0.9)
+                    SurvivorModel._gamma_mixture_quantile(offense, 0.75)
                 @test row.defense_rate ≈
                     SurvivorModel._gamma_mixture_mean(defense)
                 @test row.defense_lower ≈
-                    SurvivorModel._gamma_mixture_quantile(defense, 0.1)
+                    SurvivorModel._gamma_mixture_quantile(defense, 0.25)
                 @test row.defense_upper ≈
-                    SurvivorModel._gamma_mixture_quantile(defense, 0.9)
+                    SurvivorModel._gamma_mixture_quantile(defense, 0.75)
                 @test 0.0 <= row.offense_lower <= row.offense_upper
                 @test 0.0 <= row.defense_lower <= row.defense_upper
             end
@@ -262,8 +262,8 @@ end
         invalid_context.model.prior = HazardPrior(
             2.0,
             1.5,
-            GammaParams(1.0, 1e-308),
-            GammaParams(1.0, 1e-308),
+            GammaParams(1.0, 7e-309),
+            GammaParams(1.0, 7e-309),
             Dict{String,GammaMixture}(),
             Dict{String,GammaMixture}(),
             1.0,

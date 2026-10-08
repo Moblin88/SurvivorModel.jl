@@ -42,7 +42,7 @@ function _survivor_cli_usage()
       --plot-strength WEEK  Show a plot at the start of WEEK (1-18), using
                             prior weeks only; no picks or run options, and a
                             native desktop/OpenGL display is required.
-                            League-prior percentile axes and central 80%
+                            League-prior percentile axes and central 50%
                             posterior intervals with labeled team points.
       --grid              Print all unused teams and remaining weeks, with
                           opponents and Hessian-adjusted win percentages,

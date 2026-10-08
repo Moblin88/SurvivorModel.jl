@@ -100,12 +100,34 @@ function _gamma_mixture_mean(mixture::GammaMixture)
 end
 
 function _gamma_mixture_variance(mixture::GammaMixture)
-    second_moment = sum(
-        weight * component.shape * (component.shape + 1.0) /
-            component.rate^2
+    mean = _gamma_mixture_mean(mixture)
+    return sum(
+        weight * (
+            component.shape / component.rate / component.rate +
+            (component.shape / component.rate - mean)^2
+        )
         for (weight, component) in zip(mixture.weights, mixture.components)
     )
-    return second_moment - _gamma_mixture_mean(mixture)^2
+end
+
+function _gamma_mixture_quantile(mixture::GammaMixture, probability::Real)
+    probability_value = Float64(probability)
+    isfinite(probability_value) && 0.0 < probability_value < 1.0 ||
+        throw(ArgumentError("Gamma mixture quantile probability must be between 0 and 1"))
+    active = findall(>(0.0), mixture.weights)
+    components = Gamma{Float64}[]
+    for index in active
+        component = mixture.components[index]
+        scale = inv(component.rate)
+        isfinite(scale) && scale > 0.0 ||
+            throw(ArgumentError("Gamma mixture quantiles require finite positive scales"))
+        push!(components, Gamma(component.shape, scale))
+    end
+    distribution = MixtureModel(components, mixture.weights[active])
+    value = quantile(distribution, probability_value)
+    isfinite(value) && value >= 0.0 ||
+        throw(ArgumentError("Gamma mixture quantile must be finite and nonnegative"))
+    return Float64(value)
 end
 
 function _gamma_mixture_home_adjusted(

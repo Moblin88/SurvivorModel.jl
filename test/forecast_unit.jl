@@ -71,6 +71,161 @@ end
 
 @testset "regular-season forecast" begin
     schedule, historical, current = _forecast_fixture()
+    @test !isdefined(SurvivorModel, :GLMakie)
+
+    @testset "league Gamma prior percentile axes" begin
+        offense_prior = GammaParams(1.0, 2.0)
+        defense_prior = GammaParams(1.0, 4.0)
+        reference_prior = HazardPrior(
+            2.0, 1.5, offense_prior, defense_prior,
+            Dict("A" => GammaMixture([1.0], [GammaParams(1.0, 100.0)])),
+            Dict("B" => GammaMixture([1.0], [GammaParams(1.0, 0.01)])),
+            1.0, 1.0, 0.5, 0.5, Int[], nothing, nothing,
+        )
+        raw = DataFrame(
+            team=["A", "B"],
+            offense_rate=[0.5, 0.5],
+            offense_lower=[0.2, 0.2],
+            offense_upper=[0.8, 0.8],
+            defense_rate=[0.5, 0.5],
+            defense_lower=[0.2, 0.2],
+            defense_upper=[0.8, 0.8],
+        )
+        original = copy(raw)
+        mapped = SurvivorModel._team_strength_plot_percentiles(raw, reference_prior)
+        @test raw == original
+        @test mapped.team == raw.team
+        @test mapped.offense_percentile ≈ fill(100.0 * (1 - exp(-1.0)), 2)
+        @test mapped.defense_percentile ≈ fill(100.0 * (1 - exp(-2.0)), 2)
+        @test mapped.offense_lower_percentile ≈ fill(100.0 * (1 - exp(-0.4)), 2)
+        @test mapped.offense_upper_percentile ≈ fill(100.0 * (1 - exp(-1.6)), 2)
+        @test mapped.defense_lower_percentile ≈ fill(100.0 * (1 - exp(-0.8)), 2)
+        @test mapped.defense_upper_percentile ≈ fill(100.0 * (1 - exp(-3.2)), 2)
+        @test mapped.offense_percentile[1] == mapped.offense_percentile[2]
+        @test mapped.defense_percentile[1] == mapped.defense_percentile[2]
+        @test SurvivorModel._team_strength_prior_percentile(
+            offense_prior, -log1p(-0.25) / 2.0,
+        ) ≈ 25.0
+        @test SurvivorModel._team_strength_prior_percentile(offense_prior, 0.0) == 0.0
+        @test SurvivorModel._team_strength_prior_percentile(offense_prior, 1e308) == 100.0
+        for invalid in (-1.0, NaN, Inf)
+            @test_throws ArgumentError SurvivorModel._team_strength_prior_percentile(
+                offense_prior, invalid,
+            )
+        end
+        @test_throws ArgumentError SurvivorModel._team_strength_prior_percentile(
+            GammaParams(1.0, 1e-320), 1.0,
+        )
+        raw.offense_lower[1] = 1.0
+        @test_throws ArgumentError SurvivorModel._team_strength_plot_percentiles(
+            raw, reference_prior,
+        )
+    end
+
+    @testset "week-specific team-strength plot data" begin
+        plot_schedule = copy(schedule)
+        push!(
+            plot_schedule,
+            (
+                game_id="2023_04_BYE1_BYE2",
+                season=2023,
+                game_type="REG",
+                week=4,
+                gameday=Date(2023, 10, 1),
+                away_team="BYE1",
+                home_team="BYE2",
+                away_score=missing,
+                home_score=missing,
+                result=missing,
+            ),
+        )
+        prior_context = fit_regular_season_forecast(
+            2023;
+            as_of_week=1,
+            schedule=plot_schedule,
+            historical_drives=historical,
+            current_drives=current,
+        )
+        week_two_context = fit_regular_season_forecast(
+            2023;
+            as_of_week=2,
+            schedule=plot_schedule,
+            historical_drives=historical,
+            current_drives=current,
+            prior=prior_context.model.prior,
+        )
+        week_three_context = fit_regular_season_forecast(
+            2023;
+            as_of_week=3,
+            schedule=plot_schedule,
+            historical_drives=historical,
+            current_drives=current,
+            prior=prior_context.model.prior,
+        )
+        prior_data = SurvivorModel._team_strength_plot_data(prior_context)
+        week_two_data = SurvivorModel._team_strength_plot_data(week_two_context)
+        week_three_data =
+            SurvivorModel._team_strength_plot_data(week_three_context)
+        @test prior_data.team == ["AWAY", "BYE1", "BYE2", "HOME"]
+        @test week_two_data.team == prior_data.team
+        @test week_three_data.team == prior_data.team
+        @test get(week_two_context.model.stats.defensive.counts, "AWAY", 0) == 0
+        @test get(week_three_context.model.stats.defensive.counts, "AWAY", 0) == 1
+        for (context, data) in (
+            (prior_context, prior_data),
+            (week_two_context, week_two_data),
+            (week_three_context, week_three_data),
+        )
+            for row in eachrow(data)
+                offense = hazard_posterior(context.model, :td, row.team)
+                defense =
+                    hazard_posterior(context.model, :defensive, row.team)
+                @test row.offense_rate ≈
+                    SurvivorModel._gamma_mixture_mean(offense)
+                @test row.offense_lower ≈
+                    SurvivorModel._gamma_mixture_quantile(offense, 0.1)
+                @test row.offense_upper ≈
+                    SurvivorModel._gamma_mixture_quantile(offense, 0.9)
+                @test row.defense_rate ≈
+                    SurvivorModel._gamma_mixture_mean(defense)
+                @test row.defense_lower ≈
+                    SurvivorModel._gamma_mixture_quantile(defense, 0.1)
+                @test row.defense_upper ≈
+                    SurvivorModel._gamma_mixture_quantile(defense, 0.9)
+                @test 0.0 <= row.offense_lower <= row.offense_upper
+                @test 0.0 <= row.defense_lower <= row.defense_upper
+            end
+        end
+        @test week_three_data.defense_rate != week_two_data.defense_rate
+        @test !isdefined(SurvivorModel, :GLMakie)
+
+        invalid_context = fit_regular_season_forecast(
+            2023;
+            as_of_week=1,
+            schedule=plot_schedule,
+            historical_drives=historical,
+            current_drives=current,
+            prior=prior_context.model.prior,
+        )
+        invalid_context.model.prior = HazardPrior(
+            2.0,
+            1.5,
+            GammaParams(1.0, 1e-308),
+            GammaParams(1.0, 1e-308),
+            Dict{String,GammaMixture}(),
+            Dict{String,GammaMixture}(),
+            1.0,
+            1.0,
+            0.5,
+            0.5,
+            Int[],
+            nothing,
+            nothing,
+        )
+        @test_throws ArgumentError SurvivorModel._team_strength_plot_data(
+            invalid_context,
+        )
+    end
 
     @testset "schedule normalization" begin
         normalized = load_schedule(schedule)

@@ -187,6 +187,75 @@ end
         mean_log, variance_log = SurvivorModel._gamma_mixture_log_moments(mixture)
         @test isfinite(mean_log)
         @test variance_log > 0.0
+        rate_mixture = GammaMixture(
+            [0.25, 0.75],
+            [GammaParams(1.0, 1.0), GammaParams(4.0, 2.0)],
+        )
+        @test SurvivorModel._gamma_mixture_mean(rate_mixture) ≈ 1.75
+        @test SurvivorModel._gamma_mixture_variance(rate_mixture) ≈ 1.1875
+        concentrated = GammaMixture(
+            [1.0],
+            [GammaParams(1e150, 1e150)],
+        )
+        @test SurvivorModel._gamma_mixture_variance(concentrated) ≈
+            1e-150 rtol=1e-12
+        very_concentrated = GammaMixture(
+            [1.0],
+            [GammaParams(1e308, 1e308)],
+        )
+        @test SurvivorModel._gamma_mixture_variance(very_concentrated) ≈
+            1e-308 rtol=1e-12
+        underflow_variance = GammaMixture(
+            [1.0],
+            [GammaParams(1e-100, 1e200)],
+        )
+        @test SurvivorModel._gamma_mixture_variance(underflow_variance) == 0.0
+
+        @testset "central Gamma-mixture intervals" begin
+            exponential = GammaMixture([1.0], [GammaParams(1.0, 4.0)])
+            for probability in (0.1, 0.9)
+                @test SurvivorModel._gamma_mixture_quantile(
+                    exponential,
+                    probability,
+                ) ≈ -log1p(-probability) / 4.0
+            end
+            separated = GammaMixture(
+                [0.4, 0.6],
+                [GammaParams(2.0, 4.0), GammaParams(6.0, 0.5)],
+            )
+            lower = SurvivorModel._gamma_mixture_quantile(separated, 0.1)
+            upper = SurvivorModel._gamma_mixture_quantile(separated, 0.9)
+            mixture_cdf = value -> sum(
+                weight * cdf(Gamma(component.shape, inv(component.rate)), value)
+                for (weight, component) in zip(separated.weights, separated.components)
+            )
+            @test lower < upper
+            @test mixture_cdf(lower) ≈ 0.1 atol=1e-10
+            @test mixture_cdf(upper) ≈ 0.9 atol=1e-10
+            @test mixture_cdf(upper) - mixture_cdf(lower) ≈ 0.8 atol=1e-10
+            zero_weight = GammaMixture(
+                [1.0, 0.0],
+                [GammaParams(1.0, 4.0), GammaParams(1.0, 1e-320)],
+            )
+            @test SurvivorModel._gamma_mixture_quantile(zero_weight, 0.9) ≈
+                SurvivorModel._gamma_mixture_quantile(exponential, 0.9)
+            skewed = GammaMixture(
+                [0.95, 0.05],
+                [GammaParams(20.0, 20.0), GammaParams(1.0, 0.001)],
+            )
+            @test SurvivorModel._gamma_mixture_mean(skewed) >
+                SurvivorModel._gamma_mixture_quantile(skewed, 0.9)
+            for probability in (-1.0, 0.0, 1.0, 2.0, NaN, Inf)
+                @test_throws ArgumentError SurvivorModel._gamma_mixture_quantile(
+                    exponential,
+                    probability,
+                )
+            end
+            @test_throws ArgumentError SurvivorModel._gamma_mixture_quantile(
+                GammaMixture([1.0], [GammaParams(1.0, 1e-320)]),
+                0.9,
+            )
+        end
 
         home_mixture = SurvivorModel._gamma_mixture_home_adjusted(mixture, 2.0)
         @test home_mixture.source_seasons == mixture.source_seasons

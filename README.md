@@ -306,6 +306,86 @@ Then run it from any directory:
 survivor --season 2026 < picks.txt
 ```
 
+Use `--plot-strength WEEK` to open a team-strength scatter plot without
+providing picks or running survivor selection:
+
+```sh
+survivor --season 2026 --plot-strength 5
+survivor --season 2026 --plot-strength=5
+```
+
+Week `WEEK` is the start of that week: the posterior includes current-season
+regular-season drives only from earlier weeks, and week 1 uses the historical
+prior alone. Each target-season team appears, including teams on a bye. The
+x-axis shows the neutral-site offensive touchdown rate's percentile in the
+fitted league touchdown Gamma prior; the y-axis uses the defensive-event
+rate's percentile in its separate league Gamma prior. Both axes run from 0%
+to 100%, with higher percentiles indicating stronger rates. Each cause's
+reference distribution is shared across teams, not a team-specific mixture
+or a ranking of the current teams. Points transform the posterior mean rates
+through these prior CDFs.
+
+Bars show the central 80% posterior rate interval, from the 10th to the 90th
+percentile of the full team Gamma mixture, with each endpoint mapped to the
+same league-prior percentile scale. They are not necessarily 10%-90% on the
+plot axes. These intervals describe uncertainty in the team's rate, not a
+prediction interval for a future drive or uncertainty in the fitted league
+hyperparameters. They can be asymmetric, and a sufficiently skewed mixture's
+mean point can lie outside its interval.
+
+Team labels use bold text on opaque light backgrounds. Collision-aware
+placement keeps them clear of one another and the mean markers, with leader
+lines to their points, and updates when the window is resized. Very small
+windows may still crowd labels; enlarge the window if a warning appears.
+
+GLMakie loads only for this option. The command opens a native desktop window
+and stays open until you close it; a working graphical/OpenGL display is
+required. Headless servers and containers cannot use this popup without a
+configured display, and there is no file-output fallback. Cache refreshes can
+be combined with plotting:
+
+```sh
+survivor --refresh-priors --season 2026 --plot-strength 5
+```
+
+Plot mode does not accept pick-selection or model export options such as
+`--ban`, `--branch-and-bound`, or `--write-model`.
+
+Use `--grid` to print a survivor grid to stdout instead of selecting a pick:
+
+```sh
+survivor --season 2026 --grid < picks.txt
+survivor --season 2026 --grid --strikes 3 < picks.txt > grid.txt
+```
+
+The grid has one row per unused target-season team and columns from the
+current week through week 18. Picks on stdin infer the current week and are
+validated just as in a selection run; empty input starts at week 1. Each cell
+shows a left-aligned opponent and right-aligned one-decimal model win
+percentage (`@SF 67.4%` for an away game, `SF 67.4%` for a home game); byes
+are blank. Percentages, decimal points, and the fixed-width star slots align
+within each week, and horizontal rules separate groups of five team rows
+without a trailing rule. Rows are sorted by unrounded current-week win
+probability descending, with current-week byes last and alphabetical
+tie-breaking. All unused teams are shown, including underdogs, without the
+survivor selection market filters.
+
+An aligned `*` marks the top five unused teams independently in each week,
+using that week's unrounded adjusted probabilities and alphabetical ties.
+Byes are excluded, and fewer than five stars appear when fewer than five
+unused teams are scheduled. Stars are weekly probability rankings, not an
+optimized survivor plan.
+
+Every displayed probability includes the posterior Hessian adjustment,
+including later weeks, and is computed from the same start-of-current-week
+posterior. Later games with recorded results remain forecastable for replay;
+future drives and outcomes do not enter the posterior. The grid prints every
+row and week without truncation, does not run optimization or load GLMakie,
+and keeps diagnostics on stderr. `--strikes`, `--refresh-data`, and
+`--refresh-priors` are allowed. Do not combine `--grid` with `--plot-strength`,
+`--ban`, `--branch-and-bound`, `--write-model`, `--timeout`, or
+`--hessian-weeks`: Hessian adjustments are always applied to all grid cells.
+
 Pass `--write-model FILE.lp` to save the main MILP with HiGHS and exit without
 optimizing or printing a pick. For a preseason 2026 model with no prior picks,
 two strikes, an 18-week horizon, and Hessian adjustments for all 18 weeks:

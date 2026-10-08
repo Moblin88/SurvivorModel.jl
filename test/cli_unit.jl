@@ -126,6 +126,8 @@ end
             timeout_seconds=nothing,
             refresh_data=false,
             refresh_priors=false,
+            plot_strength_week=nothing,
+            grid=false,
         )
         @test SurvivorModel._parse_survivor_cli_args(
             ["--season=2023", "--strikes=4"],
@@ -171,6 +173,9 @@ end
         @test occursin("--write-model", usage)
         @test occursin("--hessian-weeks", usage)
         @test occursin("--refresh-priors", usage)
+        @test occursin("--plot-strength WEEK", usage)
+        @test occursin("--grid", usage)
+        @test !occursin("--as-of-week", usage)
         @test !occursin("--objective", usage)
         @test !occursin("--prove-first-pick", usage)
         @test SurvivorModel._parse_survivor_cli_args(
@@ -186,6 +191,93 @@ end
             timeout_seconds=nothing,
             refresh_data=true,
             refresh_priors=false,
+            plot_strength_week=nothing,
+            grid=false,
+        )
+        @test SurvivorModel._parse_survivor_cli_args(
+            ["--season=2023", "--grid"],
+        ).grid
+        @test SurvivorModel._parse_survivor_cli_args(
+            [
+                "--season=2023", "--grid", "--strikes=4",
+                "--refresh-data", "--refresh-priors",
+            ],
+        ).initial_strikes == 4
+        @test !SurvivorModel._parse_survivor_cli_args(["--help", "--grid"]).grid
+        for flags in (
+            ["--grid"],
+            ["--grid", "--refresh-priors"],
+            ["--grid", "--refresh-data"],
+        )
+            @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(flags)
+        end
+        for flags in (
+            ["--grid"],
+            ["--grid=true"],
+            ["true"],
+            ["--plot-strength=5"],
+            ["--ban=KC"],
+            ["--branch-and-bound"],
+            ["--write-model=grid.lp"],
+            ["--hessian-weeks=3"],
+            ["--hessian-weeks=0"],
+            ["--timeout=10"],
+        )
+            @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
+                ["--season=2023"; "--grid"; flags],
+            )
+        end
+        @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
+            ["--season=2023", "--plot-strength=5", "--grid"],
+        )
+        @test SurvivorModel._parse_survivor_cli_args(
+            ["--season=2023", "--plot-strength", "5"],
+        ).plot_strength_week == 5
+        @test SurvivorModel._parse_survivor_cli_args(
+            ["--season=2023", "--plot-strength=18"],
+        ).plot_strength_week == 18
+        @test SurvivorModel._parse_survivor_cli_args(
+            [
+                "--season=2023",
+                "--plot-strength=3",
+                "--refresh-data",
+                "--refresh-priors",
+            ],
+        ).plot_strength_week == 3
+        @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
+            ["--plot-strength", "5"],
+        )
+        @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
+            ["--season=2023", "--plot-strength"],
+        )
+        for invalid_week in ("zero", "0", "19", "-1")
+            @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
+                ["--season=2023", "--plot-strength=$invalid_week"],
+            )
+        end
+        @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
+            ["--season=2023", "--plot-strength=5", "--plot-strength", "6"],
+        )
+        @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
+            ["--season=2023", "--plot-strength=5", "--ban=KC"],
+        )
+        @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
+            ["--season=2023", "--plot-strength=5", "--branch-and-bound"],
+        )
+        @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
+            ["--season=2023", "--plot-strength=5", "--write-model", "out.lp"],
+        )
+        @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
+            ["--season=2023", "--plot-strength=5", "--strikes=2"],
+        )
+        @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
+            ["--season=2023", "--plot-strength=5", "--hessian-weeks=3"],
+        )
+        @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
+            ["--season=2023", "--plot-strength=5", "--timeout=10"],
+        )
+        @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
+            ["--season=2023", "--plot-strength=5", "--as-of-week=5"],
         )
         @test SurvivorModel._parse_survivor_cli_args(
             ["--refresh-priors"],
@@ -672,6 +764,170 @@ end
             @test !isfile(files.drive_2022)
             @test !isfile(files.drive_2023)
             @test isfile(files.unrelated)
+        end
+    end
+
+    @testset "plot-only CLI mode" begin
+        schedule, historical, current = _survivor_context_fixture()
+        input = IOBuffer("this is not a pick\n")
+        output = IOBuffer()
+        contexts = SurvivorModel.RegularSeasonForecastContext[]
+        raw_cache_clears = Ref(0)
+        display_plot = context -> begin
+            push!(contexts, context)
+            return nothing
+        end
+        @test !isdefined(SurvivorModel, :GLMakie)
+        mktempdir() do cache_directory
+            exit_code = withenv(
+                "SURVIVORMODEL_REFRESH_DATA" => "false",
+            ) do
+                SurvivorModel._run_survivor_cli(
+                    [
+                        "--season=2023",
+                        "--plot-strength",
+                        "3",
+                        "--refresh-priors",
+                        "--refresh-data",
+                    ];
+                    input,
+                    output,
+                    schedule,
+                    historical_drives=historical,
+                    current_drives=current,
+                    cache_directory,
+                    through_week=2,
+                    clear_data_cache=() -> (raw_cache_clears[] += 1),
+                    show_team_strength_plot=display_plot,
+                )
+            end
+            @test exit_code == 0
+            @test position(input) == 0
+            @test isempty(String(take!(output)))
+            @test raw_cache_clears[] == 1
+            @test length(contexts) == 1
+            context = only(contexts)
+            @test context.season == 2023
+            @test context.as_of_week == 3
+            @test get(context.model.stats.defensive.counts, "B", 0) == 1
+            @test isfile(
+                SurvivorModel._historical_prior_cache_path(
+                    cache_directory,
+                    2023,
+                    SurvivorModel.DEFAULT_HISTORICAL_SEASONS,
+                    SurvivorModel._dataframe_fingerprint(
+                        SurvivorModel._survivor_cli_historical_drives(
+                            SurvivorModel.load_schedule(schedule),
+                            2023,
+                            historical,
+                        ),
+                    ),
+                ),
+            )
+            @test !isdefined(SurvivorModel, :GLMakie)
+        end
+    end
+
+    @testset "grid-only CLI mode" begin
+        schedule, historical, current = _survivor_context_fixture()
+        mktempdir() do cache_directory
+            stale_prior = joinpath(cache_directory, "historical_prior_v0_stale.jls")
+            write(stale_prior, "cached")
+            raw_cache_clears = Ref(0)
+            for (picks, week, strikes, refresh) in (
+                ("", 1, 2, true),
+                ("A\n", 2, 4, false),
+            )
+                input = IOBuffer(picks)
+                output = IOBuffer()
+                args = ["--season=2023", "--grid", "--strikes=$strikes"]
+                refresh && append!(args, ["--refresh-data", "--refresh-priors"])
+                exit_code = withenv("SURVIVORMODEL_REFRESH_DATA" => "false") do
+                    SurvivorModel._run_survivor_cli(
+                        args;
+                        input,
+                        output,
+                        schedule,
+                        historical_drives=historical,
+                        current_drives=current,
+                        cache_directory,
+                        through_week=1,
+                        clear_data_cache=() -> (raw_cache_clears[] += 1),
+                        show_team_strength_plot=_ -> error("grid opened a plot"),
+                    )
+                end
+                @test exit_code == 0
+                @test eof(input)
+                @test raw_cache_clears[] == 1
+                @test !isfile(stale_prior)
+                @test count(
+                    name -> startswith(name, "historical_prior_"),
+                    readdir(cache_directory),
+                ) == 1
+
+                context = fit_regular_season_forecast(
+                    2023;
+                    as_of_week=week,
+                    schedule,
+                    historical_drives=historical,
+                    current_drives=current,
+                )
+                expected = IOBuffer()
+                grid = SurvivorModel._survivor_grid_data(
+                    context;
+                    picks_made=isempty(picks) ? Dict{Int,String}() : Dict(1 => "A"),
+                )
+                SurvivorModel._write_survivor_grid(expected, grid)
+                text = String(take!(output))
+                @test text == String(take!(expected))
+                @test occursin("start of week $week", text)
+                @test occursin("W18", text)
+                @test occursin("Hessian-adjusted", text)
+                @test length(grid.teams) == (week == 1 ? 4 : 3)
+                @test week == 1 || !("A" in grid.teams)
+                @test !isdefined(SurvivorModel, :GLMakie)
+                @test !any(package -> package.name == "GLMakie", keys(Base.loaded_modules))
+            end
+
+            write(stale_prior, "cached")
+            input = IOBuffer("A\n")
+            output = IOBuffer()
+            @test_throws ArgumentError SurvivorModel._run_survivor_cli(
+                [
+                    "--season=2023", "--grid", "--hessian-weeks=3",
+                    "--refresh-data", "--refresh-priors",
+                ];
+                input,
+                output,
+                cache_directory,
+                schedule_loader=() -> error("invalid grid loaded a schedule"),
+                clear_data_cache=() -> error("invalid grid cleared the raw cache"),
+            )
+            @test position(input) == 0
+            @test isempty(String(take!(output)))
+            @test isfile(stale_prior)
+            @test SurvivorModel._run_survivor_cli(
+                ["--help", "--grid", "--refresh-data", "--refresh-priors"];
+                input,
+                output,
+                cache_directory,
+                schedule_loader=() -> error("help loaded a schedule"),
+                clear_data_cache=() -> error("help cleared the raw cache"),
+            ) == 0
+            @test position(input) == 0
+            @test occursin("--grid", String(take!(output)))
+            @test isfile(stale_prior)
+            @test !isdefined(SurvivorModel, :GLMakie)
+            @test_throws ArgumentError SurvivorModel._run_survivor_cli(
+                ["--season=2023", "--grid", "--strikes=0"];
+                input=IOBuffer("A\n"),
+                output,
+                schedule,
+                historical_drives=historical,
+                current_drives=current,
+                cache_directory,
+            )
+            @test isempty(String(take!(output)))
         end
     end
 

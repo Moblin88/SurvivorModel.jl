@@ -161,6 +161,83 @@ immediate when the table is disabled; stdout remains reserved for the selected
 team abbreviation. Observer events remain available to tests and internal
 callers.
 
+## Team-strength plot
+
+The internal `_team_strength_plot_data` helper derives a sorted row for every
+team in the target-season regular-season schedule from the forecast context.
+The plot uses the neutral-site posterior means of the touchdown and defensive
+event cumulative-hazard coefficients, with central 80% posterior intervals.
+`_gamma_mixture_quantile` computes the 10th and 90th percentiles of the full
+Gamma mixture through Distributions' shape/scale parameterization, ignoring
+zero-weight components. These are posterior rate intervals, not
+future-observation prediction intervals.
+
+`_team_strength_plot_percentiles` preserves the raw data and transforms each
+mean and interval endpoint through the corresponding fitted league Gamma
+CDF, multiplied by 100. The shared references are
+`HazardPrior.td_hyperparameters` and `.defensive_hyperparameters`, using
+`Gamma(shape, inv(rate))`. Do not substitute team-specific mixtures, current
+team ranks, or the posterior expectation of the CDF for the CDF of the mean
+rate. Both axes have fixed initial 0%-100% limits. Saturated CDFs and
+coincident points are valid; do not artificially spread them. Makie range
+bars preserve the transformed endpoints even when a skewed mixture's mean
+lies outside its central interval.
+
+`src/team_strength_labels.jl` separates deterministic pixel-space layout from
+Makie rendering. Native `textlabel!` plots provide bold text, opaque white
+backgrounds, padding, and outlines; measure their background `Poly` bounds
+rather than the parent plot's zero-sized anchor bounds. Placement avoids
+padded label intersections and mean markers, keeps boxes in the viewport,
+and connects box edges to the exact projected means with leader lines. The
+layout observes viewport, camera projection, and camera resolution changes
+through scene-owned callbacks. Crowded tiny viewports retain all labels and
+warn rather than silently hiding teams.
+
+CLI `--plot-strength WEEK` fits the same forecast context as a normal run, but
+uses the start of `WEEK` as its cutoff and returns before reading picks or
+building a survivor optimization. GLMakie is a direct app dependency but is
+imported only by this plot path. It opens a native window and waits until it is
+closed, so an available desktop/OpenGL display is required. The rendering
+smoke test runs under Xvfb with software Mesa in CI; headless operation is not
+silently treated as a successful plot. The display wrapper closes its owned
+screen and empties the figure on completion or failure to release scene
+callbacks. Headless percentile tests are in `test/forecast_unit.jl`, layout
+tests in `test/team_strength_labels_unit.jl`, and native geometry, dense-team,
+resize, and lifecycle coverage in `test/team_strength_plot_rendering.jl`.
+
+## Survivor grid
+
+`--grid` reuses normal stdin pick/strike validation and
+`_survivor_cli_build_forecast_context`, then returns before constructing a
+selection configuration or solver. `_survivor_grid_data` calls
+`forecast_win_probabilities(context; include_completed=true)` once: this path
+already applies `p + 0.5 * trace(H * Sigma)` to every game, with the existing
+finite-value checks and [0,1] clamping. There is no Hessian-week prefix for
+grid probabilities and no hypothetical future posterior update.
+
+Rows contain all unused teams from the full target-season regular-season
+schedule, without market eligibility filters, and columns span the current
+week through week 18. The numeric current-week probability determines
+descending row order before formatting; byes come last and ties are
+alphabetical. Duplicate team/week games are errors.
+`_survivor_grid_top_five` ranks each column's scheduled unused teams by
+unrounded probability and alphabetical ties, returning a row-aligned Boolean
+mask after the current-week row sort. It selects exactly the lesser of five
+and the number of scheduled unused teams; byes never receive a star. These
+independent weekly rankings do not optimize a survivor plan.
+
+`_write_survivor_grid` prints an untruncated plain-text table with separate
+left-aligned opponent, right-aligned six-character percentage, and
+one-character `*` slots. Percentages retain one decimal place, `@` denotes
+away games, and byes are blank. Week headers are centered. The header rule
+also separates groups of five team rows, without a trailing rule. Recorded
+future results are included for replay but do not replace model probabilities.
+
+Grid mode allows strikes and cache-refresh flags, rejects selection/export
+options and `--plot-strength`, and never imports GLMakie. Numerical, sorting,
+formatting, and replay coverage is in `test/survivor_grid_unit.jl`; CLI
+integration coverage remains in `test/cli_unit.jl`.
+
 ## Cache maintenance
 
 Historical prior caches are fingerprinted and refresh automatically when

@@ -14,6 +14,10 @@ function _survivor_cli_usage()
       survivor --refresh-data [--refresh-priors]
       julia --project=. -m SurvivorModel --refresh-priors
       julia --project=. -m SurvivorModel --refresh-data [--refresh-priors]
+      survivor --season YEAR --plot-strength WEEK
+      julia --project=. -m SurvivorModel --season YEAR --plot-strength WEEK
+      survivor --season YEAR --grid [--strikes N] < picks.txt
+      julia --project=. -m SurvivorModel --season YEAR --grid [--strikes N] < picks.txt
 
     Input:
       One team abbreviation per nonblank line, starting with week 1.
@@ -35,6 +39,18 @@ function _survivor_cli_usage()
                           caches and exit.
       --refresh-priors    Clear cached historical prior fits. Without
                           --season, clear the cache and exit.
+      --plot-strength WEEK  Show a plot at the start of WEEK (1-18), using
+                            prior weeks only; no picks or run options, and a
+                            native desktop/OpenGL display is required.
+                            League-prior percentile axes and central 80%
+                            posterior intervals with labeled team points.
+      --grid              Print all unused teams and remaining weeks, with
+                          opponents and Hessian-adjusted win percentages,
+                          sorted by current-week probability; byes are blank.
+                          Stars mark each week's top five unused teams;
+                          horizontal rules group every five team rows.
+                          No selection/export options; --strikes and cache
+                          refresh flags are allowed.
       --help              Show this help.
     """
 end
@@ -77,6 +93,9 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
     refresh_data_specified = false
     refresh_priors = false
     refresh_priors_specified = false
+    plot_strength_week = nothing
+    plot_strength_specified = false
+    grid = false
     show_help = false
     index = 1
 
@@ -97,6 +116,12 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
             branch_and_bound &&
                 throw(ArgumentError("--branch-and-bound may only be specified once"))
             branch_and_bound = true
+            index += 1
+            continue
+        end
+        if argument == "--grid"
+            grid && throw(ArgumentError("--grid may only be specified once"))
+            grid = true
             index += 1
             continue
         end
@@ -123,7 +148,8 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
             argument == "--write-model" ||
             argument == "--strikes" ||
             argument == "--hessian-weeks" ||
-            argument == "--timeout"
+            argument == "--timeout" ||
+            argument == "--plot-strength"
             option = argument
             index += 1
             index <= length(args) ||
@@ -147,6 +173,9 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
         elseif startswith(argument, "--timeout=")
             option = "--timeout"
             value = argument[length("--timeout=") + 1:end]
+        elseif startswith(argument, "--plot-strength=")
+            option = "--plot-strength"
+            value = argument[length("--plot-strength=") + 1:end]
         else
             throw(ArgumentError("unknown option: $argument"))
         end
@@ -188,6 +217,15 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
                 throw(ArgumentError("--timeout may only be specified once"))
             timeout_seconds = _parse_survivor_cli_real(value, option)
             timeout_specified = true
+        elseif option == "--plot-strength"
+            plot_strength_specified &&
+                throw(ArgumentError(
+                    "--plot-strength may only be specified once",
+                ))
+            plot_strength_week = _parse_survivor_cli_integer(value, option)
+            plot_strength_specified = true
+            1 <= plot_strength_week <= 18 ||
+                throw(ArgumentError("--plot-strength must be between 1 and 18"))
         end
         index += 1
     end
@@ -203,7 +241,13 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
         timeout_seconds=nothing,
         refresh_data=false,
         refresh_priors=false,
+        plot_strength_week=nothing,
+        grid=false,
     )
+    plot_strength_specified && season === nothing &&
+        throw(ArgumentError("--plot-strength requires --season"))
+    grid && season === nothing &&
+        throw(ArgumentError("--grid requires --season"))
     if season === nothing
         (refresh_data || refresh_priors) ||
             throw(ArgumentError(
@@ -221,6 +265,31 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
     else
         season > 0 || throw(ArgumentError("--season must be positive"))
     end
+    if plot_strength_specified
+        (
+            grid ||
+            ban_specified ||
+            branch_and_bound ||
+            write_model_specified ||
+            strikes_specified ||
+            hessian_weeks_specified ||
+            timeout_specified
+        ) && throw(ArgumentError(
+            "--plot-strength cannot be combined with --grid, selection, or model-export options",
+        ))
+    end
+    if grid
+        (
+            ban_specified ||
+            branch_and_bound ||
+            write_model_specified ||
+            hessian_weeks_specified ||
+            timeout_specified
+        ) && throw(ArgumentError(
+            "--grid cannot be combined with selection or model-export options; " *
+            "all grid probabilities always include Hessian adjustments",
+        ))
+    end
     initial_strikes >= 0 ||
         throw(ArgumentError("--strikes must be nonnegative"))
     hessian_weeks >= 0 ||
@@ -236,6 +305,8 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
         timeout_seconds=timeout_seconds,
         refresh_data=refresh_data,
         refresh_priors=refresh_priors,
+        plot_strength_week=plot_strength_week,
+        grid=grid,
     )
 end
 
@@ -394,6 +465,60 @@ function _survivor_cli_load_historical_drives(
     return vcat(cached...; cols=:union)
 end
 
+function _survivor_cli_build_forecast_context(
+    season::Integer,
+    as_of_week::Integer,
+    normalized_schedule::AbstractDataFrame,
+    historical_drives,
+    current_drives,
+    cache_directory::Union{Nothing,AbstractString},
+    max_seasons::Int,
+    refresh_data::Bool,
+    log_phase_timing::Function,
+)
+    historical_source = _survivor_cli_load_historical_drives(
+        season,
+        max_seasons,
+        historical_drives,
+        cache_directory;
+        refresh=refresh_data,
+    )
+    historical, current = _load_forecast_drives(
+        season,
+        max_seasons,
+        historical_source,
+        current_drives;
+        allow_missing_current=as_of_week == 1,
+    )
+    log_phase_timing(:drive_data)
+    historical = _survivor_cli_historical_drives(
+        normalized_schedule,
+        season,
+        historical,
+    )
+    current = _regular_season_drives(current, normalized_schedule)
+    cached_prior = _cached_historical_prior(
+        historical;
+        current_season=season,
+        max_seasons=max_seasons,
+        cache_directory=cache_directory,
+    )
+    log_phase_timing(:prior)
+    context = fit_regular_season_forecast(
+        season;
+        as_of_week=as_of_week,
+        schedule=normalized_schedule,
+        historical_drives=historical,
+        current_drives=current,
+        max_seasons=max_seasons,
+        prior=cached_prior.prior,
+        _normalized_schedule=true,
+        _schedule_indexed_drives=true,
+    )
+    log_phase_timing(:fit)
+    return context
+end
+
 function _run_survivor_cli(
     args::AbstractVector{<:AbstractString};
     input::IO=stdin,
@@ -406,6 +531,7 @@ function _run_survivor_cli(
     through_week::Int=18,
     schedule_loader::Function=load_schedule,
     clear_data_cache::Function=NFLData.clear_cache,
+    show_team_strength_plot::Function=_show_team_strength_plot,
 )
     phase_started = time_ns()
     log_phase_timing = function(phase::Symbol)
@@ -445,6 +571,31 @@ function _run_survivor_cli(
     refresh_data = options.refresh_data || _survivor_cli_refresh_data_enabled()
     refresh_data && clear_data_cache()
 
+    if options.plot_strength_week !== nothing
+        normalized_schedule, _ = _survivor_cli_schedule_and_state(
+            schedule,
+            options.season,
+            String[],
+            options.initial_strikes;
+            schedule_loader=schedule_loader,
+            clear_data_cache=clear_data_cache,
+        )
+        log_phase_timing(:schedule)
+        context = _survivor_cli_build_forecast_context(
+            options.season,
+            options.plot_strength_week,
+            normalized_schedule,
+            historical_drives,
+            current_drives,
+            cache_directory,
+            max_seasons,
+            refresh_data,
+            log_phase_timing,
+        )
+        show_team_strength_plot(context)
+        return 0
+    end
+
     picks = _read_survivor_cli_picks(input)
     normalized_schedule, state = _survivor_cli_schedule_and_state(
         schedule,
@@ -456,47 +607,23 @@ function _run_survivor_cli(
     )
     log_phase_timing(:schedule)
     log_phase_timing(:state)
-    historical_source = _survivor_cli_load_historical_drives(
+    context = _survivor_cli_build_forecast_context(
         options.season,
-        max_seasons,
-        historical_drives,
-        cache_directory;
-        refresh=refresh_data,
-    )
-    historical, current = _load_forecast_drives(
-        options.season,
-        max_seasons,
-        historical_source,
-        current_drives,
-        ;
-        allow_missing_current=state.current_week == 1,
-    )
-    log_phase_timing(:drive_data)
-    historical = _survivor_cli_historical_drives(
+        state.current_week,
         normalized_schedule,
-        options.season,
-        historical,
+        historical_drives,
+        current_drives,
+        cache_directory,
+        max_seasons,
+        refresh_data,
+        log_phase_timing,
     )
-    current = _regular_season_drives(current, normalized_schedule)
-    cached_prior = _cached_historical_prior(
-        historical;
-        current_season=options.season,
-        max_seasons=max_seasons,
-        cache_directory=cache_directory,
-    )
-    log_phase_timing(:prior)
-    context = fit_regular_season_forecast(
-        options.season;
-        as_of_week=state.current_week,
-        schedule=normalized_schedule,
-        historical_drives=historical,
-        current_drives=current,
-        max_seasons=max_seasons,
-        prior=cached_prior.prior,
-        _normalized_schedule=true,
-        _schedule_indexed_drives=true,
-    )
-    log_phase_timing(:fit)
+    if options.grid
+        grid = _survivor_grid_data(context; picks_made=state.picks_made)
+        _write_survivor_grid(output, grid)
+        log_phase_timing(:grid)
+        return 0
+    end
     selection_config = SurvivorSelectionConfig(
         through_week=through_week,
         banned_first_pick_teams=options.banned_first_pick_teams,

@@ -7,6 +7,12 @@ include("forecast_unit.jl")
 using GLMakie
 
 schedule, historical, current = _forecast_fixture()
+schedule.away_team = replace.(schedule.away_team, "AWAY" => "KC", "HOME" => "JAX")
+schedule.home_team = replace.(schedule.home_team, "AWAY" => "KC", "HOME" => "JAX")
+historical.posteam = replace.(historical.posteam, "AWAY" => "KC", "HOME" => "JAX")
+historical.defteam = replace.(historical.defteam, "AWAY" => "KC", "HOME" => "JAX")
+current.posteam = replace.(current.posteam, "AWAY" => "KC", "HOME" => "JAX")
+current.defteam = replace.(current.defteam, "AWAY" => "KC", "HOME" => "JAX")
 context = fit_regular_season_forecast(
     2023;
     as_of_week=2,
@@ -24,8 +30,26 @@ figure = SurvivorModel._team_strength_figure(
 axis = figure.content[1]
 plots = axis.scene.plots
 
+function _test_team_strength_plot_colors(axis, teams)
+    colors = GLMakie.Makie.to_color.(
+        SurvivorModel._team_strength_team_colors(teams)
+    )
+    plots = axis.scene.plots
+    @test plots[1].color[] == colors
+    @test plots[2].color[] == colors
+    @test plots[3].color[] == colors
+    labels = filter(plot -> plot isa GLMakie.TextLabel, plots)
+    @test [plot.text[] for plot in labels] == teams
+    @test [plot.text_color[] for plot in labels] == colors
+    @test [plot.strokecolor[] for plot in labels] == colors
+    leaders = only(filter(plot -> plot isa GLMakie.LineSegments, plots))
+    @test leaders.color[] == repeat(colors; inner=2)
+    return colors
+end
+
 @testset "GLMakie team-strength figure" begin
     @test length(plots) == nrow(data) + 4
+    team_colors = _test_team_strength_plot_colors(axis, data.team)
     scatter = plots[1][1][]
     @test length(scatter) == nrow(data)
     @test all(
@@ -52,7 +76,7 @@ plots = axis.scene.plots
     @test [plot.text[] for plot in labels] == data.team
     @test all(plot.fontsize[] >= 17 for plot in labels)
     @test all(plot.background_color[] === :white for plot in labels)
-    @test all(plot.text_color[] === :black for plot in labels)
+    @test [plot.text_color[] for plot in labels] == team_colors
     @test axis.title[] ==
         "Season 2023 team strengths as of start of week 2"
     limits = axis.limits[]
@@ -64,6 +88,18 @@ plots = axis.scene.plots
     @test occursin("league Gamma prior percentiles", figure.content[2].text[])
     @test occursin("league touchdown Gamma prior", axis.xlabel[])
     @test occursin("league defensive-event Gamma prior", axis.ylabel[])
+
+    reordered_data = data[[2, 1], :]
+    reordered_data.team = ["OAK", "SD"]
+    reordered_figure = SurvivorModel._team_strength_figure(
+        GLMakie,
+        reordered_data,
+        context,
+    )
+    _test_team_strength_plot_colors(
+        reordered_figure.content[1],
+        reordered_data.team,
+    )
 end
 
 @testset "plot means can lie outside central intervals" begin
@@ -150,6 +186,10 @@ dense_data = DataFrame(
 dense_figure = SurvivorModel._team_strength_figure(GLMakie, dense_data, context)
 dense_axis = dense_figure.content[1]
 dense_mapped = SurvivorModel._team_strength_plot_percentiles(dense_data, context.model.prior)
+@testset "team colors follow all dense rows" begin
+    colors = _test_team_strength_plot_colors(dense_axis, dense_data.team)
+    @test length(colors) == 32
+end
 
 @testset "dense team labels and resize" begin
     _test_rendered_team_labels(dense_axis, dense_mapped)

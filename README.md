@@ -333,8 +333,11 @@ prediction interval for a future drive or uncertainty in the fitted league
 hyperparameters. They can be asymmetric, and a sufficiently skewed mixture's
 mean point can lie outside its interval.
 
-Team labels use bold text on opaque light backgrounds. Collision-aware
-placement keeps them clear of one another and the mean markers, with leader
+Points, both interval bars, label text and outlines, and leader lines share one
+high-contrast color for each team. Team labels use bold text on opaque white
+backgrounds. Recognized historical abbreviations use their franchise's color;
+unknown abbreviations produce a warning and use neutral gray. Collision-aware
+placement keeps labels clear of one another and the mean markers, with leader
 lines to their points, and updates when the window is resized. Very small
 windows may still crowd labels; enlarge the window if a warning appears.
 

@@ -69,6 +69,58 @@ function _forecast_fixture()
     return schedule, historical, current
 end
 
+function _team_strength_color_contrast_ratio(color::AbstractString)
+    channels = [
+        parse(UInt8, color[index:(index + 1)]; base=16) / 255
+        for index in (2, 4, 6)
+    ]
+    luminance = sum(
+        weight * (channel <= 0.04045 ?
+            channel / 12.92 : ((channel + 0.055) / 1.055)^2.4)
+        for (weight, channel) in zip((0.2126, 0.7152, 0.0722), channels)
+    )
+    return 1.05 / (luminance + 0.05)
+end
+
+@testset "team-strength plot colors" begin
+    teams = [
+        "ARI", "ATL", "BAL", "BUF", "CAR", "CHI", "CIN", "CLE",
+        "DAL", "DEN", "DET", "GB", "HOU", "IND", "JAX", "KC",
+        "LAC", "LAR", "LV", "MIA", "MIN", "NE", "NO", "NYG",
+        "NYJ", "PHI", "PIT", "SEA", "SF", "TB", "TEN", "WAS",
+    ]
+    colors = SurvivorModel._team_strength_team_colors(teams)
+    @test length(colors) == 32
+    @test Set(teams) == Set(keys(SurvivorModel.TEAM_STRENGTH_TEAM_COLOR_HEX))
+    @test colors == [
+        SurvivorModel.TEAM_STRENGTH_TEAM_COLOR_HEX[team] for team in teams
+    ]
+    @test all(color -> startswith(color, "#") && length(color) == 7, colors)
+    @test all(_team_strength_color_contrast_ratio(color) >= 4.5 for color in colors)
+
+    alias_pairs = (
+        "ARZ" => "ARI",
+        "JAC" => "JAX",
+        "LA" => "LAR",
+        "OAK" => "LV",
+        "SD" => "LAC",
+        "STL" => "LAR",
+        "WFT" => "WAS",
+        "WSH" => "WAS",
+    )
+    @test SurvivorModel._team_strength_team_colors(collect(first.(alias_pairs))) ==
+        SurvivorModel._team_strength_team_colors(collect(last.(alias_pairs)))
+    @test SurvivorModel._team_strength_team_colors([" gb ", "GB"]) ==
+        fill(SurvivorModel.TEAM_STRENGTH_TEAM_COLOR_HEX["GB"], 2)
+
+    unknown_colors = @test_logs (:warn, r"unknown team abbreviation") (
+        SurvivorModel._team_strength_team_colors(["xyz", " XYZ "])
+    )
+    @test unknown_colors ==
+        fill(SurvivorModel.TEAM_STRENGTH_UNKNOWN_TEAM_COLOR, 2)
+    @test _team_strength_color_contrast_ratio(first(unknown_colors)) >= 4.5
+end
+
 @testset "regular-season forecast" begin
     schedule, historical, current = _forecast_fixture()
     @test !isdefined(SurvivorModel, :GLMakie)

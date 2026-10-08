@@ -183,6 +183,16 @@ coincident points are valid; do not artificially spread them. Makie range
 bars preserve the transformed endpoints even when a skewed mixture's mean
 lies outside its central interval.
 
+The per-team palette in `src/team_strength_plot.jl` uses dark team-associated
+shades based on published NFL colors, including
+[nflverse's team color data](https://github.com/nflverse/nflverse-pbp/blob/master/teams_colors_logos.csv).
+Each shade has at least 4.5:1 contrast against white. The same row-ordered
+color is used for its point, both range bars, label text and outline, and both
+endpoints of each leader line; label backgrounds remain white. Historical
+aliases resolve to their current franchise colors: ARZ to ARI, JAC to JAX,
+LA and STL to LAR, OAK to LV, SD to LAC, and WFT and WSH to WAS. Unknown
+abbreviations warn and use neutral gray.
+
 `src/team_strength_labels.jl` separates deterministic pixel-space layout from
 Makie rendering. Native `textlabel!` plots provide bold text, opaque white
 backgrounds, padding, and outlines; measure their background `Poly` bounds

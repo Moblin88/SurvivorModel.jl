@@ -120,8 +120,13 @@ function _team_strength_plot_labels!(
     makie::Module,
     axis,
     data::AbstractDataFrame,
+    team_colors::AbstractVector,
 )
-    labels = map(data.team) do team
+    length(team_colors) == nrow(data) ||
+        throw(ArgumentError("team colors and labels must have equal lengths"))
+    labels = map(eachindex(data.team)) do index
+        team = data.team[index]
+        team_color = team_colors[index]
         position = makie.Observable(makie.Point2f(0, 0))
         plot = makie.textlabel!(
             axis.scene,
@@ -131,9 +136,9 @@ function _team_strength_plot_labels!(
             fontsize=17,
             font=:bold,
             padding=5,
-            text_color=:black,
+            text_color=team_color,
             background_color=:white,
-            strokecolor=:gray55,
+            strokecolor=team_color,
             strokewidth=0.7,
             cornerradius=3,
         )
@@ -144,11 +149,12 @@ function _team_strength_plot_labels!(
         return (; position, plot, size)
     end
     segments = makie.Observable(makie.Point2f[])
+    leader_colors = repeat(team_colors; inner=2)
     leader_plot = makie.linesegments!(
         axis.scene,
         segments;
         space=:pixel,
-        color=:gray45,
+        color=leader_colors,
         linewidth=0.9,
         depth_shift=0.001,
     )

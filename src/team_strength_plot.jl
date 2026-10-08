@@ -1,3 +1,71 @@
+const TEAM_STRENGTH_TEAM_COLOR_HEX = Dict(
+    "ARI" => "#97233F",
+    "ATL" => "#91172A",
+    "BAL" => "#241773",
+    "BUF" => "#00338D",
+    "CAR" => "#006A9F",
+    "CHI" => "#0B162A",
+    "CIN" => "#A1360D",
+    "CLE" => "#311D00",
+    "DAL" => "#004C9A",
+    "DEN" => "#A83F0F",
+    "DET" => "#0076B6",
+    "GB" => "#203731",
+    "HOU" => "#03202F",
+    "IND" => "#002C5F",
+    "JAX" => "#006778",
+    "KC" => "#E31837",
+    "LAC" => "#005C94",
+    "LAR" => "#003594",
+    "LV" => "#6B7074",
+    "MIA" => "#005778",
+    "MIN" => "#4F2683",
+    "NE" => "#002244",
+    "NO" => "#6A5834",
+    "NYG" => "#0B2265",
+    "NYJ" => "#003F2D",
+    "PHI" => "#004C54",
+    "PIT" => "#000000",
+    "SEA" => "#345F14",
+    "SF" => "#AA0000",
+    "TB" => "#A71930",
+    "TEN" => "#0C2340",
+    "WAS" => "#5A1414",
+)
+
+const TEAM_STRENGTH_TEAM_COLOR_ALIASES = Dict(
+    "ARZ" => "ARI",
+    "JAC" => "JAX",
+    "LA" => "LAR",
+    "OAK" => "LV",
+    "SD" => "LAC",
+    "STL" => "LAR",
+    "WFT" => "WAS",
+    "WSH" => "WAS",
+)
+
+const TEAM_STRENGTH_UNKNOWN_TEAM_COLOR = "#595959"
+
+function _team_strength_team_colors(teams::AbstractVector{<:AbstractString})
+    colors = Vector{String}(undef, length(teams))
+    unknown_teams = Set{String}()
+    for (index, raw_team) in enumerate(teams)
+        team = uppercase(strip(String(raw_team)))
+        abbreviation = get(TEAM_STRENGTH_TEAM_COLOR_ALIASES, team, team)
+        color = get(TEAM_STRENGTH_TEAM_COLOR_HEX, abbreviation, nothing)
+        if color === nothing
+            colors[index] = TEAM_STRENGTH_UNKNOWN_TEAM_COLOR
+            push!(unknown_teams, team)
+        else
+            colors[index] = color
+        end
+    end
+    for team in sort!(collect(unknown_teams))
+        @warn "unknown team abbreviation in team-strength plot; using neutral gray" team
+    end
+    return colors
+end
+
 """
     _team_strength_plot_data(context)
 
@@ -144,6 +212,9 @@ function _team_strength_figure(
     context::RegularSeasonForecastContext,
 )
     percentiles = _team_strength_plot_percentiles(data, context.model.prior)
+    team_colors = makie.Makie.to_color.(
+        _team_strength_team_colors(percentiles.team)
+    )
     title = "Season $(context.season) team strengths as of start of week " *
         "$(context.as_of_week)"
     figure = makie.Figure(size=(1100, 760), figure_padding=24)
@@ -159,6 +230,7 @@ function _team_strength_figure(
         axis,
         percentiles.offense_percentile,
         percentiles.defense_percentile;
+        color=team_colors,
         markersize=12,
         strokecolor=:white,
         strokewidth=1,
@@ -169,6 +241,7 @@ function _team_strength_figure(
         percentiles.offense_lower_percentile,
         percentiles.offense_upper_percentile;
         direction=:x,
+        color=team_colors,
         whiskerwidth=10,
     )
     makie.rangebars!(
@@ -177,6 +250,7 @@ function _team_strength_figure(
         percentiles.defense_lower_percentile,
         percentiles.defense_upper_percentile;
         direction=:y,
+        color=team_colors,
         whiskerwidth=10,
     )
     makie.xlims!(axis, 0, 100)
@@ -188,7 +262,7 @@ function _team_strength_figure(
         tellwidth=false,
         fontsize=13,
     )
-    _team_strength_plot_labels!(makie, axis, percentiles)
+    _team_strength_plot_labels!(makie, axis, percentiles, team_colors)
     return figure
 end
 

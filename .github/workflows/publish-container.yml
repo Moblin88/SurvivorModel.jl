@@ -33,6 +33,29 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: false
 
+  smoke:
+    name: Run Docker app smoke tests
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build native amd64 image
+        run: docker build --platform linux/amd64 --tag survivormodel-smoke .
+      - name: Verify installed app and BLAS thread overrides
+        run: |
+          docker run --rm survivormodel-smoke --help >/dev/null
+          docker run --rm \
+            --entrypoint julia \
+            survivormodel-smoke \
+            --project=/app /opt/survivormodel/docker/smoke.jl 1
+          docker run --rm \
+            -e JULIA_NUM_THREADS=2 \
+            -e SURVIVORMODEL_BLAS_THREADS=2 \
+            --entrypoint julia \
+            survivormodel-smoke \
+            --project=/app /opt/survivormodel/docker/smoke.jl 2 2
+
   publish:
     name: Publish image to Docker Hub
     if: github.event_name == 'push'

@@ -145,6 +145,22 @@ Conditioned hull totals use outward-rounded `BigFloat` arithmetic. That scoped
 precision/rounding section is protected by a shared reentrant lock; the
 Float64 bound calculations and solver runs remain parallel.
 
+## App startup and BLAS threads
+
+The Pkg app enables Julia startup-file loading, so installed `survivor` apps
+respect the user's `startup.jl`. Regenerate an existing shim with
+`Pkg.Apps.develop(path="...")` or `Pkg.Apps.update("survivor")` to apply this
+setting. The CLI sets the active BLAS backend to one thread by default when it
+starts; `SURVIVORMODEL_BLAS_THREADS=N` overrides that default, while
+backend-native thread environment variables are preserved. Importing
+`SurvivorModel` as a library does not change BLAS state.
+
+Docker images set `JULIA_NUM_THREADS=auto` unless overridden at runtime, and
+load MKL for Intel Linux x86_64 or AOCL for AMD Linux x86_64 before application
+packages. ARM and unknown vendors retain OpenBLAS. Vendor packages and CPU
+detection are Docker-only; the app itself does not select or install a vendor
+backend. Missing or inactive selected Docker backends are startup errors.
+
 The tree accepts a solver upper bound only when a fresh MOI result reports a
 feasible dual and the native HiGHS dual status agrees. For nonoptimal results,
 the current dual-infeasibility and stationarity diagnostics must also pass

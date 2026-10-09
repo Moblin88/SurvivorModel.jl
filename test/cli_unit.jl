@@ -89,6 +89,53 @@ end
     end
 end
 
+@testset "Survivor app BLAS thread defaults" begin
+    blas = SurvivorModel.LinearAlgebra.BLAS
+    original_threads = blas.get_num_threads()
+    config = sprint(show, blas.get_config())
+    try
+        @test SurvivorModel._survivor_blas_thread_count(
+            config, Dict{String,String}(),
+        ) == 1
+        @test SurvivorModel._survivor_blas_thread_count(
+            config, Dict("SURVIVORMODEL_BLAS_THREADS" => "3"),
+        ) == 3
+        @test SurvivorModel._survivor_blas_thread_count(
+            "LBTConfig(libopenblas64_.so)",
+            Dict("OPENBLAS_NUM_THREADS" => "4"),
+        ) === nothing
+        @test SurvivorModel._survivor_blas_thread_count(
+            "LBTConfig(libmkl_rt.so)",
+            Dict("MKL_NUM_THREADS" => "4"),
+        ) === nothing
+        @test SurvivorModel._survivor_blas_thread_count(
+            "LBTConfig(libaocl64.so)",
+            Dict("OMP_NUM_THREADS" => "4,2"),
+        ) === nothing
+        @test_throws ArgumentError SurvivorModel._survivor_blas_thread_count(
+            "LBTConfig(libopenblas64_.so)",
+            Dict("OPENBLAS_NUM_THREADS" => "not-a-number"),
+        )
+        @test_throws ArgumentError SurvivorModel._survivor_blas_thread_count(
+            config, Dict("SURVIVORMODEL_BLAS_THREADS" => "0"),
+        )
+
+        @test SurvivorModel._survivor_configure_blas_threads!(
+            env=Dict{String,String}(),
+        ) == 1
+        @test blas.get_num_threads() == 1
+        @test SurvivorModel._survivor_configure_blas_threads!(
+            env=Dict("SURVIVORMODEL_BLAS_THREADS" => "2"),
+        ) == 2
+        @test blas.get_num_threads() == 2
+        @test_throws ArgumentError SurvivorModel._survivor_configure_blas_threads!(
+            env=Dict("SURVIVORMODEL_BLAS_THREADS" => "invalid"),
+        )
+    finally
+        blas.set_num_threads(original_threads)
+    end
+end
+
 @testset "survivor command-line application" begin
     @testset "argument and stdin parsing" begin
         @test SurvivorModel._parse_survivor_cli_args(

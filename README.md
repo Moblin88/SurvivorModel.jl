@@ -563,6 +563,28 @@ docker build -t survivormodel .
 docker run --rm -i survivormodel --season 2026 < picks.txt
 ```
 
+The app starts Julia with startup-file loading enabled, so it respects
+`~/.julia/config/startup.jl` for both Docker and local Pkg app installs. Existing
+app shims must be regenerated with `Pkg.Apps.develop(path="...")` or
+`Pkg.Apps.update("survivor")` to pick up the startup-file setting.
+
+Every `survivor` app launch defaults the active BLAS backend to one thread; this
+does not change BLAS behavior when `SurvivorModel` is imported as a library.
+Set `SURVIVORMODEL_BLAS_THREADS=N` to choose a positive thread count for the
+active BLAS backend. Otherwise, backend-specific environment settings such as
+`OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`, or `OMP_NUM_THREADS` are preserved.
+The app-specific setting takes precedence when both are provided.
+
+Docker images default Julia's `:default` thread pool to automatic sizing through
+`JULIA_NUM_THREADS=auto`; override it at runtime with `docker run -e
+JULIA_NUM_THREADS=4`. Docker also selects the optimized BLAS backend at startup
+on Linux x86_64: Intel CPUs use MKL and AMD CPUs use AOCL. ARM and unrecognized
+CPU vendors use Julia's bundled OpenBLAS. MKL and AOCL packages are installed
+only in the amd64 image; the ARM image keeps OpenBLAS. A selected Intel/AMD
+backend that cannot load or activate causes startup to fail clearly rather than
+silently falling back. To opt out of startup-file loading, pass Julia's
+`--startup-file=no` before the app argument separator.
+
 GitHub Actions builds the image for pull requests without publishing, then
 publishes multi-platform `linux/amd64` and `linux/arm64` images to Docker Hub
 on pushes to `main` and `v*` tags. Docker selects the image matching the host

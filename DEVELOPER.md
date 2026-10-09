@@ -16,7 +16,7 @@ loss count below the elimination threshold. For each candidate, the model
 evaluates win probability and derivatives at the joint posterior mean using
 the game-level ForwardDiff path. With `hessian_weeks=K`, the objective includes
 posterior-mean probability states for the full horizon and the
-`1/2 * H` correction for the first `K` transitions. The default is three
+`1/2 * H` correction for the first `K` transitions. The default is 18
 weeks; zero is linear-only, and a larger value is clamped to the horizon. A
 full-horizon correction is a second-order approximation
 `F(mu) + 1/2 * trace(H_F(mu) * Sigma)`, not exact posterior integration.
@@ -87,6 +87,11 @@ objective.
 The default is an external branch-and-bound tree that certifies the current
 first pick. Set `SurvivorSelectionConfig(branch_and_bound=false)` or pass
 `--no-branch-and-bound` to select the extensive-form MILP instead.
+Tests that assert a globally optimal complete schedule explicitly select the
+extensive-form MILP: the tree certifies only the first pick and may return a
+feasible but suboptimal suffix. Tree tests instead compare the selected
+first-pick region with exhaustive per-region optima and exactly evaluate the
+returned witness.
 `_build_survivor_full_model` and the normal extensive-form solve share the
 scalar recurrence builder; branch-and-bound does not duplicate probability,
 gradient, projected-gradient, or Hessian recurrences. The model contains all
@@ -266,7 +271,10 @@ closed, so an available desktop/OpenGL display is required. The rendering
 smoke test runs under Xvfb with software Mesa in CI; headless operation is not
 silently treated as a successful plot. The display wrapper closes its owned
 screen and empties the figure on completion or failure to release scene
-callbacks. Headless percentile tests are in `test/forecast_unit.jl`, layout
+callbacks. The standalone two-thread branch-and-bound CI test also runs under
+Xvfb with software Mesa because GLMakie initialization can occur during
+precompilation even when that test does not render. Headless percentile tests
+are in `test/forecast_unit.jl`, layout
 tests in `test/team_strength_labels_unit.jl`, and native geometry, dense-team,
 resize, and lifecycle coverage in `test/team_strength_plot_rendering.jl`.
 

@@ -92,6 +92,59 @@ function _bnb_independent_objective(indices, inputs, state, config)
     return objective
 end
 
+@testset "Hybrid gradient tree certifies the exhaustive first pick" begin
+    parameter_keys = [(:td, "A"), (:td, "B")]
+    parameters = BNB.SurvivorParameterSystem(
+        parameter_keys,
+        Dict(key => index for (index, key) in enumerate(parameter_keys)),
+        [0.0, 0.0],
+        [0.7, 1.2],
+    )
+    derivatives = [
+        BNB.SurvivorCandidateDerivatives(
+            probability,
+            gradient,
+            hessian_covariance,
+        )
+        for (probability, gradient, hessian_covariance) in (
+            (0.82, [1.0, 1.0], 0.03),
+            (0.71, [1.1, 0.9], -0.02),
+            (0.77, [0.9, 1.2], 0.01),
+            (0.63, [1.2, 1.1], -0.01),
+            (0.88, [0.8, 1.3], 0.02),
+            (0.68, [1.3, 0.8], -0.03),
+        )
+    ]
+    inputs = BNB.SurvivorObjectiveInputs(parameters, derivatives)
+    candidate_positions = [1, 1, 2, 2, 3, 3]
+    candidates = DataFrame(
+        game_id=["w1", "w1", "w2", "w2", "w3", "w3"],
+        week=candidate_positions,
+        team=["A", "B", "C", "D", "E", "F"],
+        opponent=["X", "Y", "U", "V", "W", "Z"],
+        is_home=[true, false, true, false, true, false],
+        win_probability=[derivative.base_probability for derivative in derivatives],
+    )
+    state = SurvivorPoolState(2025, 1; strikes_remaining=2)
+    config = _bnb_config(; branch_and_bound_workers=1)
+    data = BNB._normalize_survivor_candidates(candidates, state, 3)
+    exhaustive = _bnb_exhaustive(data, inputs, state, config)
+    plan = BNB._optimize_survivor_expected_weeks_scalar_milp(
+        data, state, config, inputs,
+    )
+    selected = BNB._survivor_fixed_selected_indices(
+        data, plan.selections, state, 3,
+    )
+
+    @test nrow(plan.selections) == 3
+    @test plan.selections.week == [1, 2, 3]
+    @test length(unique(plan.selections.team)) == 3
+    @test exhaustive[first(selected)] >= maximum(values(exhaustive)) - 5e-6
+    @test plan.objective_value <= exhaustive[first(selected)] + 2e-6
+    @test plan.objective_value ≈
+          _bnb_independent_objective(selected, inputs, state, config) atol=2e-6
+end
+
 function _bnb_numeric_snapshot(tree)
     model = tree.model
     variables = [(BNB.JuMP.lower_bound(v), BNB.JuMP.upper_bound(v))

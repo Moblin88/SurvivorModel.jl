@@ -38,13 +38,15 @@ jobs:
       - uses: julia-actions/cache@v3
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
-      - name: Exercise parallel branch-and-bound workers
-        run: julia --threads=2 --project=. test/survivor_branch_and_bound_unit.jl
-      - name: Install virtual display for GLMakie smoke test
+      - name: Install virtual display for GLMakie-dependent tests
         run: >-
           sudo apt-get update &&
           sudo apt-get install --yes xvfb xauth libgl1-mesa-dri libxrandr2
           libxinerama1 libxcursor1 libxi6
+      - name: Exercise parallel branch-and-bound workers
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1600x1200x24 +extension GLX" julia --threads=2 --project=. test/survivor_branch_and_bound_unit.jl
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
       - name: Test interactive team-strength plot
         run: xvfb-run --auto-servernum --server-args="-screen 0 1600x1200x24 +extension GLX" julia --project=. test/team_strength_plot_rendering.jl
         env:

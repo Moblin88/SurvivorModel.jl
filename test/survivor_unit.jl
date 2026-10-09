@@ -1604,7 +1604,7 @@ end
 
     @testset "HiPO LP solver options" begin
         moi = SurvivorModel.JuMP.MOI
-        config = SurvivorSelectionConfig()
+        config = SurvivorSelectionConfig(branch_and_bound=false)
         lp_optimizer = moi.instantiate(
             SurvivorModel._survivor_optimizer(
                 config;
@@ -1636,15 +1636,19 @@ end
     end
 
     @testset "selection configuration" begin
-        @test SurvivorSelectionConfig().hessian_weeks == 3
+        @test SurvivorSelectionConfig().hessian_weeks == 18
         @test SurvivorSelectionConfig(hessian_weeks=0).hessian_weeks == 0
         @test SurvivorSelectionConfig(hessian_weeks=19).hessian_weeks == 19
-        @test !SurvivorSelectionConfig().branch_and_bound
+        @test SurvivorSelectionConfig().branch_and_bound
+        @test !SurvivorSelectionConfig(branch_and_bound=false).branch_and_bound
         @test SurvivorSelectionConfig(branch_and_bound=true).branch_and_bound
         @test SurvivorSelectionConfig(
             branch_and_bound=true, branch_and_bound_workers=2,
         ).branch_and_bound_workers == 2
         @test SurvivorSelectionConfig().branch_and_bound_workers === nothing
+        @test SurvivorSelectionConfig(
+            branch_and_bound_workers=2,
+        ).branch_and_bound_workers == 2
         @test_throws ArgumentError SurvivorSelectionConfig(
             branch_and_bound=true, branch_and_bound_workers=0,
         )
@@ -1652,7 +1656,7 @@ end
             branch_and_bound=true, branch_and_bound_workers=true,
         )
         @test_throws ArgumentError SurvivorSelectionConfig(
-            branch_and_bound_workers=2,
+            branch_and_bound=false, branch_and_bound_workers=2,
         )
         @test SurvivorModel._survivor_tree_worker_count(
             SurvivorSelectionConfig(

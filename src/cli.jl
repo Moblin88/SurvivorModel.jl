@@ -8,8 +8,8 @@ end
 function _survivor_cli_usage()
     return """
     Usage:
-      survivor --season YEAR [--ban TEAM1,TEAM2] [--branch-and-bound [--branch-and-bound-workers N]] [--write-model FILE.lp] [--strikes N] [--hessian-weeks N] [--timeout SECONDS] < picks.txt
-      julia --project=. -m SurvivorModel --season YEAR [--ban TEAM1,TEAM2] [--branch-and-bound [--branch-and-bound-workers N]] [--write-model FILE.lp] [--strikes N] [--hessian-weeks N] [--timeout SECONDS] < picks.txt
+      survivor --season YEAR [--ban TEAM1,TEAM2] [--branch-and-bound | --no-branch-and-bound] [--branch-and-bound-workers N] [--write-model FILE.lp] [--strikes N] [--hessian-weeks N] [--timeout SECONDS] < picks.txt
+      julia --project=. -m SurvivorModel --season YEAR [--ban TEAM1,TEAM2] [--branch-and-bound | --no-branch-and-bound] [--branch-and-bound-workers N] [--write-model FILE.lp] [--strikes N] [--hessian-weeks N] [--timeout SECONDS] < picks.txt
       survivor --refresh-priors
       survivor --refresh-data [--refresh-priors]
       julia --project=. -m SurvivorModel --refresh-priors
@@ -26,8 +26,10 @@ function _survivor_cli_usage()
     Options:
       --season YEAR       Target season (required unless refreshing caches).
       --ban TEAMS         Comma-separated teams forbidden as the current pick.
-      --branch-and-bound  Full-LP external tree certifying the current pick;
+      --branch-and-bound  Use the full-LP external tree (the default);
                           single-threaded HiPO LPs use Julia worker tasks.
+      --no-branch-and-bound
+                          Use the extensive-form MILP instead of the default tree.
       --branch-and-bound-workers N
                           Maximum tree workers (default: Julia default-pool
                           thread count; capped to available threads).
@@ -35,7 +37,7 @@ function _survivor_cli_usage()
       --write-model FILE.lp  Save the MILP with HiGHS and exit without solving.
       --strikes N         Initial strike count (default: 2).
       --hessian-weeks N  Number of future weeks with Hessian adjustments
-                          for exact-milp (default: 3; 0 is linear-only).
+                          for exact-milp (default: 18; 0 is linear-only).
       --timeout SECONDS  Optimization time limit in seconds (default: unlimited).
       --refresh-data      Clear NFLData's raw cache and refresh summarized
                           historical drive data before running. Without
@@ -86,12 +88,13 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
     strikes_specified = false
     banned_first_pick_teams = String[]
     ban_specified = false
-    branch_and_bound = false
+    branch_and_bound = true
+    branch_and_bound_specified = false
     branch_and_bound_workers = nothing
     branch_and_bound_workers_specified = false
     write_model_file = nothing
     write_model_specified = false
-    hessian_weeks = 3
+    hessian_weeks = 18
     hessian_weeks_specified = false
     timeout_seconds = nothing
     timeout_specified = false
@@ -119,9 +122,19 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
         end
 
         if argument == "--branch-and-bound"
-            branch_and_bound &&
-                throw(ArgumentError("--branch-and-bound may only be specified once"))
+            branch_and_bound_specified && throw(ArgumentError(
+                "branch-and-bound mode may only be specified once",
+            ))
             branch_and_bound = true
+            branch_and_bound_specified = true
+            index += 1
+            continue
+        elseif argument == "--no-branch-and-bound"
+            branch_and_bound_specified && throw(ArgumentError(
+                "branch-and-bound mode may only be specified once",
+            ))
+            branch_and_bound = false
+            branch_and_bound_specified = true
             index += 1
             continue
         end
@@ -255,8 +268,8 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
         initial_strikes=2,
         banned_first_pick_teams=String[],
         write_model_file=nothing,
-        hessian_weeks=3,
-        branch_and_bound=false,
+        hessian_weeks=18,
+        branch_and_bound=true,
         branch_and_bound_workers=nothing,
         timeout_seconds=nothing,
         refresh_data=false,
@@ -276,7 +289,7 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
             ))
         (
             ban_specified ||
-            branch_and_bound ||
+            branch_and_bound_specified ||
             branch_and_bound_workers_specified ||
             write_model_specified ||
             strikes_specified ||
@@ -287,7 +300,9 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
         season > 0 || throw(ArgumentError("--season must be positive"))
     end
     branch_and_bound_workers_specified && !branch_and_bound &&
-        throw(ArgumentError("--branch-and-bound-workers requires --branch-and-bound"))
+        throw(ArgumentError(
+            "--branch-and-bound-workers cannot be used with --no-branch-and-bound",
+        ))
     branch_and_bound_workers_specified && write_model_specified &&
         throw(ArgumentError(
             "--branch-and-bound-workers cannot be combined with --write-model",
@@ -296,7 +311,7 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
         (
             grid ||
             ban_specified ||
-            branch_and_bound ||
+            branch_and_bound_specified ||
             branch_and_bound_workers_specified ||
             write_model_specified ||
             strikes_specified ||
@@ -309,7 +324,7 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
     if grid
         (
             ban_specified ||
-            branch_and_bound ||
+            branch_and_bound_specified ||
             branch_and_bound_workers_specified ||
             write_model_specified ||
             hessian_weeks_specified ||

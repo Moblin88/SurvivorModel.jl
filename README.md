@@ -177,16 +177,16 @@ plan.selections
 plan.objective_value
 ```
 
-The default `:exact_milp` optimizer expands each unplayed forecast game into
+The `:exact_milp` formulation expands each unplayed forecast game into
 model-favorite candidates with win probability at least `0.5`, excludes teams
-in `picks_made`, and solves one binary assignment model with JuMP and HiGHS.
+in `picks_made`, and represents the schedule with binary assignment variables.
 It selects exactly one team for every week in the requested horizon and allows
 each team to be selected at most once. The covariance-aware finite-state
 formulation maximizes expected completed weeks before elimination.
 
-The default is the extensive-form MILP. Set
-`branch_and_bound=true` in `SurvivorSelectionConfig` or pass
-`--branch-and-bound` to use an external tree of full-model LP relaxations.
+By default, the formulation is solved using an external tree of full-model LP
+relaxations. Set `branch_and_bound=false` in `SurvivorSelectionConfig` or pass
+`--no-branch-and-bound` to use the extensive-form MILP instead.
 The tree uses one-thread HiPO root and child LP solves, with independent Julia
 worker tasks processing nodes in parallel. Every worker owns a separate copy
 of the full LP; model memory therefore grows with the effective worker count.
@@ -197,8 +197,8 @@ available pool and the number of initial regions. The app leaves Julia's
 thread startup settings unchanged, so `JULIA_NUM_THREADS` is respected:
 
 ```sh
-JULIA_NUM_THREADS=auto survivor --season 2026 --branch-and-bound
-JULIA_NUM_THREADS=4 survivor --season 2026 --branch-and-bound \
+JULIA_NUM_THREADS=auto survivor --season 2026
+JULIA_NUM_THREADS=4 survivor --season 2026 \
   --branch-and-bound-workers 3
 ```
 
@@ -241,7 +241,7 @@ second-order prefix of the expected-weeks objective. With
 
 `sum(P[w] for every planned week) + 1/2 * sum(H[w] for the first K weeks)`.
 
-The default is `hessian_weeks=3`; `0` uses only posterior-mean probability
+The default is `hessian_weeks=18`; `0` uses only posterior-mean probability
 terms, and values beyond the available horizon are clamped to that horizon.
 The linear tail is not a different probability model: it continues the same
 posterior-mean recurrence and omits only the later Hessian corrections. When
@@ -410,15 +410,16 @@ future drives and outcomes do not enter the posterior. The grid prints every
 row and week without truncation, does not run optimization or load GLMakie,
 and keeps diagnostics on stderr. `--strikes`, `--refresh-data`, and
 `--refresh-priors` are allowed. Do not combine `--grid` with `--plot-strength`,
-`--ban`, `--branch-and-bound`, `--write-model`, `--timeout`, or
-`--hessian-weeks`: Hessian adjustments are always applied to all grid cells.
+`--ban`, `--branch-and-bound`, `--no-branch-and-bound`, `--write-model`,
+`--timeout`, or `--hessian-weeks`: Hessian adjustments are always applied to
+all grid cells.
 
 Pass `--write-model FILE.lp` to save the main MILP with HiGHS and exit without
 optimizing or printing a pick. For a preseason 2026 model with no prior picks,
 two strikes, an 18-week horizon, and Hessian adjustments for all 18 weeks:
 
 ```sh
-survivor --season 2026 --hessian-weeks 18 \
+survivor --season 2026 \
   --write-model survivor_2026_full18_hessian18.lp < /dev/null
 ```
 
@@ -429,13 +430,12 @@ without excluding them from later weeks in the plan:
 survivor --season 2026 --ban KC,SF < picks.txt
 ```
 
-Pass `--branch-and-bound` (or set
-`SurvivorSelectionConfig(branch_and_bound=true)`) to use the optional external
-HiPO branch-and-bound tree instead of the default extensive-form MILP:
+Branch-and-bound is the default. Pass `--no-branch-and-bound` or set
+`SurvivorSelectionConfig(branch_and_bound=false)` to use the extensive-form
+MILP instead:
 
 ```sh
-survivor --season 2026 --hessian-weeks 18 --branch-and-bound \
-  --timeout 60 < picks.txt
+survivor --season 2026 --timeout 60 < picks.txt
 ```
 
 The tree solves the full continuous relaxation at the root and partitions all
@@ -543,9 +543,9 @@ schedule validation once.
 
 The weekly planner uses the covariance-aware expected-weeks MILP described
 above. `SurvivorSelectionConfig` controls the market guard, missing-line
-policy, planning horizon, `hessian_weeks`, whether the optional
-`branch_and_bound` tree is selected, and `timeout_seconds`.
-`hessian_weeks` defaults to three, allows zero for posterior-mean probability
+policy, planning horizon, `hessian_weeks`, whether the
+`branch_and_bound` tree is selected (default: true), and `timeout_seconds`.
+`hessian_weeks` defaults to 18, allows zero for posterior-mean probability
 terms only, and is clamped to the available horizon. `timeout_seconds` limits
 the HiGHS solve and defaults to unlimited. The default market policy protects
 the current and following week by requiring a selected team to be favored by

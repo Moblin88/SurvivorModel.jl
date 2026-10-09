@@ -84,8 +84,9 @@ objective.
 
 ## HiPO branch-and-bound
 
-`SurvivorSelectionConfig(branch_and_bound=true)` selects an external tree that
-certifies the current first pick. The default remains the extensive-form MILP.
+The default is an external branch-and-bound tree that certifies the current
+first pick. Set `SurvivorSelectionConfig(branch_and_bound=false)` or pass
+`--no-branch-and-bound` to select the extensive-form MILP instead.
 `_build_survivor_full_model` and the normal extensive-form solve share the
 scalar recurrence builder; branch-and-bound does not duplicate probability,
 gradient, projected-gradient, or Hessian recurrences. The model contains all

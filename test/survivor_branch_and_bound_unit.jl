@@ -1022,7 +1022,8 @@ end
 
 @testset "Retired solver options are rejected" begin
     config = SurvivorSelectionConfig()
-    @test !config.branch_and_bound
+    @test config.branch_and_bound
+    @test config.hessian_weeks == 18
     @test !(:simplex in fieldnames(typeof(config)))
     @test !(:benders_weeks in fieldnames(typeof(config)))
     @test_throws MethodError SurvivorSelectionConfig(simplex=true)

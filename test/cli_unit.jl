@@ -94,6 +94,12 @@ end
         @test SurvivorModel._parse_survivor_cli_args(
             ["--season=2023", "--branch-and-bound", "--hessian-weeks=0"],
         ).branch_and_bound
+        @test !SurvivorModel._parse_survivor_cli_args(
+            ["--season=2023", "--no-branch-and-bound"],
+        ).branch_and_bound
+        @test SurvivorModel._parse_survivor_cli_args(
+            ["--season=2023", "--branch-and-bound-workers=2"],
+        ).branch_and_bound
         @test SurvivorModel._parse_survivor_cli_args(
             [
                 "--season=2023", "--branch-and-bound-workers=2",
@@ -112,7 +118,6 @@ end
             ["--branch-and-bound-workers=-1"],
             ["--branch-and-bound-workers=two"],
             ["--branch-and-bound-workers=2", "--branch-and-bound-workers=3"],
-            ["--branch-and-bound-workers=2"],
         )
             @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
                 ["--season=2023"; flags],
@@ -124,8 +129,20 @@ end
                 "--branch-and-bound-workers=2", "--write-model=tree.lp",
             ],
         )
+        for flags in (
+            ["--branch-and-bound", "--branch-and-bound"],
+            ["--no-branch-and-bound", "--no-branch-and-bound"],
+            ["--branch-and-bound", "--no-branch-and-bound"],
+        )
+            @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
+                ["--season=2023"; flags],
+            )
+        end
         @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
-            ["--season=2023", "--branch-and-bound", "--branch-and-bound"],
+            [
+                "--season=2023", "--no-branch-and-bound",
+                "--branch-and-bound-workers=2",
+            ],
         )
         for flags in (
             ["--simplex"],
@@ -151,8 +168,8 @@ end
             initial_strikes=2,
             banned_first_pick_teams=String[],
             write_model_file=nothing,
-            hessian_weeks=3,
-            branch_and_bound=false,
+            hessian_weeks=18,
+            branch_and_bound=true,
             branch_and_bound_workers=nothing,
             timeout_seconds=nothing,
             refresh_data=false,
@@ -187,6 +204,18 @@ end
         @test SurvivorModel._parse_survivor_cli_args(
             ["--season=2023", "--hessian-weeks=6"],
         ).hessian_weeks == 6
+        @test SurvivorModel._parse_survivor_cli_args(
+            ["--season=2023", "--plot-strength=5"],
+        ).plot_strength_week == 5
+        @test SurvivorModel._parse_survivor_cli_args(
+            ["--season=2023", "--grid"],
+        ).grid
+        @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
+            ["--season=2023", "--grid", "--no-branch-and-bound"],
+        )
+        @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
+            ["--season=2023", "--plot-strength=5", "--no-branch-and-bound"],
+        )
         @test SurvivorModel._read_survivor_cli_picks(
             IOBuffer("KC\n\n sf \n"),
         ) == ["KC", "SF"]
@@ -204,6 +233,7 @@ end
         @test occursin("--write-model", usage)
         @test occursin("--hessian-weeks", usage)
         @test occursin("--branch-and-bound-workers", usage)
+        @test occursin("--no-branch-and-bound", usage)
         @test occursin("--refresh-priors", usage)
         @test occursin("--plot-strength WEEK", usage)
         @test occursin("--grid", usage)
@@ -218,8 +248,8 @@ end
             initial_strikes=2,
             banned_first_pick_teams=String[],
             write_model_file=nothing,
-            hessian_weeks=3,
-            branch_and_bound=false,
+            hessian_weeks=18,
+            branch_and_bound=true,
             branch_and_bound_workers=nothing,
             timeout_seconds=nothing,
             refresh_data=true,
@@ -345,6 +375,7 @@ end
         for run_options in (
             ["--ban=KC"],
             ["--branch-and-bound"],
+            ["--no-branch-and-bound"],
             ["--write-model", "survivor.lp"],
             ["--strikes", "2"],
             ["--hessian-weeks", "3"],

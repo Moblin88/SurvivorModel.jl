@@ -37,23 +37,25 @@ end
 """
     SurvivorSelectionConfig(; kwargs...)
 
-Configuration for survivor selection. `:exact_milp` is the default
-covariance-aware expected-weeks formulation. `timeout_seconds` limits solver
-time. At a time limit, the extensive-form solve returns an incumbent if
-available and otherwise reports failure.
-`hessian_weeks` controls how many future weeks receive the covariance-aware
-Hessian adjustment; later weeks retain their posterior-mean probability terms
-only. Survivor optimization always uses HiGHS. `banned_first_pick_teams`
-excludes the listed teams from the current-week pick only; they may still be
-used in later weeks.
-`branch_and_bound=true` instead uses a full-LP external tree to certify the
-first pick within numerical tolerance, not the complete witness schedule.
-Its shared timeout includes model construction and returns an exactly
-evaluated feasible witness with an explicit warning if the first pick remains
-unproven. `branch_and_bound_workers` controls the number of independent tree
-workers; `nothing` uses the available default-pool Julia threads. Each worker
-owns a single-threaded HiPO LP. `hessian_weeks` is independent of tree depth.
-The app honors Julia's `JULIA_NUM_THREADS` environment setting.
+Configuration for survivor selection. `:exact_milp` is the covariance-aware
+expected-weeks formulation. It is solved by a full-LP external
+branch-and-bound tree by default; `branch_and_bound=false` selects the
+extensive-form MILP. `timeout_seconds` limits optimization time. The
+extensive-form solve returns an incumbent at a time limit if available and
+otherwise reports failure.
+`hessian_weeks` defaults to 18 and controls how many future weeks receive the
+covariance-aware Hessian adjustment; later weeks retain their posterior-mean
+probability terms only. Survivor optimization always uses HiGHS.
+`banned_first_pick_teams` excludes the listed teams from the current-week pick
+only; they may still be used in later weeks.
+The branch-and-bound tree certifies the first pick within numerical tolerance,
+not the complete witness schedule. Its shared timeout includes model
+construction and returns an exactly evaluated feasible witness with an
+explicit warning if the first pick remains unproven.
+`branch_and_bound_workers` controls the number of independent tree workers;
+`nothing` uses the available default-pool Julia threads. Each worker owns a
+single-threaded HiPO LP. `hessian_weeks` is independent of tree depth. The app
+honors Julia's `JULIA_NUM_THREADS` environment setting.
 """
 struct SurvivorSelectionConfig
     minimum_favorite_spread::Union{Nothing,Float64}
@@ -74,8 +76,8 @@ function SurvivorSelectionConfig(
     market_guard_weeks::Integer=DEFAULT_SURVIVOR_MARKET_GUARD_WEEKS,
     through_week::Integer=18,
     banned_first_pick_teams::AbstractVector{<:AbstractString}=String[],
-    hessian_weeks::Integer=3,
-    branch_and_bound::Bool=false,
+    hessian_weeks::Integer=18,
+    branch_and_bound::Bool=true,
     timeout_seconds=nothing,
     branch_and_bound_workers::Union{Nothing,Integer}=nothing,
 )

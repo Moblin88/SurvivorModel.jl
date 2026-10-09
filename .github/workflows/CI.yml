@@ -38,6 +38,8 @@ jobs:
       - uses: julia-actions/cache@v3
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
+      - name: Exercise parallel branch-and-bound workers
+        run: julia --threads=2 --project=. test/survivor_branch_and_bound_unit.jl
       - name: Install virtual display for GLMakie smoke test
         run: >-
           sudo apt-get update &&

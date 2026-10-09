@@ -187,11 +187,35 @@ formulation maximizes expected completed weeks before elimination.
 The default is the extensive-form MILP. Set
 `branch_and_bound=true` in `SurvivorSelectionConfig` or pass
 `--branch-and-bound` to use an external tree of full-model LP relaxations.
-The tree uses HiPO with crossover for its root and child solves and certifies
-the current-week pick within numerical tolerance; it does not promise that the
-remaining witness schedule is globally optimal. If only one current-week
-candidate is eligible, that pick is forced and returned with a feasible
-greedy schedule. Both modes use HiGHS and the same covariance-aware
+The tree uses one-thread HiPO root and child LP solves, with independent Julia
+worker tasks processing nodes in parallel. Every worker owns a separate copy
+of the full LP; model memory therefore grows with the effective worker count.
+By default, workers use Julia's available `:default` thread pool. Set
+`branch_and_bound_workers` in `SurvivorSelectionConfig` or pass
+`--branch-and-bound-workers N` to request a maximum; the count is capped to the
+available pool and the number of initial regions. The app leaves Julia's
+thread startup settings unchanged, so `JULIA_NUM_THREADS` is respected:
+
+```sh
+JULIA_NUM_THREADS=auto survivor --season 2026 --branch-and-bound
+JULIA_NUM_THREADS=4 survivor --season 2026 --branch-and-bound \
+  --branch-and-bound-workers 3
+```
+
+HiGHS uses a process-global scheduler. SurvivorModel coordinates its own
+optimizer calls around tree runs, resetting that scheduler before and after
+the tree so one-thread HiPO solves also work after earlier default-thread
+solves. Do not run unrelated direct HiGHS solves concurrently with a tree run.
+
+Without an environment or runtime thread setting, Julia 1.12 may provide only
+one default-pool thread, so the tree remains single-worker. The coordinator
+retains bounds for queued and in-flight nodes and owns incumbent selection,
+branching, and progress output. Concurrent solve completion can change search
+order and the returned feasible witness, but first-pick certification,
+eligibility, and objective semantics are unchanged. The tree does not promise
+that the remaining witness schedule is globally optimal. If only one
+current-week candidate is eligible, that pick is forced and returned with a
+feasible greedy schedule. Both modes use HiGHS and the same covariance-aware
 formulation.
 
 `plan.selections` includes each selected team's win probability, selected-team
@@ -415,14 +439,18 @@ survivor --season 2026 --hessian-weeks 18 --branch-and-bound \
 ```
 
 The tree solves the full continuous relaxation at the root and partitions all
-eligible first-week picks, including candidates with zero LP value. Child LPs
-fix picks and tighten probability, gradient, projected-gradient, and Hessian
-intervals; the existing four product-hull inequalities are updated in place.
-Both root and child solves use HiPO with crossover and automatic presolve.
-Validated solver dual bounds may prune nodes; if a recoverable solve has no
-validated bound, the root uses the formulation-based global interval bound
-and children retain their inherited bounds while branching exhaustively.
-Primal LP values are only optional branching guidance, never upper bounds.
+eligible first-week picks, including candidates with zero LP value. Its root
+and child relaxations use HiPO with one solver thread each, crossover, and
+automatic presolve. Julia worker tasks process independent nodes using
+worker-owned copies of the LP; `--branch-and-bound-workers N` limits the worker
+pool. Set `JULIA_NUM_THREADS` before launching the app to select Julia's thread
+pool; the app does not override that setting. Child LPs fix picks and tighten
+probability, gradient, projected-gradient, and Hessian intervals; the existing
+four product-hull inequalities are updated in place. Validated solver dual
+bounds may prune nodes; if a recoverable solve has no validated bound, the root
+uses the formulation-based global interval bound and children retain their
+inherited bounds while branching exhaustively. Primal LP values are only
+optional branching guidance, never upper bounds.
 The tree certifies the current first pick within a numerical tolerance, not the
 entire witness schedule. Its returned schedule is feasible and independently
 evaluated. A timeout returns the best feasible schedule with an explicit

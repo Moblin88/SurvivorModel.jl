@@ -50,8 +50,10 @@ used in later weeks.
 first pick within numerical tolerance, not the complete witness schedule.
 Its shared timeout includes model construction and returns an exactly
 evaluated feasible witness with an explicit warning if the first pick remains
-unproven. `hessian_weeks` is independent of tree depth. Both root and child
-relaxations use HiPO with crossover.
+unproven. `branch_and_bound_workers` controls the number of independent tree
+workers; `nothing` uses the available default-pool Julia threads. Each worker
+owns a single-threaded HiPO LP. `hessian_weeks` is independent of tree depth.
+The app honors Julia's `JULIA_NUM_THREADS` environment setting.
 """
 struct SurvivorSelectionConfig
     minimum_favorite_spread::Union{Nothing,Float64}
@@ -62,6 +64,7 @@ struct SurvivorSelectionConfig
     hessian_weeks::Int
     branch_and_bound::Bool
     timeout_seconds::Union{Nothing,Float64}
+    branch_and_bound_workers::Union{Nothing,Int}
 end
 
 function SurvivorSelectionConfig(
@@ -74,6 +77,7 @@ function SurvivorSelectionConfig(
     hessian_weeks::Integer=3,
     branch_and_bound::Bool=false,
     timeout_seconds=nothing,
+    branch_and_bound_workers::Union{Nothing,Integer}=nothing,
 )
     normalized_spread = if minimum_favorite_spread === nothing
         nothing
@@ -107,6 +111,23 @@ function SurvivorSelectionConfig(
             ))
         value
     end
+    normalized_branch_and_bound_workers = if branch_and_bound_workers === nothing
+        nothing
+    else
+        branch_and_bound_workers isa Bool && throw(ArgumentError(
+            "branch_and_bound_workers must be nothing or a positive integer",
+        ))
+        branch_and_bound_workers > 0 || throw(ArgumentError(
+            "branch_and_bound_workers must be nothing or a positive integer",
+        ))
+        branch_and_bound_workers <= typemax(Int) || throw(ArgumentError(
+            "branch_and_bound_workers must fit in an Int",
+        ))
+        branch_and_bound || throw(ArgumentError(
+            "branch_and_bound_workers requires branch_and_bound=true",
+        ))
+        Int(branch_and_bound_workers)
+    end
     normalized_banned_first_pick_teams =
         _normalize_survivor_team_abbreviations(
             banned_first_pick_teams,
@@ -121,6 +142,7 @@ function SurvivorSelectionConfig(
         Int(hessian_weeks),
         branch_and_bound,
         normalized_timeout,
+        normalized_branch_and_bound_workers,
     )
 end
 
@@ -140,6 +162,63 @@ function _survivor_debug_logging_enabled()
     )
 end
 
+mutable struct SurvivorHighsSchedulerGate
+    condition::Threads.Condition
+    active_default_solves::Int
+    waiting_tree_solves::Int
+    tree_active::Bool
+end
+
+const SURVIVOR_HIGHS_SCHEDULER_GATE = SurvivorHighsSchedulerGate(
+    Threads.Condition(), 0, 0, false,
+)
+
+function _survivor_with_default_highs_scheduler(f::Function)
+    gate = SURVIVOR_HIGHS_SCHEDULER_GATE
+    lock(gate.condition) do
+        while gate.tree_active || gate.waiting_tree_solves > 0
+            wait(gate.condition)
+        end
+        gate.active_default_solves += 1
+    end
+    try
+        return f()
+    finally
+        lock(gate.condition) do
+            gate.active_default_solves -= 1
+            notify(gate.condition, all=true)
+        end
+    end
+end
+
+function _survivor_with_tree_highs_scheduler(f::Function)
+    gate = SURVIVOR_HIGHS_SCHEDULER_GATE
+    lock(gate.condition) do
+        gate.waiting_tree_solves += 1
+        try
+            while gate.tree_active || gate.active_default_solves > 0
+                wait(gate.condition)
+            end
+            gate.tree_active = true
+        finally
+            gate.waiting_tree_solves -= 1
+        end
+    end
+    try
+        HiGHS.Highs_resetGlobalScheduler(1)
+        return f()
+    finally
+        try
+            HiGHS.Highs_resetGlobalScheduler(1)
+        finally
+            lock(gate.condition) do
+                gate.tree_active = false
+                notify(gate.condition, all=true)
+            end
+        end
+    end
+end
+
 function _survivor_optimizer(
     config::SurvivorSelectionConfig,
     debug_logging::Bool=false,
@@ -147,21 +226,27 @@ function _survivor_optimizer(
     time_limit_seconds=config.timeout_seconds,
     lp_relaxation::Bool=false,
 )
-    attributes = Pair{String,Any}[
-        "parallel" => "on",
-    ]
+    attributes = Pair{String,Any}[]
     if lp_relaxation
+        tree_relaxation = config.branch_and_bound
         append!(
             attributes,
             Pair{String,Any}[
                 "solver" => "hipo",
-                "threads" => 0, # HiGHS selects its automatic thread count.
+                "threads" => tree_relaxation ? 1 : 0,
+                "parallel" => tree_relaxation ? "off" : "on",
                 "run_crossover" => "on",
             ],
         )
     else
-        push!(attributes, "mip_lp_solver" => "hipo")
-        push!(attributes, "run_crossover" => "on")
+        append!(
+            attributes,
+            Pair{String,Any}[
+                "parallel" => "on",
+                "mip_lp_solver" => "hipo",
+                "run_crossover" => "on",
+            ],
+        )
     end
     time_limit_seconds === nothing ||
         push!(attributes, "time_limit" => time_limit_seconds)
@@ -949,7 +1034,9 @@ function _survivor_constant_plan(
         )
         export_lp_only && return lp_export_result
         solve_started_at = time_ns()
-        optimize!(model)
+        _survivor_with_default_highs_scheduler() do
+            optimize!(model)
+        end
         _survivor_log_milp_result(
             model,
             :constant_plan,
@@ -3334,7 +3421,9 @@ function _optimize_survivor_expected_weeks_scalar_milp(
     )
     export_lp_only && return lp_export_result
     solve_started_at = time_ns()
-    optimize!(model)
+    _survivor_with_default_highs_scheduler() do
+        optimize!(model)
+    end
     _survivor_log_milp_result(
         model,
         :exact_milp,

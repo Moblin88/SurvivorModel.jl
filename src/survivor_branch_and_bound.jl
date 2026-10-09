@@ -7,6 +7,100 @@ struct SurvivorBranchNode
     completion_ready::Bool
 end
 
+const SURVIVOR_TREE_BIGFLOAT_LOCK = ReentrantLock()
+
+function _survivor_tree_worker_count(config::SurvivorSelectionConfig)
+    available = Threads.nthreads(:default)
+    requested = something(config.branch_and_bound_workers, available)
+    effective = min(requested, available)
+    if requested > available
+        @debug "survivor branch-and-bound worker request capped to Julia's default thread pool" requested available effective
+    end
+    return effective
+end
+
+function _survivor_tree_configure_lp!(model)
+    for (option, value) in (
+        ("output_flag", false),
+        ("log_to_console", false),
+        ("log_file", ""),
+        ("log_dev_level", 0),
+        ("solver", "hipo"),
+        ("threads", 1),
+        ("parallel", "off"),
+        ("run_crossover", "on"),
+        ("presolve", "choose"),
+    )
+        JuMP.set_optimizer_attribute(model, option, value)
+    end
+    return nothing
+end
+
+function _survivor_tree_mapped_variable(model, index_map, variable)
+    return JuMP.VariableRef(model, index_map[JuMP.index(variable)])
+end
+
+function _survivor_tree_mapped_constraint(model, index_map, constraint)
+    return JuMP.ConstraintRef(
+        model, index_map[JuMP.index(constraint)], JuMP.ScalarShape(),
+    )
+end
+
+function _survivor_tree_mapped_variables(map_variable, values)
+    mapped = Vector{JuMP.VariableRef}(undef, length(values))
+    for (index, variable) in enumerate(values)
+        mapped[index] = map_variable(variable)
+    end
+    return reshape(mapped, size(values))
+end
+
+function _survivor_tree_copy_worker(tree)
+    backend = JuMP.MOI.instantiate(
+        _survivor_optimizer(tree.config, false; lp_relaxation=true),
+    )
+    model = JuMP.direct_model(backend)
+    JuMP.set_silent(model)
+    index_map = JuMP.MOI.copy_to(JuMP.backend(model), JuMP.backend(tree.model))
+    variable(variable_ref) =
+        _survivor_tree_mapped_variable(model, index_map, variable_ref)
+    constraint(constraint_ref) =
+        _survivor_tree_mapped_constraint(model, index_map, constraint_ref)
+
+    model.ext[:survivor_node_hulls] = [
+        (;
+            key=hull.key,
+            index=hull.index,
+            dummy=variable(hull.dummy),
+            selected=variable(hull.selected),
+            lower_row=constraint(hull.lower_row),
+            upper_row=constraint(hull.upper_row),
+            other_upper_row=constraint(hull.other_upper_row),
+            other_lower_row=constraint(hull.other_lower_row),
+        )
+        for hull in tree.model.ext[:survivor_node_hulls]
+    ]
+    _survivor_tree_configure_lp!(model)
+    JuMP.objective_sense(model) == JuMP.MOI.MIN_SENSE ||
+        error("survivor worker model must copy the normalized minimization objective")
+
+    return merge(
+        tree,
+        (;
+            model,
+            selected=_survivor_tree_mapped_variables(variable, tree.selected),
+            probability=_survivor_tree_mapped_variables(variable, tree.probability),
+            parameter_gradient=map(
+                states -> map(variable, states), tree.parameter_gradient,
+            ),
+            gradient=map(
+                states -> states === nothing ? nothing : map(variable, states),
+                tree.gradient,
+            ),
+            hessian=_survivor_tree_mapped_variables(variable, tree.hessian),
+        ),
+    )
+end
+
 function _survivor_tree_plan(tree, indices; expected_objective=nothing)
     length(indices) == tree.number_of_weeks ||
         error("survivor tree witness has the wrong horizon")
@@ -42,17 +136,19 @@ function _survivor_tree_hull_interval(bounds, key, index)
     if kind in (:probability_sum, :adjusted_sum)
         function total(source, side)
             rounding = side == :lower ? RoundDown : RoundUp
-            return setprecision(BigFloat, 128) do
-                setrounding(BigFloat, rounding) do
-                    value = sum(BigFloat, @view(
-                        getproperty(source.candidate_probability, side)[index, :]
-                    ))
-                    if kind == :adjusted_sum
-                        value += BigFloat(0.5) * sum(BigFloat, @view(
-                            getproperty(source.candidate_hessian, side)[index, :]
+            return lock(SURVIVOR_TREE_BIGFLOAT_LOCK) do
+                setprecision(BigFloat, 128) do
+                    setrounding(BigFloat, rounding) do
+                        value = sum(BigFloat, @view(
+                            getproperty(source.candidate_probability, side)[index, :]
                         ))
+                        if kind == :adjusted_sum
+                            value += BigFloat(0.5) * sum(BigFloat, @view(
+                                getproperty(source.candidate_hessian, side)[index, :]
+                            ))
+                        end
+                        Float64(value, rounding)
                     end
-                    Float64(value, rounding)
                 end
             end
         end
@@ -219,6 +315,28 @@ struct SurvivorTreeAssignmentGuidance
     reason::Symbol
 end
 
+struct SurvivorTreeNodeResult
+    worker::Int
+    node::SurvivorBranchNode
+    kind::Symbol
+    status::Union{Nothing,JuMP.MOI.TerminationStatusCode}
+    solver_bound::Union{Nothing,SurvivorTreeDualBound}
+    assignment::Union{Nothing,SurvivorTreeAssignmentGuidance}
+    schedule_indices::Union{Nothing,Vector{Int}}
+    infeasibility_certificate::Bool
+    iterations::Union{Nothing,Int}
+    crossover_iterations::Union{Nothing,Int}
+    seconds::Float64
+    failure::Union{Nothing,Base.CapturedException}
+end
+
+mutable struct SurvivorTreeWorker
+    id::Int
+    tree::Any
+    requests::Channel{SurvivorBranchNode}
+    task::Union{Nothing,Task}
+end
+
 function _survivor_tree_highs_backend(model)
     optimizer = JuMP.backend(model)
     optimizer isa HiGHS.Optimizer ||
@@ -354,6 +472,155 @@ function _survivor_tree_must_stop(status)
         JuMP.MOI.NODE_LIMIT, JuMP.MOI.SOLUTION_LIMIT, JuMP.MOI.NORM_LIMIT,
         JuMP.MOI.OBJECTIVE_LIMIT, JuMP.MOI.OTHER_LIMIT,
     )
+end
+
+function _survivor_tree_node_result(
+    worker,
+    node,
+    kind;
+    status=nothing,
+    solver_bound=nothing,
+    assignment=nothing,
+    schedule_indices=nothing,
+    infeasibility_certificate=false,
+    iterations=nothing,
+    crossover_iterations=nothing,
+    seconds=0.0,
+    failure=nothing,
+)
+    return SurvivorTreeNodeResult(
+        worker, node, kind, status, solver_bound, assignment, schedule_indices,
+        infeasibility_certificate, iterations, crossover_iterations, seconds,
+        failure,
+    )
+end
+
+function _survivor_tree_evaluate_node!(
+    worker,
+    node,
+    remaining_time,
+    optimize_relaxation!,
+)
+    tree = worker.tree
+    model = tree.model
+    started = time_ns()
+    remaining = remaining_time()
+    if remaining !== nothing && remaining <= 0.0
+        return _survivor_tree_node_result(
+            worker.id, node, :timeout;
+            status=JuMP.MOI.TIME_LIMIT,
+            assignment=SurvivorTreeAssignmentGuidance(
+                nothing, nothing, :no_solver_result,
+            ),
+            seconds=(time_ns() - started) / 1.0e9,
+        )
+    end
+    if !_survivor_tree_apply_path!(tree, node.path)
+        return _survivor_tree_node_result(
+            worker.id, node, :structural;
+            seconds=(time_ns() - started) / 1.0e9,
+        )
+    end
+    remaining = remaining_time()
+    if remaining !== nothing && remaining <= 0.0
+        return _survivor_tree_node_result(
+            worker.id, node, :timeout;
+            status=JuMP.MOI.TIME_LIMIT,
+            assignment=SurvivorTreeAssignmentGuidance(
+                nothing, nothing, :no_solver_result,
+            ),
+            seconds=(time_ns() - started) / 1.0e9,
+        )
+    end
+    remaining === nothing ||
+        JuMP.set_time_limit_sec(model, max(1e-9, remaining))
+    solve_started = time_ns()
+    optimize_relaxation!(model)
+    status = JuMP.termination_status(model)
+    expired = remaining_time()
+    status in (JuMP.MOI.NUMERICAL_ERROR, JuMP.MOI.OTHER_ERROR) &&
+        expired !== nothing && expired <= 0.0 &&
+        (status = JuMP.MOI.TIME_LIMIT)
+    iterations = _survivor_barrier_iterations(model)
+    crossover_iterations = _survivor_crossover_iterations(model)
+    seconds = (time_ns() - solve_started) / 1.0e9
+    status == JuMP.MOI.INFEASIBLE && return _survivor_tree_node_result(
+        worker.id, node, :solved;
+        status,
+        infeasibility_certificate=
+            JuMP.dual_status(model) == JuMP.MOI.INFEASIBILITY_CERTIFICATE,
+        iterations,
+        crossover_iterations,
+        seconds,
+    )
+    status == JuMP.MOI.OPTIMAL || _survivor_tree_can_fallback(status) ||
+        _survivor_tree_must_stop(status) ||
+        error("survivor HiPO child LP failed with unexpected status $status")
+    solver_bound = _survivor_tree_solver_upper_bound(model, status)
+    assignment = _survivor_tree_assignment_guidance(tree, node.path)
+    schedule_indices =
+        assignment.indices !== nothing && assignment.week === nothing ?
+        assignment.indices : nothing
+    return _survivor_tree_node_result(
+        worker.id, node, :solved;
+        status,
+        solver_bound,
+        assignment,
+        schedule_indices,
+        iterations,
+        crossover_iterations,
+        seconds,
+    )
+end
+
+function _survivor_tree_worker_loop!(
+    worker,
+    results,
+    remaining_time,
+    optimize_relaxation!,
+    stopping,
+)
+    for node in worker.requests
+        stopping[] && break
+        result = try
+            _survivor_tree_evaluate_node!(
+                worker, node, remaining_time, optimize_relaxation!,
+            )
+        catch error
+            _survivor_tree_node_result(
+                worker.id, node, :failure;
+                seconds=0.0,
+                failure=Base.CapturedException(error, catch_backtrace()),
+            )
+        end
+        put!(results, result)
+        result.kind == :failure && break
+    end
+    return nothing
+end
+
+function _survivor_tree_stop_workers!(workers, results, stopping)
+    stopping[] = true
+    for worker in workers
+        isopen(worker.requests) && close(worker.requests)
+    end
+    for worker in workers
+        worker.task === nothing || wait(worker.task)
+    end
+    stopped_results = SurvivorTreeNodeResult[]
+    while isready(results)
+        push!(stopped_results, take!(results))
+    end
+    return stopped_results
+end
+
+function _survivor_tree_throw_worker_failure(result)
+    result.failure === nothing &&
+        error("survivor worker failure result is missing its exception")
+    throw(ErrorException(
+        "survivor branch-and-bound worker $(result.worker) failed " *
+        "on node $(result.node.id): " * sprint(showerror, result.failure),
+    ))
 end
 
 function _survivor_tree_merge_upper(inherited, solver_upper, feasible_values, context)
@@ -553,6 +820,30 @@ function _optimize_survivor_branch_and_bound!(
     ),
     optimize_relaxation!::Function=JuMP.optimize!,
 )
+    return _survivor_with_tree_highs_scheduler() do
+        _optimize_survivor_branch_and_bound_locked!(
+            tree; observer, remaining_time, optimize_relaxation!,
+        )
+    end
+end
+
+function _optimize_survivor_branch_and_bound_locked!(
+    tree;
+    observer::Function=event -> nothing,
+    remaining_time::Function=() -> _survivor_remaining_time(
+        tree.config, tree.budget_started_at,
+    ),
+    optimize_relaxation!::Function=JuMP.optimize!,
+)
+    worker_count = _survivor_tree_worker_count(tree.config)
+    worker_count > 1 && return _optimize_survivor_branch_and_bound_parallel!(
+        tree;
+        observer,
+        remaining_time,
+        optimize_relaxation!,
+        worker_count,
+    )
+
     model = tree.model
     started = tree.budget_started_at
     incumbent = _survivor_tree_plan(tree, tree.warm_start.selected)
@@ -622,15 +913,7 @@ function _optimize_survivor_branch_and_bound!(
     end
     expired() && return finish(incumbent, false, :build_timeout, initial_upper, 0)
 
-    JuMP.set_optimizer_attribute(model, "output_flag", false)
-    JuMP.set_optimizer_attribute(model, "log_to_console", false)
-    JuMP.set_optimizer_attribute(model, "log_file", "")
-    JuMP.set_optimizer_attribute(model, "log_dev_level", 0)
-    JuMP.set_optimizer_attribute(model, "solver", "hipo")
-    JuMP.set_optimizer_attribute(model, "threads", 0)
-    JuMP.set_optimizer_attribute(model, "parallel", "on")
-    JuMP.set_optimizer_attribute(model, "run_crossover", "on")
-    JuMP.set_optimizer_attribute(model, "presolve", "choose")
+    _survivor_tree_configure_lp!(model)
     if JuMP.objective_sense(model) == JuMP.MOI.MAX_SENSE
         JuMP.set_objective_function(model, -JuMP.objective_function(model))
         JuMP.set_objective_sense(model, JuMP.MOI.MIN_SENSE)
@@ -1013,6 +1296,645 @@ function _optimize_survivor_branch_and_bound!(
                   parents=Dict(id => summary.parent for (id, summary) in summaries),
                   upper=copy(upper)))
     end
+end
+
+function _optimize_survivor_branch_and_bound_parallel!(
+    tree;
+    observer::Function,
+    remaining_time::Function,
+    optimize_relaxation!::Function,
+    worker_count::Int,
+)
+    model = tree.model
+    started = tree.budget_started_at
+    incumbent = _survivor_tree_plan(tree, tree.warm_start.selected)
+    regions = _survivor_tree_candidates(tree, Int[], 1)
+    isempty(regions) && error("survivor tree has no eligible first-pick regions")
+    incumbent_region = tree.warm_start.selected[1]
+    remaining() = remaining_time()
+    expired() = remaining() !== nothing && remaining() <= 0.0
+    initial_upper = _survivor_tree_global_upper_bound(
+        tree.bounds, tree.number_of_weeks, tree.losses_to_elimination,
+        tree.curvature_weeks,
+    )
+    upper = Dict(region => initial_upper for region in regions)
+    summaries = Dict{Int,SurvivorBranchSummary}()
+    queue = SurvivorBranchNode[]
+    active = Dict{Int,SurvivorBranchNode}()
+    nodes = 0
+    debug = _survivor_debug_logging_enabled()
+    table_rows = Ref(0)
+
+    function competing_upper()
+        return maximum(
+            (upper[region] for region in regions if region != incumbent_region);
+            init=-Inf,
+        )
+    end
+
+    function emit_row(node, region, depth, week, node_upper, action, source,
+                      reason, iterations, crossover_iterations, seconds;
+                      queue_size=length(queue) + length(active),
+                      other_upper=competing_upper())
+        debug || return nothing
+        _survivor_tree_emit_progress!(table_rows, (
+            node, region, depth, week, queue_size,
+            only(incumbent.current_pick.team),
+            _survivor_progress_value(incumbent.objective_value),
+            _survivor_progress_value(other_upper),
+            _survivor_progress_value(node_upper), action, source, reason,
+            _survivor_progress_value(iterations),
+            _survivor_progress_value(crossover_iterations),
+            _survivor_progress_value(seconds),
+        ))
+        return nothing
+    end
+
+    function finish(plan, proven, reason, competing, processed_nodes)
+        elapsed = (time_ns() - started) / 1.0e9
+        pending = Int[node.id for node in queue]
+        append!(pending, (node.id for node in values(active)))
+        sort!(pending)
+        observer((; kind=:finish, proven, reason, upper=competing,
+                  nodes=processed_nodes, plan, retained=length(summaries),
+                  pending, root_bounds=copy(upper)))
+        emit_row(
+            "FINAL", only(plan.current_pick.team), "-", "-", competing,
+            proven ? "PROVEN" : "UNPROVEN", "region_upper", string(reason),
+            nothing, nothing, elapsed; other_upper=competing,
+        )
+        if !debug && !proven
+            @warn "survivor branch-and-bound stopped before proving the first pick" first_pick=only(plan.current_pick.team) objective=plan.objective_value competing_upper=competing nodes=processed_nodes elapsed_seconds=elapsed reason
+        end
+        return plan
+    end
+
+    if length(regions) == 1
+        emit_row(
+            "ROOT", String(tree.data.team[only(regions)]), 0, "-", initial_upper,
+            "FORCED", "matching", "forced_first_pick", nothing, nothing, 0.0;
+            queue_size=0, other_upper=-Inf,
+        )
+        return finish(incumbent, true, :forced_first_pick, -Inf, 0)
+    end
+    expired() && return finish(incumbent, false, :build_timeout, initial_upper, 0)
+
+    _survivor_tree_configure_lp!(model)
+    if JuMP.objective_sense(model) == JuMP.MOI.MAX_SENSE
+        JuMP.set_objective_function(model, -JuMP.objective_function(model))
+        JuMP.set_objective_sense(model, JuMP.MOI.MIN_SENSE)
+    end
+
+    function solve_root!()
+        optimize_relaxation!(model)
+        status = JuMP.termination_status(model)
+        return status in (JuMP.MOI.NUMERICAL_ERROR, JuMP.MOI.OTHER_ERROR) && expired() ?
+            JuMP.MOI.TIME_LIMIT : status
+    end
+
+    root_remaining = remaining()
+    root_remaining === nothing ||
+        JuMP.set_time_limit_sec(model, max(1e-9, root_remaining))
+    root_started = time_ns()
+    status = solve_root!()
+    root_seconds = (time_ns() - root_started) / 1.0e9
+    root_iterations = _survivor_barrier_iterations(model)
+    root_crossover_iterations = _survivor_crossover_iterations(model)
+    observer((; kind=:root, status, seconds=root_seconds,
+              barrier_iterations=root_iterations,
+              crossover_iterations=root_crossover_iterations))
+    status == JuMP.MOI.INFEASIBLE &&
+        error("survivor root LP is infeasible despite a feasible schedule")
+    status == JuMP.MOI.OPTIMAL || _survivor_tree_can_fallback(status) ||
+        _survivor_tree_must_stop(status) ||
+        error("survivor root LP failed with unexpected status $status")
+
+    root_result = _survivor_tree_solver_upper_bound(model, status)
+    root_assignment = _survivor_tree_assignment_guidance(tree, Int[])
+    root_upper = _survivor_tree_merge_upper(
+        initial_upper, root_result.upper, (incumbent.objective_value,), "root",
+    )
+    root_source = root_result.upper !== nothing && root_result.upper <= initial_upper ?
+        :solver_dual : :global_interval
+    root_plan = nothing
+    previous_incumbent = incumbent.objective_value
+    if root_assignment.indices !== nothing && root_assignment.week === nothing
+        root_plan = _survivor_tree_plan(tree, root_assignment.indices)
+        root_upper = _survivor_tree_merge_upper(
+            root_upper, nothing, (root_plan.objective_value,), "root",
+        )
+        region = only(index for index in root_assignment.indices
+                      if tree.candidate_positions[index] == 1)
+        incumbent_region, incumbent = _survivor_tree_best(
+            incumbent_region, incumbent, region, root_plan,
+        )
+    end
+    for region in regions
+        upper[region] = root_upper
+    end
+    root_upper + _survivor_tree_tolerance(incumbent.objective_value, root_upper) >=
+        incumbent.objective_value ||
+        error("survivor root bound contradicts the greedy witness")
+    root_reason = _survivor_tree_diagnostic(
+        status, root_result.reason, root_assignment.reason,
+    )
+    emit_row(
+        "ROOT", "all", 0, something(root_assignment.week, "-"), root_upper,
+        "ROOT", string(root_source), root_reason, root_iterations,
+        root_crossover_iterations, root_seconds; queue_size=length(regions),
+    )
+    if root_plan !== nothing && incumbent.objective_value > previous_incumbent
+        emit_row(
+            "ROOT", String(incumbent.current_pick.team), 0, "-",
+            root_plan.objective_value, "INCUMBENT", "root_primal",
+            "validated_assignment", root_iterations, root_crossover_iterations,
+            root_seconds; queue_size=length(regions),
+        )
+    end
+    if !debug && (root_result.upper === nothing || status != JuMP.MOI.OPTIMAL)
+        @warn "survivor HiPO root used a fallback bound or did not solve to optimality" status bound_source=root_source bound_reason=root_result.reason upper=root_upper
+    end
+    root_event_kind = status == JuMP.MOI.OPTIMAL &&
+                      root_result.upper !== nothing ?
+                      :root_optimum : :root_fallback
+    observer((kind=root_event_kind, upper=root_upper,
+              assignment=root_assignment, bound_source=root_source, status))
+
+    if _survivor_tree_must_stop(status) || expired()
+        if incumbent.objective_value >= root_upper -
+           _survivor_tree_tolerance(incumbent.objective_value, root_upper)
+            return finish(incumbent, true, :root_bound_certificate, root_upper, 0)
+        end
+        reason = status == JuMP.MOI.TIME_LIMIT || expired() ?
+            :root_timeout : :root_interrupted
+        return finish(incumbent, false, reason, root_upper, 0)
+    end
+    if incumbent.objective_value >= root_upper -
+       _survivor_tree_tolerance(incumbent.objective_value, root_upper)
+        reason = root_assignment.indices !== nothing && root_assignment.week === nothing ?
+            :integral_root : :root_bound_certificate
+        return finish(incumbent, true, reason, root_upper, 0)
+    end
+
+    queue = [SurvivorBranchNode(
+        id, region, [region], root_upper, -Inf, false,
+    ) for (id, region) in enumerate(regions)]
+    next_id = length(queue)
+    summaries = Dict(
+        node.id => _survivor_tree_summary(0, node.region, node.upper)
+        for node in queue
+    )
+    observer((kind=:partition, nodes=copy(queue)))
+
+    function queue_snapshot!()
+        pending_nodes = [queue; collect(values(active))]
+        sort!(pending_nodes; by=node -> node.id)
+        observer((kind=:queue, nodes=pending_nodes,
+                  active=Dict(worker => node.id for (worker, node) in active),
+                  retained=length(summaries),
+                  parents=Dict(id => summary.parent for (id, summary) in summaries),
+                  upper=copy(upper)))
+        return nothing
+    end
+
+    function emit_node(node, week, bound, action, source, reason,
+                       iterations, crossover_iterations, seconds; worker="-")
+        emit_row(
+            node.id, String(tree.data.team[node.region]), length(node.path),
+            something(week, "-"), bound, action, string(source), reason,
+            iterations, crossover_iterations, seconds;
+            queue_size=length(queue) + length(active),
+        )
+        return nothing
+    end
+
+    function branch_node!(node, bound, assignment, node_status, seconds,
+                          iterations, crossover_iterations, bound_source,
+                          diagnostic, worker)
+        fixed_positions = Set(tree.candidate_positions[node.path])
+        week = assignment.week
+        if week === nothing || week in fixed_positions
+            week = _survivor_tree_fallback_week(tree, node.path)
+        end
+        week === nothing && error("survivor fallback branching has no unfixed week")
+        child_ids = Int[]
+        for index in _survivor_tree_candidates(tree, node.path, week)
+            next_id += 1
+            push!(child_ids, next_id)
+            push!(queue, SurvivorBranchNode(
+                next_id, node.region, [node.path; index], bound, -Inf, false,
+            ))
+        end
+        _survivor_tree_branch!(summaries, upper, node.id, bound, child_ids)
+        observer((; kind=:node_branch, node, week, bound, status=node_status,
+                  bound_source, children=copy(child_ids), worker))
+        emit_node(
+            node, week, bound, "BRANCH", bound_source, diagnostic,
+            iterations, crossover_iterations, seconds; worker,
+        )
+        return nothing
+    end
+
+    worker_count = min(worker_count, length(regions))
+    @debug "starting survivor branch-and-bound workers" requested=tree.config.branch_and_bound_workers available=Threads.nthreads(:default) effective=worker_count
+    workers = SurvivorTreeWorker[]
+    for worker_id in 1:worker_count
+        expired() && break
+        push!(workers, SurvivorTreeWorker(
+            worker_id, _survivor_tree_copy_worker(tree),
+            Channel{SurvivorBranchNode}(1), nothing,
+        ))
+    end
+    if expired() || length(workers) != worker_count
+        return finish(
+            incumbent, false, :worker_initialization_timeout,
+            competing_upper(), 0,
+        )
+    end
+    results = Channel{SurvivorTreeNodeResult}(worker_count)
+    stopping = Threads.Atomic{Bool}(false)
+    for worker in workers
+        worker.task = Threads.@spawn :default _survivor_tree_worker_loop!(
+            worker, results, remaining_time, optimize_relaxation!, stopping,
+        )
+    end
+    idle_workers = collect(1:worker_count)
+    stop_reason = nothing
+    outcome = nothing
+
+    try
+        while outcome === nothing
+            competing = competing_upper()
+            tolerance = _survivor_tree_tolerance(
+                incumbent.objective_value, competing,
+            )
+            if incumbent.objective_value >= competing - tolerance
+                outcome = (incumbent, true, :region_certificate, competing, nodes)
+                break
+            end
+            isempty(queue) && isempty(active) &&
+                error("survivor exhausted tree has inconsistent region certificates")
+            if stop_reason === nothing && expired()
+                stop_reason = :node_timeout
+            end
+
+            if stop_reason === nothing
+                for index in eachindex(queue)
+                    node = queue[index]
+                    node.completion_ready && continue
+                    if expired()
+                        stop_reason = :node_timeout
+                        break
+                    end
+                    if node.upper <= incumbent.objective_value +
+                                     _survivor_tree_tolerance(
+                                         incumbent.objective_value, node.upper,
+                                     )
+                        continue
+                    end
+                    completion_started = time_ns()
+                    completion = _survivor_greedy_selected_indices(
+                        tree.data, tree.state, tree.config, tree.inputs;
+                        fixed_indices=node.path, expired,
+                    )
+                    if completion === nothing && expired()
+                        stop_reason = :node_timeout
+                        break
+                    end
+                    plan = completion === nothing ?
+                        nothing : _survivor_tree_plan(tree, completion)
+                    node = SurvivorBranchNode(
+                        node.id, node.region, node.path, node.upper,
+                        plan === nothing ? -Inf : plan.objective_value, true,
+                    )
+                    queue[index] = node
+                    if plan !== nothing
+                        plan.objective_value <= node.upper +
+                            _survivor_tree_tolerance(
+                                plan.objective_value, node.upper,
+                            ) || error(
+                                "survivor node completion contradicts its inherited upper bound",
+                            )
+                        previous_incumbent = incumbent.objective_value
+                        incumbent_region, incumbent = _survivor_tree_best(
+                            incumbent_region, incumbent, node.region, plan,
+                        )
+                        improved = incumbent.objective_value > previous_incumbent
+                        if improved
+                            emit_row(
+                                node.id, String(tree.data.team[node.region]),
+                                length(node.path), "-", node.upper, "INCUMBENT",
+                                "greedy_completion", "validated_schedule",
+                                nothing, nothing,
+                                (time_ns() - completion_started) / 1.0e9,
+                            )
+                        end
+                        observer((; kind=:node_completion, node, plan, improved))
+                    end
+                    observer((; kind=:node_ranked, node))
+                end
+            end
+
+            competing = competing_upper()
+            tolerance = _survivor_tree_tolerance(
+                incumbent.objective_value, competing,
+            )
+            if incumbent.objective_value >= competing - tolerance
+                outcome = (incumbent, true, :region_certificate, competing, nodes)
+                break
+            end
+            stop_reason === nothing && expired() &&
+                (stop_reason = :node_timeout)
+
+            while stop_reason === nothing &&
+                  !isempty(idle_workers) && !isempty(queue)
+                if expired()
+                    stop_reason = :node_timeout
+                    break
+                end
+                node_index = _survivor_tree_next_node(
+                    queue, incumbent_region, nodes + 1, upper,
+                )
+                node = queue[node_index]
+                deleteat!(queue, node_index)
+                if node.upper <= incumbent.objective_value +
+                                 _survivor_tree_tolerance(
+                                     incumbent.objective_value, node.upper,
+                                 )
+                    _survivor_tree_close!(summaries, upper, node.id, node.upper)
+                    emit_node(
+                        node, nothing, node.upper, "PRUNE", :inherited,
+                        "incumbent_bound", nothing, nothing, 0.0,
+                    )
+                    queue_snapshot!()
+                    continue
+                end
+                node.completion_ready ||
+                    error("survivor selected node has no completion ranking")
+                if length(node.path) == tree.number_of_weeks &&
+                   length(Set(tree.candidate_positions[node.path])) ==
+                   tree.number_of_weeks
+                    exact_started = time_ns()
+                    plan = _survivor_tree_plan(tree, node.path)
+                    node.upper +
+                        _survivor_tree_tolerance(plan.objective_value, node.upper) >=
+                        plan.objective_value ||
+                        error("survivor exact schedule contradicts its inherited upper bound")
+                    previous_incumbent = incumbent.objective_value
+                    incumbent_region, incumbent = _survivor_tree_best(
+                        incumbent_region, incumbent, node.region, plan,
+                    )
+                    if incumbent.objective_value > previous_incumbent
+                        emit_row(
+                            node.id, String(tree.data.team[node.region]),
+                            length(node.path), "-", node.upper, "INCUMBENT",
+                            "exact_schedule", "validated_schedule", nothing,
+                            nothing, (time_ns() - exact_started) / 1.0e9,
+                        )
+                    end
+                    leaf_upper = nextfloat(
+                        plan.objective_value +
+                        1e-8 * max(1.0, abs(plan.objective_value)),
+                    )
+                    _survivor_tree_close!(
+                        summaries, upper, node.id, leaf_upper,
+                    )
+                    nodes += 1
+                    observer((; kind=:node_exact, node, plan, bound=leaf_upper))
+                    queue_snapshot!()
+                    emit_node(
+                        node, nothing, min(node.upper, leaf_upper), "EXACT",
+                        :exact_schedule, "closed", 0, 0,
+                        (time_ns() - exact_started) / 1.0e9,
+                    )
+                    continue
+                end
+
+                worker_id = popfirst!(idle_workers)
+                active[worker_id] = node
+                observer((; kind=:node_start, node, worker=worker_id))
+                put!(workers[worker_id].requests, node)
+            end
+
+            competing = competing_upper()
+            tolerance = _survivor_tree_tolerance(
+                incumbent.objective_value, competing,
+            )
+            if incumbent.objective_value >= competing - tolerance
+                outcome = (incumbent, true, :region_certificate, competing, nodes)
+                break
+            end
+            stop_reason === nothing && expired() &&
+                (stop_reason = :node_timeout)
+            if stop_reason !== nothing && isempty(active)
+                outcome = (incumbent, false, stop_reason, competing, nodes)
+                break
+            end
+            isempty(active) && isempty(queue) &&
+                error("survivor exhausted tree has inconsistent region certificates")
+
+            result = take!(results)
+            get(active, result.worker, nothing) === result.node ||
+                error("survivor worker returned a result for an inactive node")
+            delete!(active, result.worker)
+            if result.failure !== nothing
+                _survivor_tree_throw_worker_failure(result)
+            end
+            push!(idle_workers, result.worker)
+            sort!(idle_workers)
+            node = result.node
+            solve_seconds = result.seconds
+            if result.kind == :structural
+                _survivor_tree_close!(summaries, upper, node.id, -Inf)
+                observer((; kind=:node_structural, node, worker=result.worker))
+                emit_node(
+                    node, nothing, -Inf, "PRUNE", :structural,
+                    "infeasible_path", nothing, nothing, solve_seconds;
+                    worker=result.worker,
+                )
+                queue_snapshot!()
+                continue
+            end
+            result.kind in (:solved, :timeout) ||
+                error("survivor worker returned unknown result kind $(result.kind)")
+            status = something(result.status)
+            if result.kind == :solved
+                nodes += 1
+                observer((; kind=:node_solve, node, status,
+                          seconds=solve_seconds,
+                          iterations=result.iterations,
+                          crossover_iterations=result.crossover_iterations,
+                          worker=result.worker))
+            else
+                observer((; kind=:node_preparation_timeout, node,
+                          worker=result.worker, seconds=solve_seconds))
+            end
+
+            if status == JuMP.MOI.INFEASIBLE
+                matches_incumbent = all(
+                    tree.data.team[index] == only(incumbent.selections.team[
+                        incumbent.selections.week .== tree.data.week[index],
+                    ]) for index in node.path
+                )
+                matches_incumbent &&
+                    error("survivor infeasible LP contradicts a known feasible witness")
+                !isfinite(node.completion_lower_bound) ||
+                    error("survivor infeasible LP contradicts its feasible completion")
+                result.infeasibility_certificate ||
+                    (node.completion_ready && node.completion_lower_bound == -Inf) ||
+                    error("survivor infeasible node has no supported infeasibility certificate")
+                _survivor_tree_close!(summaries, upper, node.id, -Inf)
+                observer((; kind=:node_infeasible, node, status,
+                          worker=result.worker))
+                emit_node(
+                    node, nothing, -Inf, "INFEASIBLE", :certificate,
+                    "infeasibility_proven", result.iterations,
+                    result.crossover_iterations, solve_seconds;
+                    worker=result.worker,
+                )
+                queue_snapshot!()
+                continue
+            end
+            status == JuMP.MOI.OPTIMAL || _survivor_tree_can_fallback(status) ||
+                _survivor_tree_must_stop(status) ||
+                error("survivor child LP failed with unexpected status $status")
+
+            solver_bound = something(
+                result.solver_bound,
+                SurvivorTreeDualBound(nothing, :no_solver_result),
+            )
+            assignment = something(
+                result.assignment,
+                SurvivorTreeAssignmentGuidance(
+                    nothing, nothing, :no_solver_result,
+                ),
+            )
+            if !debug && assignment.indices === nothing &&
+               assignment.reason in (
+                   :nonfinite_pick_values, :pick_value_out_of_bounds,
+                   :fixed_pick_mismatch, :fixed_week_mismatch, :week_not_one_hot,
+                   :team_reused, :ineligible_pick,
+               )
+                @warn "survivor HiPO primal assignment is inconsistent and will not guide the tree" node=node.id status reason=assignment.reason
+            end
+            schedule = result.schedule_indices === nothing ?
+                nothing : _survivor_tree_plan(tree, result.schedule_indices)
+            feasible_values = schedule === nothing ?
+                (node.completion_lower_bound,) :
+                (node.completion_lower_bound, schedule.objective_value)
+            bound = _survivor_tree_merge_upper(
+                node.upper, solver_bound.upper, feasible_values, "node",
+            )
+            bound_source =
+                solver_bound.upper !== nothing && solver_bound.upper <= node.upper ?
+                :solver_dual : :inherited
+            diagnostic = _survivor_tree_diagnostic(
+                status, solver_bound.reason, assignment.reason,
+            )
+            if !debug &&
+               (solver_bound.upper === nothing || status != JuMP.MOI.OPTIMAL)
+                @warn "survivor HiPO node used its inherited bound or stopped before optimality" node=node.id status bound_source bound_reason=solver_bound.reason upper=bound
+            end
+            event_kind = status == JuMP.MOI.OPTIMAL &&
+                         bound_source == :solver_dual &&
+                         (assignment.week !== nothing ||
+                          assignment.indices !== nothing) ?
+                         :node_optimum : :node_fallback
+            observer((; kind=event_kind, node, bound, assignment, status,
+                      bound_source, bound_rejection=solver_bound.reason,
+                      worker=result.worker))
+            known_node_lower = max(
+                node.completion_lower_bound,
+                schedule === nothing ? -Inf : schedule.objective_value,
+            )
+
+            if bound <= incumbent.objective_value +
+                        _survivor_tree_tolerance(incumbent.objective_value, bound)
+                _survivor_tree_close!(summaries, upper, node.id, bound)
+                observer((; kind=:node_pruned, node, bound,
+                          source=bound_source, reason=:incumbent_bound,
+                          worker=result.worker))
+                emit_node(
+                    node, nothing, bound, "PRUNE", bound_source,
+                    string("incumbent_bound/", diagnostic), result.iterations,
+                    result.crossover_iterations, solve_seconds;
+                    worker=result.worker,
+                )
+            elseif isfinite(known_node_lower) &&
+                   bound <= known_node_lower +
+                            _survivor_tree_tolerance(known_node_lower, bound)
+                _survivor_tree_close!(summaries, upper, node.id, bound)
+                observer((; kind=:node_pruned, node, bound,
+                          source=bound_source, reason=:feasible_schedule_bound,
+                          worker=result.worker))
+                emit_node(
+                    node, nothing, bound, "SCHED_CLOSE", bound_source,
+                    string("schedule_bound/", diagnostic), result.iterations,
+                    result.crossover_iterations, solve_seconds;
+                    worker=result.worker,
+                )
+            elseif _survivor_tree_must_stop(status) || expired()
+                bound < node.upper &&
+                    _survivor_tree_tighten!(summaries, upper, node.id, bound)
+                interrupted_node = SurvivorBranchNode(
+                    node.id, node.region, node.path, bound,
+                    node.completion_lower_bound, node.completion_ready,
+                )
+                push!(queue, interrupted_node)
+                competing = competing_upper()
+                tolerance = _survivor_tree_tolerance(
+                    incumbent.objective_value, competing,
+                )
+                if incumbent.objective_value >= competing - tolerance
+                    emit_node(
+                        node, nothing, bound, "PRUNE", bound_source,
+                        "region_certificate", result.iterations,
+                        result.crossover_iterations, solve_seconds;
+                        worker=result.worker,
+                    )
+                    outcome = (
+                        incumbent, true, :region_certificate, competing, nodes,
+                    )
+                else
+                    stop_reason = expired() ? :node_timeout :
+                        (status == JuMP.MOI.TIME_LIMIT ?
+                         :interrupted_node : :solver_interrupted)
+                    emit_node(
+                        node, nothing, bound,
+                        status == JuMP.MOI.TIME_LIMIT || expired() ?
+                        "TIMEOUT" : "STOPPED",
+                        bound_source, diagnostic, result.iterations,
+                        result.crossover_iterations, solve_seconds;
+                        worker=result.worker,
+                    )
+                end
+            else
+                branch_node!(
+                    node, bound, assignment, status, solve_seconds,
+                    result.iterations, result.crossover_iterations,
+                    bound_source, diagnostic, result.worker,
+                )
+            end
+            queue_snapshot!()
+        end
+    catch
+        _survivor_tree_stop_workers!(workers, results, stopping)
+        rethrow()
+    end
+    stopped_results = _survivor_tree_stop_workers!(workers, results, stopping)
+    for result in stopped_results
+        result.failure === nothing || _survivor_tree_throw_worker_failure(result)
+        result.kind == :solved && (nodes += 1)
+    end
+    outcome === nothing &&
+        error("survivor parallel tree stopped without a terminal outcome")
+    outcome = (outcome[1], outcome[2], outcome[3], outcome[4], nodes)
+    observer((; kind=:workers_joined, workers=worker_count,
+              tasks_terminated=all(
+                  worker.task !== nothing && istaskdone(worker.task)
+                  for worker in workers
+              )))
+    return finish(outcome...)
 end
 
 function _build_survivor_full_model(data, state, config, inputs; kwargs...)

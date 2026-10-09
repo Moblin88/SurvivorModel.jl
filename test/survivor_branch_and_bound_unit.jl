@@ -29,12 +29,27 @@ function _bnb_fixture(; current_week=1, repeated=true)
     return data, inputs
 end
 
-function _bnb_config(; through_week=3, hessian_weeks=3, kwargs...)
+function _bnb_config(;
+    through_week=3,
+    hessian_weeks=3,
+    branch_and_bound_workers=1,
+    kwargs...,
+)
     return SurvivorSelectionConfig(
         ;
         minimum_favorite_spread=nothing, market_guard_weeks=0,
-        through_week, hessian_weeks, branch_and_bound=true, kwargs...,
+        through_week, hessian_weeks, branch_and_bound=true,
+        branch_and_bound_workers, kwargs...,
     )
+end
+
+function _bnb_optimize_single_threaded!(model)
+    BNB.HiGHS.Highs_resetGlobalScheduler(1)
+    try
+        return BNB.JuMP.optimize!(model)
+    finally
+        BNB.HiGHS.Highs_resetGlobalScheduler(1)
+    end
 end
 
 function _bnb_exhaustive(data, inputs, state, config)
@@ -218,7 +233,7 @@ end
         )
             BNB.JuMP.set_optimizer_attribute(model, option, value)
         end
-        BNB.JuMP.optimize!(model)
+        _bnb_optimize_single_threaded!(model)
         status = BNB.JuMP.termination_status(model)
         raw_bound = BNB.JuMP.objective_bound(model)
         @test isfinite(raw_bound)
@@ -258,12 +273,243 @@ end
     )
         BNB.JuMP.set_optimizer_attribute(model, option, value)
     end
-    BNB.JuMP.optimize!(model)
+    _bnb_optimize_single_threaded!(model)
     result = BNB._survivor_tree_solver_upper_bound(
         model, BNB.JuMP.termination_status(model),
     )
     @test result.upper ≈ BNB.JuMP.objective_bound(model)
     @test result.upper >= 13
+end
+
+@testset "Tree search isolates the HiGHS scheduler" begin
+    data, inputs = _bnb_fixture()
+    state = SurvivorPoolState(2025, 1; strikes_remaining=2)
+    tree = BNB._build_survivor_full_model(
+        data, state, _bnb_config(; branch_and_bound_workers=2), inputs,
+    )
+
+    function solve_default_model()
+        model = BNB.JuMP.Model(BNB.HiGHS.Optimizer)
+        BNB.JuMP.set_silent(model)
+        BNB.JuMP.@variable(model, selected[1:3], Bin)
+        BNB.JuMP.@constraint(model, sum(selected) <= 2)
+        BNB.JuMP.@objective(model, Max, sum(selected))
+        BNB._survivor_with_default_highs_scheduler() do
+            BNB.JuMP.optimize!(model)
+        end
+        return BNB.JuMP.termination_status(model)
+    end
+
+    @test solve_default_model() == BNB.JuMP.MOI.OPTIMAL
+    events = []
+    plan = BNB._optimize_survivor_branch_and_bound!(
+        tree; observer=event -> push!(events, event),
+    )
+    @test only(plan.current_pick.team) in data.team[data.week .== 1]
+    @test last(events).proven
+    @test solve_default_model() == BNB.JuMP.MOI.OPTIMAL
+end
+
+@testset "Worker HiGHS models own remapped tree references" begin
+    data, inputs = _bnb_fixture()
+    state = SurvivorPoolState(2025, 1; strikes_remaining=2)
+    tree = BNB._build_survivor_full_model(data, state, _bnb_config(), inputs)
+    BNB.JuMP.set_objective_function(tree.model, -BNB.JuMP.objective_function(tree.model))
+    BNB.JuMP.set_objective_sense(tree.model, BNB.JuMP.MOI.MIN_SENSE)
+    original_snapshot = _bnb_numeric_snapshot(tree)
+    worker = BNB._survivor_tree_copy_worker(tree)
+    JuMP = BNB.JuMP
+    @test JuMP.num_variables(worker.model) == JuMP.num_variables(tree.model)
+    @test JuMP.num_constraints(worker.model; count_variable_in_set_constraints=true) ==
+          JuMP.num_constraints(tree.model; count_variable_in_set_constraints=true)
+    @test JuMP.objective_sense(worker.model) == JuMP.MOI.MIN_SENSE
+    @test [JuMP.get_optimizer_attribute(worker.model, option)
+           for option in ("solver", "threads", "parallel", "run_crossover")] ==
+          ["hipo", 1, "off", "on"]
+    for variable in worker.selected
+        @test JuMP.owner_model(variable) === worker.model
+    end
+    for variable in worker.probability
+        @test JuMP.owner_model(variable) === worker.model
+    end
+    for variable in worker.hessian
+        @test JuMP.owner_model(variable) === worker.model
+    end
+    for states in worker.parameter_gradient, variable in states
+        @test JuMP.owner_model(variable) === worker.model
+    end
+    for states in worker.gradient
+        states === nothing && continue
+        for variable in states
+            @test JuMP.owner_model(variable) === worker.model
+        end
+    end
+    for hull in worker.model.ext[:survivor_node_hulls]
+        @test JuMP.owner_model(hull.dummy) === worker.model
+        @test JuMP.owner_model(hull.selected) === worker.model
+        for row in (
+            hull.lower_row, hull.upper_row,
+            hull.other_upper_row, hull.other_lower_row,
+        )
+            @test JuMP.owner_model(row) === worker.model
+        end
+    end
+    @test BNB._survivor_tree_apply_path!(worker, [1])
+    first_path_snapshot = _bnb_numeric_snapshot(worker)
+    @test BNB._survivor_tree_apply_path!(worker, [2])
+    @test BNB._survivor_tree_apply_path!(worker, [1])
+    @test _bnb_numeric_snapshot(worker) == first_path_snapshot
+    @test _bnb_numeric_snapshot(tree) == original_snapshot
+end
+
+@testset "Parallel HiPO tree certifies the exhaustive first pick" begin
+    data, inputs = _bnb_fixture()
+    state = SurvivorPoolState(2025, 1; strikes_remaining=2)
+    config = _bnb_config(; branch_and_bound_workers=2)
+    exhaustive = _bnb_exhaustive(data, inputs, state, config)
+    tree = BNB._build_survivor_full_model(data, state, config, inputs)
+    events = []
+    active = Set{Int}()
+    max_active = Ref(0)
+    function observe(event)
+        push!(events, event)
+        if event.kind == :node_start
+            push!(active, hasproperty(event, :worker) ? event.worker : 1)
+            max_active[] = max(max_active[], length(active))
+        elseif event.kind in (
+            :node_solve, :node_structural, :node_preparation_timeout,
+        )
+            worker = hasproperty(event, :worker) ? event.worker : 1
+            @test worker in active
+            delete!(active, worker)
+        elseif event.kind == :workers_joined
+            @test event.tasks_terminated
+            empty!(active)
+        elseif event.kind == :queue
+            necessary = Set{Int}()
+            for node in event.nodes
+                id = node.id
+                while id != 0
+                    push!(necessary, id)
+                    id = event.parents[id]
+                end
+            end
+            @test Set(keys(event.parents)) == necessary
+            @test event.retained == length(necessary)
+        end
+    end
+    plan = BNB._optimize_survivor_branch_and_bound!(tree; observer=observe)
+    first_index = only(findall((data.week .== 1) .&
+                              (data.team .== only(plan.current_pick.team))))
+    @test exhaustive[first_index] >= maximum(values(exhaustive)) - 5e-6
+    @test plan.objective_value <= exhaustive[first_index] + 2e-6
+    @test last(events).proven
+    @test isempty(active)
+    if Threads.nthreads(:default) >= 2
+        @test max_active[] >= 2
+        tree = BNB._build_survivor_full_model(data, state, config, inputs)
+        calls = Threads.Atomic{Int}(0)
+        barrier = Threads.Condition()
+        arrived = 0
+        entering_solver = 0
+        max_entering_solver = 0
+        function synchronize_worker_solves(model)
+            call = Threads.atomic_add!(calls, 1) + 1
+            call == 1 && return BNB.JuMP.optimize!(model)
+            lock(barrier) do
+                arrived += 1
+                if arrived == 2
+                    notify(barrier, all=true)
+                else
+                    while arrived < 2
+                        wait(barrier)
+                    end
+                end
+                entering_solver += 1
+                max_entering_solver = max(
+                    max_entering_solver, entering_solver,
+                )
+                if entering_solver == 2
+                    notify(barrier, all=true)
+                else
+                    while entering_solver < 2
+                        wait(barrier)
+                    end
+                end
+            end
+            status = BNB.JuMP.optimize!(model)
+            lock(barrier) do
+                entering_solver -= 1
+                notify(barrier, all=true)
+            end
+            return status
+        end
+        parallel_events = []
+        BNB._optimize_survivor_branch_and_bound!(
+            tree;
+            observer=event -> push!(parallel_events, event),
+            optimize_relaxation! = synchronize_worker_solves,
+        )
+        parallel_finish = only(filter(
+            event -> event.kind == :finish, parallel_events,
+        ))
+        @test arrived == 2
+        @test max_entering_solver == 2
+        @test parallel_finish.nodes >= calls[] - 1
+    else
+        @test max_active[] <= 1
+    end
+end
+
+if Threads.nthreads(:default) >= 2
+    @testset "Parallel worker failures and shared timeout shut down cleanly" begin
+        data, inputs = _bnb_fixture()
+        state = SurvivorPoolState(2025, 1; strikes_remaining=2)
+        config = _bnb_config(; branch_and_bound_workers=2)
+
+        tree = BNB._build_survivor_full_model(data, state, config, inputs)
+        calls = Threads.Atomic{Int}(0)
+        function fail_in_worker(model)
+            call = Threads.atomic_add!(calls, 1) + 1
+            call == 1 && return BNB.JuMP.optimize!(model)
+            error("injected worker failure")
+        end
+        failure = try
+            BNB._optimize_survivor_branch_and_bound!(
+                tree; optimize_relaxation! = fail_in_worker,
+            )
+            nothing
+        catch error
+            error
+        end
+        @test failure isa ErrorException
+        @test occursin("worker", sprint(showerror, failure))
+        @test occursin("injected worker failure", sprint(showerror, failure))
+
+        tree = BNB._build_survivor_full_model(data, state, config, inputs)
+        force_timeout = Threads.Atomic{Bool}(false)
+        events = []
+        function observe_timeout(event)
+            push!(events, event)
+            event.kind == :node_start && (force_timeout[] = true)
+        end
+        remaining_time = () -> force_timeout[] ? 0.0 : nothing
+        @test_logs (:warn, r"stopped before proving the first pick") match_mode=:any begin
+            plan = BNB._optimize_survivor_branch_and_bound!(
+                tree;
+                observer=observe_timeout,
+                remaining_time,
+            )
+            @test nrow(plan.selections) == 3
+        end
+        final = only(filter(event -> event.kind == :finish, events))
+        joined = only(filter(event -> event.kind == :workers_joined, events))
+        @test !final.proven
+        @test final.reason == :node_timeout
+        @test joined.tasks_terminated
+        @test final.nodes == 0
+        @test !isempty(final.pending)
+    end
 end
 
 @testset "HiPO tree matches exhaustive schedules over horizons" begin
@@ -287,7 +533,7 @@ end
             if event.kind in (:root, :node_start, :node_solve)
                 for (option, value) in (
                     ("solver", "hipo"), ("run_crossover", "on"),
-                    ("parallel", "on"), ("threads", 0),
+                    ("parallel", "off"), ("threads", 1),
                 )
                     @test BNB.JuMP.get_optimizer_attribute(tree.model, option) == value
                 end
@@ -343,11 +589,11 @@ end
             JuMP.set_objective_sense(model, JuMP.MOI.MIN_SENSE)
             for (option, value) in (
                 ("solver", "hipo"), ("run_crossover", crossover),
-                ("parallel", "on"), ("threads", 0), ("presolve", "off"),
+                ("parallel", "off"), ("threads", 1), ("presolve", "off"),
             )
                 JuMP.set_optimizer_attribute(model, option, value)
             end
-            seconds = @elapsed JuMP.optimize!(model)
+            seconds = @elapsed _bnb_optimize_single_threaded!(model)
             @test JuMP.termination_status(model) == JuMP.MOI.OPTIMAL
             @test JuMP.primal_status(model) == JuMP.MOI.FEASIBLE_POINT
             @test JuMP.dual_status(model) == JuMP.MOI.FEASIBLE_POINT

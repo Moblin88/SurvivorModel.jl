@@ -94,6 +94,36 @@ end
         @test SurvivorModel._parse_survivor_cli_args(
             ["--season=2023", "--branch-and-bound", "--hessian-weeks=0"],
         ).branch_and_bound
+        @test SurvivorModel._parse_survivor_cli_args(
+            [
+                "--season=2023", "--branch-and-bound-workers=2",
+                "--branch-and-bound",
+            ],
+        ).branch_and_bound_workers == 2
+        @test SurvivorModel._parse_survivor_cli_args(
+            [
+                "--season", "2023", "--branch-and-bound",
+                "--branch-and-bound-workers", "3",
+            ],
+        ).branch_and_bound_workers == 3
+        for flags in (
+            ["--branch-and-bound-workers"],
+            ["--branch-and-bound-workers=0"],
+            ["--branch-and-bound-workers=-1"],
+            ["--branch-and-bound-workers=two"],
+            ["--branch-and-bound-workers=2", "--branch-and-bound-workers=3"],
+            ["--branch-and-bound-workers=2"],
+        )
+            @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
+                ["--season=2023"; flags],
+            )
+        end
+        @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
+            [
+                "--season=2023", "--branch-and-bound",
+                "--branch-and-bound-workers=2", "--write-model=tree.lp",
+            ],
+        )
         @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
             ["--season=2023", "--branch-and-bound", "--branch-and-bound"],
         )
@@ -123,6 +153,7 @@ end
             write_model_file=nothing,
             hessian_weeks=3,
             branch_and_bound=false,
+            branch_and_bound_workers=nothing,
             timeout_seconds=nothing,
             refresh_data=false,
             refresh_priors=false,
@@ -172,6 +203,7 @@ end
         @test !occursin("--benders", usage)
         @test occursin("--write-model", usage)
         @test occursin("--hessian-weeks", usage)
+        @test occursin("--branch-and-bound-workers", usage)
         @test occursin("--refresh-priors", usage)
         @test occursin("--plot-strength WEEK", usage)
         @test occursin("--grid", usage)
@@ -188,6 +220,7 @@ end
             write_model_file=nothing,
             hessian_weeks=3,
             branch_and_bound=false,
+            branch_and_bound_workers=nothing,
             timeout_seconds=nothing,
             refresh_data=true,
             refresh_priors=false,
@@ -316,6 +349,7 @@ end
             ["--strikes", "2"],
             ["--hessian-weeks", "3"],
             ["--timeout", "1"],
+            ["--branch-and-bound-workers", "2"],
         )
             @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(
                 ["--refresh-priors"; run_options],

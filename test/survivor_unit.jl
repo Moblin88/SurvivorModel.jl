@@ -1621,6 +1621,18 @@ end
         @test moi.get(lp_optimizer, raw_attribute("run_crossover")) == "on"
         @test moi.get(mip_optimizer, raw_attribute("mip_lp_solver")) == "hipo"
         @test moi.get(mip_optimizer, raw_attribute("run_crossover")) == "on"
+        tree_config = SurvivorSelectionConfig(
+            branch_and_bound=true, branch_and_bound_workers=2,
+        )
+        tree_optimizer = moi.instantiate(
+            SurvivorModel._survivor_optimizer(
+                tree_config; lp_relaxation=true,
+            ),
+        )
+        @test moi.get(tree_optimizer, raw_attribute("solver")) == "hipo"
+        @test moi.get(tree_optimizer, raw_attribute("threads")) == 1
+        @test moi.get(tree_optimizer, raw_attribute("parallel")) == "off"
+        @test moi.get(tree_optimizer, raw_attribute("run_crossover")) == "on"
     end
 
     @testset "selection configuration" begin
@@ -1629,6 +1641,25 @@ end
         @test SurvivorSelectionConfig(hessian_weeks=19).hessian_weeks == 19
         @test !SurvivorSelectionConfig().branch_and_bound
         @test SurvivorSelectionConfig(branch_and_bound=true).branch_and_bound
+        @test SurvivorSelectionConfig(
+            branch_and_bound=true, branch_and_bound_workers=2,
+        ).branch_and_bound_workers == 2
+        @test SurvivorSelectionConfig().branch_and_bound_workers === nothing
+        @test_throws ArgumentError SurvivorSelectionConfig(
+            branch_and_bound=true, branch_and_bound_workers=0,
+        )
+        @test_throws ArgumentError SurvivorSelectionConfig(
+            branch_and_bound=true, branch_and_bound_workers=true,
+        )
+        @test_throws ArgumentError SurvivorSelectionConfig(
+            branch_and_bound_workers=2,
+        )
+        @test SurvivorModel._survivor_tree_worker_count(
+            SurvivorSelectionConfig(
+                branch_and_bound=true,
+                branch_and_bound_workers=Threads.nthreads(:default) + 2,
+            ),
+        ) == Threads.nthreads(:default)
         @test_throws MethodError SurvivorSelectionConfig(simplex=true)
         @test_throws MethodError SurvivorSelectionConfig(benders_weeks=1)
         @test SurvivorSelectionConfig().timeout_seconds === nothing

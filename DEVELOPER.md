@@ -95,18 +95,55 @@ corrections use `H=min(hessian_weeks, remaining_horizon)`. Fixing path picks
 does not shift or shorten H. `--write-model` continues to export the unsolved
 extensive-form MILP.
 
-The external tree uses one direct continuous HiGHS model. It solves the root
-relaxation, partitions every eligible first-week pick (including zero-valued
-LP candidates), and adds path fixings through variable bounds. Before each
-child solve, availability and fixed picks tighten probability,
-parameter-gradient, projected-gradient, and signed-curvature intervals. The
-four existing product-hull rows are rewritten in place from those intervals;
-model rows and columns remain fixed, and siblings recompute from root bounds.
-The full objective is maximized by minimizing its negative in this tree, then
-solver bounds are normalized back to the original maximization convention.
+The external tree solves its root relaxation on one direct continuous HiGHS
+model, partitions every eligible first-week pick (including zero-valued LP
+candidates), then dispatches independent child nodes to Julia worker tasks.
+Each worker owns a distinct direct HiGHS model copied from the unconditioned
+root formulation with its JuMP variable and hull-row references explicitly
+remapped. A worker never shares a mutable optimizer or conditioned reference
+with another task. Before each child solve, availability and fixed picks
+tighten probability, parameter-gradient, projected-gradient, and
+signed-curvature intervals. The four existing product-hull rows are rewritten
+in place from those intervals; model rows and columns remain fixed, and
+siblings recompute from root bounds. The full objective is maximized by
+minimizing its negative in this tree, then solver bounds are normalized back
+to the original maximization convention.
 
-Root and child relaxations set `solver=hipo`, `threads=0`, `parallel=on`,
+Root and worker LPs set `solver=hipo`, `threads=1`, `parallel=off`,
 `presolve=choose`, and `run_crossover=on`. HiGHS native output remains silent.
+The default worker capacity is Julia's `Threads.nthreads(:default)`, limited
+by available first-pick regions. `branch_and_bound_workers` and
+`--branch-and-bound-workers` request a positive upper limit, which is capped
+to the default-pool size. The coordinator is not assigned a reserved solver
+thread; node work runs as `Threads.@spawn :default` tasks, and ownership follows
+the task rather than a thread ID. The package/app does not set a Julia thread
+flag: Julia startup honors `JULIA_NUM_THREADS`, so set it before launch to
+select automatic or explicit pool sizing. On Julia 1.12, the default pool can
+contain only one thread when the variable is unset.
+
+HiGHS' scheduler is process-global, so prior ordinary solves can otherwise
+prevent a later model from changing to `threads=1`. A writer-preferring gate
+allows ordinary SurvivorModel solves to share the default scheduler, then gives
+the tree exclusive access while it resets the scheduler before the root solve
+and again after all workers join. This lets a later ordinary solve reinitialize
+HiGHS with its default thread count. Optimizations made directly on unrelated
+HiGHS models are outside this gate and must not overlap a tree run.
+
+Only the coordinator changes the ready queue, incumbent, node summaries,
+regional upper bounds, observers, and progress output. In-flight nodes remain
+live leaves in their ancestor summaries, so taking a node out of the ready
+queue never drops its inherited regional certificate. A tree completion is
+not considered exhausted while there is queued or in-flight work. On every
+normal stop, timeout, or error, the coordinator stops dispatch, closes worker
+inputs, drains bounded result delivery, and joins all worker tasks before
+returning or rethrowing. It does not destroy or mutate an optimizer while
+HiGHS is solving. Workers return node IDs and immutable result data, never
+solver references. Coordinator callbacks are serialized.
+
+Conditioned hull totals use outward-rounded `BigFloat` arithmetic. That scoped
+precision/rounding section is protected by a shared reentrant lock; the
+Float64 bound calculations and solver runs remain parallel.
+
 The tree accepts a solver upper bound only when a fresh MOI result reports a
 feasible dual and the native HiGHS dual status agrees. For nonoptimal results,
 the current dual-infeasibility and stationarity diagnostics must also pass
@@ -129,15 +166,16 @@ and contradictions with known feasible schedules remain errors.
 
 The root and descendants share a deterministic feasible greedy incumbent.
 Node completions preserve fixed picks and only provide a lower bound for
-ranking/incumbent updates. Competing first-pick regions are prioritized, with
-incumbent-region work interleaved. The current first pick is proven when its
+ranking/incumbent updates. The coordinator selects nodes with the existing
+competing-first-pick priority and interleaves incumbent-region work; solve
+results are integrated as workers finish. The current first pick is proven when its
 feasible objective is at least the best competing-region upper bound within
 the scale-aware `1e-6` tolerance. The returned full schedule is feasible and
 its objective is independently evaluated, but future picks are not promised
 globally optimal after the first pick is certified. The timeout covers model
-construction, relaxations, and certification; on timeout the best feasible
-schedule is returned with an explicit unproven warning and pending bounds
-retained.
+construction, root and worker model copies, node conditioning, relaxations,
+and certification; on timeout the best feasible schedule is returned with an
+explicit unproven warning and all queued and in-flight bounds retained.
 
 The default HiPO tree performs no application-level retry with presolve off
 and does not build residual-corrected Lagrangian certificates. HiGHS' internal

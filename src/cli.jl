@@ -8,8 +8,8 @@ end
 function _survivor_cli_usage()
     return """
     Usage:
-      survivor --season YEAR [--ban TEAM1,TEAM2] [--branch-and-bound] [--write-model FILE.lp] [--strikes N] [--hessian-weeks N] [--timeout SECONDS] < picks.txt
-      julia --project=. -m SurvivorModel --season YEAR [--ban TEAM1,TEAM2] [--branch-and-bound] [--write-model FILE.lp] [--strikes N] [--hessian-weeks N] [--timeout SECONDS] < picks.txt
+      survivor --season YEAR [--ban TEAM1,TEAM2] [--branch-and-bound [--branch-and-bound-workers N]] [--write-model FILE.lp] [--strikes N] [--hessian-weeks N] [--timeout SECONDS] < picks.txt
+      julia --project=. -m SurvivorModel --season YEAR [--ban TEAM1,TEAM2] [--branch-and-bound [--branch-and-bound-workers N]] [--write-model FILE.lp] [--strikes N] [--hessian-weeks N] [--timeout SECONDS] < picks.txt
       survivor --refresh-priors
       survivor --refresh-data [--refresh-priors]
       julia --project=. -m SurvivorModel --refresh-priors
@@ -27,7 +27,11 @@ function _survivor_cli_usage()
       --season YEAR       Target season (required unless refreshing caches).
       --ban TEAMS         Comma-separated teams forbidden as the current pick.
       --branch-and-bound  Full-LP external tree certifying the current pick;
-                          HiPO with crossover is used for root and child LPs.
+                          single-threaded HiPO LPs use Julia worker tasks.
+      --branch-and-bound-workers N
+                          Maximum tree workers (default: Julia default-pool
+                          thread count; capped to available threads).
+                          Set JULIA_NUM_THREADS before launch to size that pool.
       --write-model FILE.lp  Save the MILP with HiGHS and exit without solving.
       --strikes N         Initial strike count (default: 2).
       --hessian-weeks N  Number of future weeks with Hessian adjustments
@@ -83,6 +87,8 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
     banned_first_pick_teams = String[]
     ban_specified = false
     branch_and_bound = false
+    branch_and_bound_workers = nothing
+    branch_and_bound_workers_specified = false
     write_model_file = nothing
     write_model_specified = false
     hessian_weeks = 3
@@ -149,6 +155,7 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
             argument == "--strikes" ||
             argument == "--hessian-weeks" ||
             argument == "--timeout" ||
+            argument == "--branch-and-bound-workers" ||
             argument == "--plot-strength"
             option = argument
             index += 1
@@ -173,6 +180,9 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
         elseif startswith(argument, "--timeout=")
             option = "--timeout"
             value = argument[length("--timeout=") + 1:end]
+        elseif startswith(argument, "--branch-and-bound-workers=")
+            option = "--branch-and-bound-workers"
+            value = argument[length("--branch-and-bound-workers=") + 1:end]
         elseif startswith(argument, "--plot-strength=")
             option = "--plot-strength"
             value = argument[length("--plot-strength=") + 1:end]
@@ -217,6 +227,15 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
                 throw(ArgumentError("--timeout may only be specified once"))
             timeout_seconds = _parse_survivor_cli_real(value, option)
             timeout_specified = true
+        elseif option == "--branch-and-bound-workers"
+            branch_and_bound_workers_specified && throw(ArgumentError(
+                "--branch-and-bound-workers may only be specified once",
+            ))
+            branch_and_bound_workers = _parse_survivor_cli_integer(value, option)
+            branch_and_bound_workers > 0 || throw(ArgumentError(
+                "--branch-and-bound-workers must be a positive integer",
+            ))
+            branch_and_bound_workers_specified = true
         elseif option == "--plot-strength"
             plot_strength_specified &&
                 throw(ArgumentError(
@@ -238,6 +257,7 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
         write_model_file=nothing,
         hessian_weeks=3,
         branch_and_bound=false,
+        branch_and_bound_workers=nothing,
         timeout_seconds=nothing,
         refresh_data=false,
         refresh_priors=false,
@@ -257,6 +277,7 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
         (
             ban_specified ||
             branch_and_bound ||
+            branch_and_bound_workers_specified ||
             write_model_specified ||
             strikes_specified ||
             hessian_weeks_specified ||
@@ -265,11 +286,18 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
     else
         season > 0 || throw(ArgumentError("--season must be positive"))
     end
+    branch_and_bound_workers_specified && !branch_and_bound &&
+        throw(ArgumentError("--branch-and-bound-workers requires --branch-and-bound"))
+    branch_and_bound_workers_specified && write_model_specified &&
+        throw(ArgumentError(
+            "--branch-and-bound-workers cannot be combined with --write-model",
+        ))
     if plot_strength_specified
         (
             grid ||
             ban_specified ||
             branch_and_bound ||
+            branch_and_bound_workers_specified ||
             write_model_specified ||
             strikes_specified ||
             hessian_weeks_specified ||
@@ -282,6 +310,7 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
         (
             ban_specified ||
             branch_and_bound ||
+            branch_and_bound_workers_specified ||
             write_model_specified ||
             hessian_weeks_specified ||
             timeout_specified
@@ -302,6 +331,7 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
         write_model_file=write_model_file,
         hessian_weeks=Int(hessian_weeks),
         branch_and_bound,
+        branch_and_bound_workers=branch_and_bound_workers,
         timeout_seconds=timeout_seconds,
         refresh_data=refresh_data,
         refresh_priors=refresh_priors,
@@ -630,6 +660,7 @@ function _run_survivor_cli(
         hessian_weeks=options.hessian_weeks,
         branch_and_bound=options.branch_and_bound,
         timeout_seconds=options.timeout_seconds,
+        branch_and_bound_workers=options.branch_and_bound_workers,
     )
     if options.write_model_file !== nothing
         saved_path = write_survivor_pool_lp(

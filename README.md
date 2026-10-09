@@ -567,6 +567,11 @@ The app starts Julia with startup-file loading enabled, so it respects
 `~/.julia/config/startup.jl` for both Docker and local Pkg app installs. Existing
 app shims must be regenerated with `Pkg.Apps.develop(path="...")` or
 `Pkg.Apps.update("survivor")` to pick up the startup-file setting.
+The image is built in two stages: GLMakie dependencies are strictly
+precompiled and explicitly loaded under a temporary Xvfb display, while the
+published runtime image does not include Xvfb or build-time display packages.
+Plotting from inside the container still requires a separately configured
+display.
 
 Every `survivor` app launch defaults the active BLAS backend to one thread; this
 does not change BLAS behavior when `SurvivorModel` is imported as a library.

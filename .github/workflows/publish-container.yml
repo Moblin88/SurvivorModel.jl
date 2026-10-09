@@ -23,7 +23,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
       - name: Build image
@@ -42,8 +42,10 @@ jobs:
       - uses: actions/checkout@v7
       - name: Build native amd64 image
         run: docker build --platform linux/amd64 --tag survivormodel-smoke .
-      - name: Verify installed app and BLAS thread overrides
+      - name: Verify installed app, clean runtime, and BLAS thread overrides
         run: |
+          docker run --rm --entrypoint sh survivormodel-smoke \
+            -c 'test "$(command -v survivor)" = /root/.julia/bin/survivor && ! command -v xvfb-run >/dev/null 2>&1'
           docker run --rm survivormodel-smoke --help >/dev/null
           docker run --rm \
             --entrypoint julia \
@@ -65,7 +67,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
       - name: Log in to Docker Hub
@@ -76,7 +78,7 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
       - name: Extract image metadata
         id: meta
-        uses: docker/metadata-action@v4
+        uses: docker/metadata-action@v6
         with:
           images: moblin88/survivormodel.jl
           labels: |

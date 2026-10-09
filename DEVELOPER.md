@@ -165,6 +165,12 @@ load MKL for Intel Linux x86_64 or AOCL for AMD Linux x86_64 before application
 packages. ARM and unknown vendors retain OpenBLAS. Vendor packages and CPU
 detection are Docker-only; the app itself does not select or install a vendor
 backend. Missing or inactive selected Docker backends are startup errors.
+Container construction strictly precompiles app dependencies and explicitly
+loads GLMakie under Xvfb/software Mesa in a builder stage, then copies the
+Julia depot into a clean runtime stage. Precompile or GLMakie load failures
+fail the build. The published image omits Xvfb and build-time display packages,
+so interactive container plotting still needs a separately configured
+display.
 
 The tree accepts a solver upper bound only when a fresh MOI result reports a
 feasible dual and the native HiGHS dual status agrees. For nonoptimal results,

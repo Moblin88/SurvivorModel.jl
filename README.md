@@ -563,6 +563,15 @@ docker build -t survivormodel .
 docker run --rm -i survivormodel --season 2026 < picks.txt
 ```
 
+Dependency installation and precompilation run before copying `src/`, in a
+separate Docker layer. Source-only rebuilds reuse that layer and recompile the
+package and installed app; changes to either project file invalidate dependency
+setup. Cache reuse also depends on the base image and target architecture.
+Both CI build jobs import and export GitHub Actions layer caches, including
+intermediate dependency layers.
+Build-time precompilation uses Xvfb for GLMakie; the runtime entrypoint remains
+unchanged, and interactive plotting still requires a graphical display.
+
 GitHub Actions builds the image for pull requests without publishing, then
 publishes multi-platform `linux/amd64` and `linux/arm64` images to Docker Hub
 on pushes to `main` and `v*` tags. Docker selects the image matching the host

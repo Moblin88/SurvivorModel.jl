@@ -1,5 +1,74 @@
 const SURVIVOR_CLI_APP_NAME = "survivor"
 
+function _survivor_parse_blas_threads(value::AbstractString, option::AbstractString)
+    parsed = tryparse(Int, strip(value))
+    parsed !== nothing && 1 <= parsed <= typemax(Int32) ||
+        throw(ArgumentError("$option must be a positive integer no greater than $(typemax(Int32))"))
+    return parsed
+end
+
+function _survivor_validate_blas_thread_environment(
+    key::AbstractString,
+    value::AbstractString,
+)
+    if key == "MKL_DOMAIN_NUM_THREADS"
+        isempty(strip(value)) &&
+            throw(ArgumentError("$key must not be empty"))
+        return nothing
+    end
+    values = key == "OMP_NUM_THREADS" ? split(value, ',') : (value,)
+    for item in values
+        _survivor_parse_blas_threads(item, key)
+    end
+    return nothing
+end
+
+function _survivor_blas_thread_environment_keys(blas_config::AbstractString)
+    config = lowercase(blas_config)
+    if occursin("mkl", config)
+        return ("MKL_NUM_THREADS", "MKL_DOMAIN_NUM_THREADS", "OMP_NUM_THREADS")
+    elseif occursin("aocl", config) || occursin("blis", config) ||
+        occursin("armpl", config)
+        return ("AOCL_NUM_THREADS", "BLIS_NUM_THREADS", "OMP_NUM_THREADS")
+    elseif occursin("openblas", config)
+        return ("OPENBLAS_NUM_THREADS", "GOTO_NUM_THREADS")
+    elseif occursin("accelerate", config)
+        return ("VECLIB_MAXIMUM_THREADS",)
+    end
+    return ()
+end
+
+function _survivor_blas_thread_count(
+    blas_config::AbstractString,
+    env::AbstractDict{<:AbstractString,<:AbstractString},
+)
+    key = "SURVIVORMODEL_BLAS_THREADS"
+    if haskey(env, key)
+        return _survivor_parse_blas_threads(env[key], key)
+    end
+    for key in _survivor_blas_thread_environment_keys(blas_config)
+        haskey(env, key) || continue
+        _survivor_validate_blas_thread_environment(key, env[key])
+        return nothing
+    end
+    return 1
+end
+
+function _survivor_configure_blas_threads!(; env=ENV)
+    blas = LinearAlgebra.BLAS
+    config = sprint(show, blas.get_config())
+    thread_count = _survivor_blas_thread_count(config, env)
+    thread_count === nothing && return nothing
+    blas.set_num_threads(thread_count)
+    actual_thread_count = blas.get_num_threads()
+    actual_thread_count == thread_count ||
+        throw(ArgumentError(
+            "active BLAS backend did not apply the requested $thread_count threads " *
+            "(reported $actual_thread_count)",
+        ))
+    return thread_count
+end
+
 function _survivor_cli_refresh_data_enabled()
     value = lowercase(strip(get(ENV, "SURVIVORMODEL_REFRESH_DATA", "false")))
     return value in ("1", "true", "yes", "on")
@@ -8,22 +77,55 @@ end
 function _survivor_cli_usage()
     return """
     Usage:
-      survivor --season YEAR [--strikes N] [--objective NAME] [--timings] < picks.txt
-      julia --project=. -m SurvivorModel --season YEAR [--strikes N] [--objective NAME] [--timings] < picks.txt
+      survivor --season YEAR [--ban TEAM1,TEAM2] [--branch-and-bound | --no-branch-and-bound] [--branch-and-bound-workers N] [--write-model FILE.lp] [--strikes N] [--hessian-weeks N] [--timeout SECONDS] < picks.txt
+      julia --project=. -m SurvivorModel --season YEAR [--ban TEAM1,TEAM2] [--branch-and-bound | --no-branch-and-bound] [--branch-and-bound-workers N] [--write-model FILE.lp] [--strikes N] [--hessian-weeks N] [--timeout SECONDS] < picks.txt
+      survivor --refresh-priors
+      survivor --refresh-data [--refresh-priors]
+      julia --project=. -m SurvivorModel --refresh-priors
+      julia --project=. -m SurvivorModel --refresh-data [--refresh-priors]
+      survivor --season YEAR --plot-strength WEEK
+      julia --project=. -m SurvivorModel --season YEAR --plot-strength WEEK
+      survivor --season YEAR --grid [--strikes N] < picks.txt
+      julia --project=. -m SurvivorModel --season YEAR --grid [--strikes N] < picks.txt
 
     Input:
       One team abbreviation per nonblank line, starting with week 1.
       The next pick is inferred from the number of nonblank lines.
 
     Options:
-      --season YEAR       Target season (required).
+      --season YEAR       Target season (required unless refreshing caches).
+      --ban TEAMS         Comma-separated teams forbidden as the current pick.
+      --branch-and-bound  Use the full-LP external tree (the default);
+                          single-threaded HiPO LPs use Julia worker tasks.
+      --no-branch-and-bound
+                          Use the extensive-form MILP instead of the default tree.
+      --branch-and-bound-workers N
+                          Maximum tree workers (default: Julia default-pool
+                          thread count; capped to available threads).
+                          Set JULIA_NUM_THREADS before launch to size that pool.
+      --write-model FILE.lp  Save the MILP with HiGHS and exit without solving.
       --strikes N         Initial strike count (default: 2).
-      --objective NAME    Selection objective (default:
-                          exact-milp; use milp for the
-                          discounted approximation).
-      --timings           Print phase timings to stderr.
+      --hessian-weeks N  Number of future weeks with Hessian adjustments
+                          for exact-milp (default: 18; 0 is linear-only).
+      --timeout SECONDS  Optimization time limit in seconds (default: unlimited).
       --refresh-data      Clear NFLData's raw cache and refresh summarized
-                          historical drive data before running.
+                          historical drive data before running. Without
+                          --season, clear raw-data and summarized-drive
+                          caches and exit.
+      --refresh-priors    Clear cached historical prior fits. Without
+                          --season, clear the cache and exit.
+      --plot-strength WEEK  Show a plot at the start of WEEK (1-18), using
+                            prior weeks only; no picks or run options, and a
+                            native desktop/OpenGL display is required.
+                            League-prior percentile axes and central 50%
+                            posterior intervals with labeled team points.
+      --grid              Print all unused teams and remaining weeks, with
+                          opponents and Hessian-adjusted win percentages,
+                          sorted by current-week probability; byes are blank.
+                          Stars mark each week's top five unused teams;
+                          horizontal rules group every five team rows.
+                          No selection/export options; --strikes and cache
+                          refresh flags are allowed.
       --help              Show this help.
     """
 end
@@ -35,21 +137,43 @@ function _parse_survivor_cli_integer(value::AbstractString, option::AbstractStri
     return parsed
 end
 
-function _parse_survivor_cli_objective(value::AbstractString)
-    normalized = lowercase(replace(strip(value), '-' => '_'))
-    return _canonical_survivor_objective(Symbol(normalized))
+function _parse_survivor_cli_real(value::AbstractString, option::AbstractString)
+    parsed = tryparse(Float64, value)
+    parsed === nothing ||
+        (isfinite(parsed) && parsed > 0.0 && return parsed)
+    throw(ArgumentError("$option requires a finite positive number of seconds"))
+end
+
+function _parse_survivor_cli_banned_teams(value::AbstractString)
+    return _normalize_survivor_team_abbreviations(
+        split(value, ','; keepempty=true),
+        "--ban",
+    )
 end
 
 function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
     season = nothing
     initial_strikes = 2
     strikes_specified = false
-    objective = DEFAULT_SURVIVOR_OBJECTIVE
-    objective_specified = false
-    timings = false
-    timings_specified = false
+    banned_first_pick_teams = String[]
+    ban_specified = false
+    branch_and_bound = true
+    branch_and_bound_specified = false
+    branch_and_bound_workers = nothing
+    branch_and_bound_workers_specified = false
+    write_model_file = nothing
+    write_model_specified = false
+    hessian_weeks = 18
+    hessian_weeks_specified = false
+    timeout_seconds = nothing
+    timeout_specified = false
     refresh_data = false
     refresh_data_specified = false
+    refresh_priors = false
+    refresh_priors_specified = false
+    plot_strength_week = nothing
+    plot_strength_specified = false
+    grid = false
     show_help = false
     index = 1
 
@@ -66,6 +190,29 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
             break
         end
 
+        if argument == "--branch-and-bound"
+            branch_and_bound_specified && throw(ArgumentError(
+                "branch-and-bound mode may only be specified once",
+            ))
+            branch_and_bound = true
+            branch_and_bound_specified = true
+            index += 1
+            continue
+        elseif argument == "--no-branch-and-bound"
+            branch_and_bound_specified && throw(ArgumentError(
+                "branch-and-bound mode may only be specified once",
+            ))
+            branch_and_bound = false
+            branch_and_bound_specified = true
+            index += 1
+            continue
+        end
+        if argument == "--grid"
+            grid && throw(ArgumentError("--grid may only be specified once"))
+            grid = true
+            index += 1
+            continue
+        end
         if argument == "--refresh-data"
             refresh_data_specified &&
                 throw(ArgumentError("--refresh-data may only be specified once"))
@@ -74,20 +221,24 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
             index += 1
             continue
         end
-        if argument == "--timings"
-            timings_specified &&
-                throw(ArgumentError("--timings may only be specified once"))
-            timings = true
-            timings_specified = true
+        if argument == "--refresh-priors"
+            refresh_priors_specified &&
+                throw(ArgumentError("--refresh-priors may only be specified once"))
+            refresh_priors = true
+            refresh_priors_specified = true
             index += 1
             continue
         end
-
         option = nothing
         value = nothing
         if argument == "--season" ||
+            argument == "--ban" ||
+            argument == "--write-model" ||
             argument == "--strikes" ||
-            argument == "--objective"
+            argument == "--hessian-weeks" ||
+            argument == "--timeout" ||
+            argument == "--branch-and-bound-workers" ||
+            argument == "--plot-strength"
             option = argument
             index += 1
             index <= length(args) ||
@@ -96,12 +247,27 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
         elseif startswith(argument, "--season=")
             option = "--season"
             value = argument[length("--season=") + 1:end]
+        elseif startswith(argument, "--ban=")
+            option = "--ban"
+            value = argument[length("--ban=") + 1:end]
+        elseif startswith(argument, "--write-model=")
+            option = "--write-model"
+            value = argument[length("--write-model=") + 1:end]
         elseif startswith(argument, "--strikes=")
             option = "--strikes"
             value = argument[length("--strikes=") + 1:end]
-        elseif startswith(argument, "--objective=")
-            option = "--objective"
-            value = argument[length("--objective=") + 1:end]
+        elseif startswith(argument, "--hessian-weeks=")
+            option = "--hessian-weeks"
+            value = argument[length("--hessian-weeks=") + 1:end]
+        elseif startswith(argument, "--timeout=")
+            option = "--timeout"
+            value = argument[length("--timeout=") + 1:end]
+        elseif startswith(argument, "--branch-and-bound-workers=")
+            option = "--branch-and-bound-workers"
+            value = argument[length("--branch-and-bound-workers=") + 1:end]
+        elseif startswith(argument, "--plot-strength=")
+            option = "--plot-strength"
+            value = argument[length("--plot-strength=") + 1:end]
         else
             throw(ArgumentError("unknown option: $argument"))
         end
@@ -112,40 +278,149 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
             season === nothing ||
                 throw(ArgumentError("--season may only be specified once"))
             season = parsed
+        elseif option == "--ban"
+            ban_specified &&
+                throw(ArgumentError("--ban may only be specified once"))
+            banned_first_pick_teams =
+                _parse_survivor_cli_banned_teams(value)
+            ban_specified = true
+        elseif option == "--write-model"
+            write_model_specified &&
+                throw(ArgumentError(
+                    "--write-model may only be specified once",
+                ))
+            write_model_file = _survivor_lp_output_path(value)
+            write_model_specified = true
         elseif option == "--strikes"
             parsed = _parse_survivor_cli_integer(value, option)
             strikes_specified &&
                 throw(ArgumentError("--strikes may only be specified once"))
             initial_strikes = parsed
             strikes_specified = true
-        elseif option == "--objective"
-            objective_specified &&
-                throw(ArgumentError("--objective may only be specified once"))
-            objective = _parse_survivor_cli_objective(value)
-            objective_specified = true
+        elseif option == "--hessian-weeks"
+            hessian_weeks_specified &&
+                throw(ArgumentError("--hessian-weeks may only be specified once"))
+            hessian_weeks = _parse_survivor_cli_integer(value, option)
+            hessian_weeks_specified = true
+            hessian_weeks >= 0 ||
+                throw(ArgumentError("--hessian-weeks must be nonnegative"))
+        elseif option == "--timeout"
+            timeout_specified &&
+                throw(ArgumentError("--timeout may only be specified once"))
+            timeout_seconds = _parse_survivor_cli_real(value, option)
+            timeout_specified = true
+        elseif option == "--branch-and-bound-workers"
+            branch_and_bound_workers_specified && throw(ArgumentError(
+                "--branch-and-bound-workers may only be specified once",
+            ))
+            branch_and_bound_workers = _parse_survivor_cli_integer(value, option)
+            branch_and_bound_workers > 0 || throw(ArgumentError(
+                "--branch-and-bound-workers must be a positive integer",
+            ))
+            branch_and_bound_workers_specified = true
+        elseif option == "--plot-strength"
+            plot_strength_specified &&
+                throw(ArgumentError(
+                    "--plot-strength may only be specified once",
+                ))
+            plot_strength_week = _parse_survivor_cli_integer(value, option)
+            plot_strength_specified = true
+            1 <= plot_strength_week <= 18 ||
+                throw(ArgumentError("--plot-strength must be between 1 and 18"))
         end
         index += 1
     end
 
     show_help && return (
         show_help=true,
-        season=0,
+        season=nothing,
         initial_strikes=2,
-        objective=DEFAULT_SURVIVOR_OBJECTIVE,
-        timings=false,
+        banned_first_pick_teams=String[],
+        write_model_file=nothing,
+        hessian_weeks=18,
+        branch_and_bound=true,
+        branch_and_bound_workers=nothing,
+        timeout_seconds=nothing,
         refresh_data=false,
+        refresh_priors=false,
+        plot_strength_week=nothing,
+        grid=false,
     )
-    season === nothing && throw(ArgumentError("--season is required"))
-    season > 0 || throw(ArgumentError("--season must be positive"))
+    plot_strength_specified && season === nothing &&
+        throw(ArgumentError("--plot-strength requires --season"))
+    grid && season === nothing &&
+        throw(ArgumentError("--grid requires --season"))
+    if season === nothing
+        (refresh_data || refresh_priors) ||
+            throw(ArgumentError(
+                "--season is required unless --refresh-data or " *
+                "--refresh-priors is specified",
+            ))
+        (
+            ban_specified ||
+            branch_and_bound_specified ||
+            branch_and_bound_workers_specified ||
+            write_model_specified ||
+            strikes_specified ||
+            hessian_weeks_specified ||
+            timeout_specified
+        ) && throw(ArgumentError("run options require --season"))
+    else
+        season > 0 || throw(ArgumentError("--season must be positive"))
+    end
+    branch_and_bound_workers_specified && !branch_and_bound &&
+        throw(ArgumentError(
+            "--branch-and-bound-workers cannot be used with --no-branch-and-bound",
+        ))
+    branch_and_bound_workers_specified && write_model_specified &&
+        throw(ArgumentError(
+            "--branch-and-bound-workers cannot be combined with --write-model",
+        ))
+    if plot_strength_specified
+        (
+            grid ||
+            ban_specified ||
+            branch_and_bound_specified ||
+            branch_and_bound_workers_specified ||
+            write_model_specified ||
+            strikes_specified ||
+            hessian_weeks_specified ||
+            timeout_specified
+        ) && throw(ArgumentError(
+            "--plot-strength cannot be combined with --grid, selection, or model-export options",
+        ))
+    end
+    if grid
+        (
+            ban_specified ||
+            branch_and_bound_specified ||
+            branch_and_bound_workers_specified ||
+            write_model_specified ||
+            hessian_weeks_specified ||
+            timeout_specified
+        ) && throw(ArgumentError(
+            "--grid cannot be combined with selection or model-export options; " *
+            "all grid probabilities always include Hessian adjustments",
+        ))
+    end
     initial_strikes >= 0 ||
         throw(ArgumentError("--strikes must be nonnegative"))
+    hessian_weeks >= 0 ||
+        throw(ArgumentError("--hessian-weeks must be nonnegative"))
     return (
         show_help=false,
-        season=Int(season),
+        season=season === nothing ? nothing : Int(season),
         initial_strikes=Int(initial_strikes),
-        objective=objective,
-        timings=timings,
+        banned_first_pick_teams=banned_first_pick_teams,
+        write_model_file=write_model_file,
+        hessian_weeks=Int(hessian_weeks),
+        branch_and_bound,
+        branch_and_bound_workers=branch_and_bound_workers,
+        timeout_seconds=timeout_seconds,
         refresh_data=refresh_data,
+        refresh_priors=refresh_priors,
+        plot_strength_week=plot_strength_week,
+        grid=grid,
     )
 end
 
@@ -168,6 +443,42 @@ function _survivor_cli_result_value(value)
     result === nothing ||
         (isfinite(result) && return result)
     throw(ArgumentError("schedule results must be finite numeric margins"))
+end
+
+function _survivor_cli_schedule_and_state(
+    schedule,
+    season::Integer,
+    picks::AbstractVector{<:AbstractString},
+    initial_strikes::Integer;
+    schedule_loader::Function=load_schedule,
+    clear_data_cache::Function=NFLData.clear_cache,
+)
+    normalized_schedule = schedule === nothing ?
+        schedule_loader() :
+        load_schedule(schedule)
+    state = try
+        _survivor_cli_state(
+            normalized_schedule,
+            season,
+            picks,
+            initial_strikes,
+        )
+    catch error
+        stale_schedule = schedule === nothing &&
+            error isa ArgumentError &&
+            error.msg ==
+            "a previous pick refers to an uncompleted game"
+        stale_schedule || rethrow()
+        clear_data_cache()
+        normalized_schedule = schedule_loader()
+        _survivor_cli_state(
+            normalized_schedule,
+            season,
+            picks,
+            initial_strikes,
+        )
+    end
+    return normalized_schedule, state
 end
 
 function _survivor_cli_state(
@@ -268,6 +579,60 @@ function _survivor_cli_load_historical_drives(
     return vcat(cached...; cols=:union)
 end
 
+function _survivor_cli_build_forecast_context(
+    season::Integer,
+    as_of_week::Integer,
+    normalized_schedule::AbstractDataFrame,
+    historical_drives,
+    current_drives,
+    cache_directory::Union{Nothing,AbstractString},
+    max_seasons::Int,
+    refresh_data::Bool,
+    log_phase_timing::Function,
+)
+    historical_source = _survivor_cli_load_historical_drives(
+        season,
+        max_seasons,
+        historical_drives,
+        cache_directory;
+        refresh=refresh_data,
+    )
+    historical, current = _load_forecast_drives(
+        season,
+        max_seasons,
+        historical_source,
+        current_drives;
+        allow_missing_current=as_of_week == 1,
+    )
+    log_phase_timing(:drive_data)
+    historical = _survivor_cli_historical_drives(
+        normalized_schedule,
+        season,
+        historical,
+    )
+    current = _regular_season_drives(current, normalized_schedule)
+    cached_prior = _cached_historical_prior(
+        historical;
+        current_season=season,
+        max_seasons=max_seasons,
+        cache_directory=cache_directory,
+    )
+    log_phase_timing(:prior)
+    context = fit_regular_season_forecast(
+        season;
+        as_of_week=as_of_week,
+        schedule=normalized_schedule,
+        historical_drives=historical,
+        current_drives=current,
+        max_seasons=max_seasons,
+        prior=cached_prior.prior,
+        _normalized_schedule=true,
+        _schedule_indexed_drives=true,
+    )
+    log_phase_timing(:fit)
+    return context
+end
+
 function _run_survivor_cli(
     args::AbstractVector{<:AbstractString};
     input::IO=stdin,
@@ -276,109 +641,147 @@ function _run_survivor_cli(
     historical_drives=nothing,
     current_drives=nothing,
     cache_directory::Union{Nothing,AbstractString}=nothing,
-    method::PriorFitMethod=DEFAULT_PRIOR_FIT_METHOD,
     max_seasons::Int=DEFAULT_HISTORICAL_SEASONS,
     through_week::Int=18,
-    timing_output::IO=stderr,
+    schedule_loader::Function=load_schedule,
+    clear_data_cache::Function=NFLData.clear_cache,
+    show_team_strength_plot::Function=_show_team_strength_plot,
 )
-    timing_started = time_ns()
-    timing_logger = Logging.SimpleLogger(timing_output, Logging.Info)
-    record_timing = function(phase::Symbol)
-        timings_enabled || return nothing
+    phase_started = time_ns()
+    log_phase_timing = function(phase::Symbol)
         now = time_ns()
-        duration = (now - timing_started) / 1.0e9
-        timing_started = now
-        Logging.with_logger(timing_logger) do
-            @info "survivor phase complete" phase elapsed_seconds=duration
-        end
+        elapsed_seconds = (now - phase_started) / 1.0e9
+        phase_started = now
+        @debug "survivor phase complete" phase=phase elapsed_seconds=elapsed_seconds
         return nothing
     end
 
     options = _parse_survivor_cli_args(args)
-    timings_enabled = options.timings
-    record_timing(:parse)
+    log_phase_timing(:parse)
     if options.show_help
         print(output, _survivor_cli_usage())
         return 0
     end
+    if options.season === nothing
+        if options.refresh_priors
+            clear_historical_prior_cache!(; cache_directory=cache_directory)
+            @info "historical prior cache cleared"
+        end
+        if options.refresh_data
+            clear_data_cache()
+            @info "NFLData raw cache cleared"
+            summarized_cache_entries =
+                _clear_drive_cache!(; cache_directory=cache_directory)
+            @info "summarized historical-drive cache cleared" summarized_cache_entries
+        end
+        log_phase_timing(:cache_clear)
+        return 0
+    end
+
+    if options.refresh_priors
+        clear_historical_prior_cache!(; cache_directory=cache_directory)
+        @info "historical prior cache cleared"
+    end
     refresh_data = options.refresh_data || _survivor_cli_refresh_data_enabled()
-    refresh_data && NFLData.clear_cache()
+    refresh_data && clear_data_cache()
+
+    if options.plot_strength_week !== nothing
+        normalized_schedule, _ = _survivor_cli_schedule_and_state(
+            schedule,
+            options.season,
+            String[],
+            options.initial_strikes;
+            schedule_loader=schedule_loader,
+            clear_data_cache=clear_data_cache,
+        )
+        log_phase_timing(:schedule)
+        context = _survivor_cli_build_forecast_context(
+            options.season,
+            options.plot_strength_week,
+            normalized_schedule,
+            historical_drives,
+            current_drives,
+            cache_directory,
+            max_seasons,
+            refresh_data,
+            log_phase_timing,
+        )
+        show_team_strength_plot(context)
+        return 0
+    end
 
     picks = _read_survivor_cli_picks(input)
-    normalized_schedule = schedule === nothing ? load_schedule() : load_schedule(schedule)
-    record_timing(:schedule)
-    state = _survivor_cli_state(
-        normalized_schedule,
+    normalized_schedule, state = _survivor_cli_schedule_and_state(
+        schedule,
         options.season,
         picks,
-        options.initial_strikes,
+        options.initial_strikes;
+        schedule_loader=schedule_loader,
+        clear_data_cache=clear_data_cache,
     )
-    record_timing(:state)
-    historical_source = _survivor_cli_load_historical_drives(
+    log_phase_timing(:schedule)
+    log_phase_timing(:state)
+    context = _survivor_cli_build_forecast_context(
         options.season,
-        max_seasons,
-        historical_drives,
-        cache_directory;
-        refresh=refresh_data,
-    )
-    historical, current = _load_forecast_drives(
-        options.season,
-        max_seasons,
-        historical_source,
-        current_drives,
-        ;
-        allow_missing_current=state.current_week == 1,
-    )
-    record_timing(:drive_data)
-    historical = _survivor_cli_historical_drives(
+        state.current_week,
         normalized_schedule,
-        options.season,
-        historical,
+        historical_drives,
+        current_drives,
+        cache_directory,
+        max_seasons,
+        refresh_data,
+        log_phase_timing,
     )
-    current = _regular_season_drives(current, normalized_schedule)
-    cached_prior = _cached_historical_prior(
-        historical;
-        current_season=options.season,
-        time_edges=DEFAULT_TIME_EDGES,
-        max_seasons=max_seasons,
-        method=method,
-        cache_directory=cache_directory,
+    if options.grid
+        grid = _survivor_grid_data(context; picks_made=state.picks_made)
+        _write_survivor_grid(output, grid)
+        log_phase_timing(:grid)
+        return 0
+    end
+    selection_config = SurvivorSelectionConfig(
+        through_week=through_week,
+        banned_first_pick_teams=options.banned_first_pick_teams,
+        hessian_weeks=options.hessian_weeks,
+        branch_and_bound=options.branch_and_bound,
+        timeout_seconds=options.timeout_seconds,
+        branch_and_bound_workers=options.branch_and_bound_workers,
     )
-    record_timing(:prior)
-    context = fit_regular_season_forecast(
-        options.season;
-        as_of_week=state.current_week,
-        schedule=normalized_schedule,
-        historical_drives=historical,
-        current_drives=current,
-        max_seasons=max_seasons,
-        method=method,
-        prior=cached_prior.prior,
-        _normalized_schedule=true,
-        _schedule_indexed_drives=true,
-    )
-    record_timing(:fit)
-    record_timing(:optimize_start)
-    plan = optimize_survivor_pool(
+    if options.write_model_file !== nothing
+        saved_path = write_survivor_pool_lp(
+            options.write_model_file,
+            context;
+            picks_made=state.picks_made,
+            strikes_remaining=state.strikes_remaining,
+            selection_config=selection_config,
+            include_completed=true,
+        )
+        log_phase_timing(:model_export)
+        @info "survivor MILP saved" path=saved_path
+        return 0
+    end
+
+    log_phase_timing(:optimize_start)
+    solve_plan = () -> optimize_survivor_pool(
         context;
         picks_made=state.picks_made,
         strikes_remaining=state.strikes_remaining,
         include_completed=true,
-        selection_config=SurvivorSelectionConfig(
-            objective=options.objective,
-            through_week=through_week,
-        ),
+        selection_config=selection_config,
     )
-    record_timing(:optimize)
+    plan = solve_plan()
+    log_phase_timing(:optimize)
     nrow(plan.current_pick) == 1 ||
         throw(ArgumentError("survivor optimization did not produce one current pick"))
-    print(output, String(plan.current_pick.team[1]), '\n')
-    record_timing(:output)
+    selected_team = String(plan.current_pick.team[1])
+    @info "survivor pick selected" week=state.current_week team=selected_team
+    print(output, selected_team, '\n')
+    log_phase_timing(:output)
     return 0
 end
 
 function (@main)(args)
     try
+        _survivor_configure_blas_threads!()
         return _run_survivor_cli(args)
     catch error
         if error isa ArgumentError

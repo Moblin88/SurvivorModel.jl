@@ -324,6 +324,10 @@ local checkout into Julia's app environment with:
 julia -e 'using Pkg; Pkg.Apps.develop(path="/path/to/SurvivorModel")'
 ```
 
+The installed app loads Julia's `startup.jl`, including user startup settings.
+After changing the app's launcher configuration, rerun `Pkg.Apps.develop` to
+regenerate an existing launcher.
+
 Then run it from any directory:
 
 ```sh

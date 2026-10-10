@@ -1,6 +1,7 @@
 using Test
 
 @testset "SurvivorModel.jl" begin
+    include("docker_startup_unit.jl")
     include("unit.jl")
     include("drive_cache_unit.jl")
     include("model_unit.jl")

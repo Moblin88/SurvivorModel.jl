@@ -575,6 +575,15 @@ The image defaults to `JULIA_NUM_THREADS=auto` for runtime Julia processes.
 Override it with `docker run -e JULIA_NUM_THREADS=N` to set a specific thread
 count.
 
+The image installs a standalone Julia `startup.jl` that selects AOCL on AMD
+x86 CPUs and MKL on Intel x86 CPUs using the container's Linux CPU vendor ID.
+ARM and unknown vendors retain default BLAS. Both x86 backends are installed
+in a Docker-only environment, separate from the application's dependencies;
+startup does not install packages or change the active project. Backend load
+errors propagate normally. Julia apps must enable startup files to use this
+selection (the installed `survivor` app already does).
+This does not change the BLAS thread limit applied before parallel tree work.
+
 Dependency installation and precompilation run before copying `src/`, in a
 separate Docker layer. Source-only rebuilds reuse that layer and recompile the
 package and installed app; changes to either project file invalidate dependency

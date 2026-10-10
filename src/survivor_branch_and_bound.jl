@@ -1553,7 +1553,6 @@ function _optimize_survivor_branch_and_bound_parallel!(
     end
     results = Channel{SurvivorTreeNodeResult}(worker_count)
     stopping = Threads.Atomic{Bool}(false)
-    worker_count > 1 && LinearAlgebra.BLAS.set_num_threads(1)
     for worker in workers
         worker.task = Threads.@spawn :default _survivor_tree_worker_loop!(
             worker, results, remaining_time, optimize_relaxation!, stopping,

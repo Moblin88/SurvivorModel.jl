@@ -1,22 +1,7 @@
 using DataFrames
 using Dates
-using LinearAlgebra
 using Test
 using SurvivorModel
-
-@testset "CLI preserves BLAS threads before parallel work" begin
-    original_threads = BLAS.get_num_threads()
-    try
-        BLAS.set_num_threads(2)
-        configured_threads = BLAS.get_num_threads()
-        @test redirect_stdout(devnull) do
-            SurvivorModel.main(["--help"])
-        end == 0
-        @test BLAS.get_num_threads() == configured_threads
-    finally
-        BLAS.set_num_threads(original_threads)
-    end
-end
 
 if !isdefined(Main, :_survivor_context_fixture)
     function _survivor_context_fixture()

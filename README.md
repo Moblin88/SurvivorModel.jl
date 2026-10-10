@@ -207,7 +207,7 @@ optimizer calls around tree runs, resetting that scheduler before and after
 the tree so one-thread HiPO solves also work after earlier default-thread
 solves. Do not run unrelated direct HiGHS solves concurrently with a tree run.
 
-Without an environment or runtime thread setting, Julia 1.12 may provide only
+Without an environment or runtime thread setting, Julia 1.13 may provide only
 one default-pool thread, so the tree remains single-worker. The coordinator
 retains bounds for queued and in-flight nodes and owns incumbent selection,
 branching, and progress output. Concurrent solve completion can change search
@@ -308,7 +308,7 @@ zero means the next loss eliminates it.
 
 ### Survivor command-line app
 
-Julia 1.12 can run the package directly through its `@main` entry point:
+Julia 1.13 can run the package directly through its `@main` entry point:
 
 ```sh
 julia --project=. -m SurvivorModel --season 2026 <<'EOF'

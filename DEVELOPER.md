@@ -119,7 +119,7 @@ to the default-pool size. The coordinator is not assigned a reserved solver
 thread; node work runs as `Threads.@spawn :default` tasks, and ownership follows
 the task rather than a thread ID. The package/app does not set a Julia thread
 flag: Julia startup honors `JULIA_NUM_THREADS`, so set it before launch to
-select automatic or explicit pool sizing. On Julia 1.12, the default pool can
+select automatic or explicit pool sizing. On Julia 1.13, the default pool can
 contain only one thread when the variable is unset.
 
 HiGHS' scheduler is process-global, so prior ordinary solves can otherwise

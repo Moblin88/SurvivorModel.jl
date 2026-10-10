@@ -45,7 +45,7 @@ end
     @test size(grid.cells) == (4, 17)
     @test size(grid.top_five) == size(grid.cells)
     @test grid.top_five == .!isnothing.(grid.cells)
-    @test !isdefined(SurvivorModel, :GLMakie)
+    @test !isdefined(SurvivorModel, :CairoMakie)
 
     @testset "opponents, byes, and every adjusted probability" begin
         corrections = Float64[]

@@ -64,5 +64,5 @@ using Test
     @test_throws ArgumentError SurvivorModel._team_strength_label_layout(
         [(0.0, 0.0)], [(40.0, 29.0)], (100.0, 100.0); padding=-1.0,
     )
-    @test !isdefined(SurvivorModel, :GLMakie)
+    @test !isdefined(SurvivorModel, :CairoMakie)
 end

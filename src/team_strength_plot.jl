@@ -143,18 +143,18 @@ function _team_strength_plot_data(
     )
 end
 
-function _load_glmakie()
-    if !isdefined(@__MODULE__, :GLMakie)
+function _load_cairomakie()
+    if !isdefined(@__MODULE__, :CairoMakie)
         try
-            Base.eval(@__MODULE__, :(import GLMakie))
+            Base.eval(@__MODULE__, :(import CairoMakie))
         catch error
             throw(ErrorException(
-                "could not load GLMakie for the interactive team-strength " *
+                "could not load CairoMakie for the PNG team-strength " *
                 "plot: $(sprint(showerror, error))",
             ))
         end
     end
-    return Base.eval(@__MODULE__, :(GLMakie))
+    return Base.eval(@__MODULE__, :(CairoMakie))
 end
 
 function _team_strength_prior_percentile(prior::GammaParams, rate::Real)
@@ -266,52 +266,31 @@ function _team_strength_figure(
     return figure
 end
 
-function _show_team_strength_plot(
-    context::RegularSeasonForecastContext;
-    on_screen::Function=(_screen -> nothing),
+function _save_team_strength_plot(
+    context::RegularSeasonForecastContext,
+    output_path::AbstractString,
 )
     data = _team_strength_plot_data(context)
-    makie = _load_glmakie()
+    makie = _load_cairomakie()
     return Base.invokelatest(
-        _show_team_strength_plot_latest!,
+        _save_team_strength_plot_latest!,
         makie,
         data,
-        context;
-        on_screen,
+        context,
+        output_path,
     )
 end
 
-function _show_team_strength_plot_latest!(
+function _save_team_strength_plot_latest!(
     makie::Module,
     data::AbstractDataFrame,
-    context::RegularSeasonForecastContext;
-    on_screen::Function=(_screen -> nothing),
+    context::RegularSeasonForecastContext,
+    output_path::AbstractString,
 )
     figure = _team_strength_figure(makie, data, context)
     try
-        screen = try
-            makie.activate!()
-            makie.Screen(
-                figure.scene;
-                start_renderloop=false,
-                visible=true,
-                title="SurvivorModel team strength",
-            )
-        catch error
-            throw(ErrorException(
-                "could not open the GLMakie team-strength window; a working " *
-                "desktop/OpenGL display is required: $(sprint(showerror, error))",
-            ))
-        end
-        try
-            Base.invokelatest(on_screen, screen)
-            if isopen(screen)
-                makie.start_renderloop!(screen)
-                wait(screen)
-            end
-        finally
-            isopen(screen) && close(screen)
-        end
+        makie.activate!()
+        makie.save(output_path, figure; px_per_unit=1)
     finally
         makie.empty!(figure)
     end

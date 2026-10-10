@@ -334,12 +334,14 @@ Then run it from any directory:
 survivor --season 2026 < picks.txt
 ```
 
-Use `--plot-strength WEEK` to open a team-strength scatter plot without
+Use `--plot-strength WEEK` to save a team-strength PNG scatter plot without
 providing picks or running survivor selection:
 
 ```sh
 survivor --season 2026 --plot-strength 5
 survivor --season 2026 --plot-strength=5
+survivor --season 2026 --plot-strength 5 --plot-output strengths.png
+survivor --season 2026 --plot-strength=5 --plot-output=strengths.png
 ```
 
 Week `WEEK` is the start of that week: the posterior includes current-season
@@ -366,14 +368,15 @@ high-contrast color for each team. Team labels use bold text on opaque white
 backgrounds. Recognized historical abbreviations use their franchise's color;
 unknown abbreviations produce a warning and use neutral gray. Collision-aware
 placement keeps labels clear of one another and the mean markers, with leader
-lines to their points, and updates when the window is resized. Very small
-windows may still crowd labels; enlarge the window if a warning appears.
+lines to their points. The saved figure is 1100 × 760 pixels.
 
-GLMakie loads only for this option. The command opens a native desktop window
-and stays open until you close it; a working graphical/OpenGL display is
-required. Headless servers and containers cannot use this popup without a
-configured display, and there is no file-output fallback. Cache refreshes can
-be combined with plotting:
+CairoMakie loads only for this option. No GPU, graphical display, or Xvfb is
+required, including in the Docker image. The default output is
+`team-strength-SEASON-week-WEEK.png` in the working directory.
+`--plot-output FILE.png` overrides the path (spaced and equals forms work);
+only PNG paths are accepted, and existing files are overwritten normally.
+The saved path is logged to stderr, leaving stdout unchanged. Write failures
+propagate rather than reporting success. Cache refreshes can be combined with plotting:
 
 ```sh
 survivor --refresh-priors --season 2026 --plot-strength 5
@@ -411,7 +414,7 @@ Every displayed probability includes the posterior Hessian adjustment,
 including later weeks, and is computed from the same start-of-current-week
 posterior. Later games with recorded results remain forecastable for replay;
 future drives and outcomes do not enter the posterior. The grid prints every
-row and week without truncation, does not run optimization or load GLMakie,
+row and week without truncation, does not run optimization or load CairoMakie,
 and keeps diagnostics on stderr. `--strikes`, `--refresh-data`, and
 `--refresh-priors` are allowed. Do not combine `--grid` with `--plot-strength`,
 `--ban`, `--branch-and-bound`, `--no-branch-and-bound`, `--write-model`,
@@ -585,13 +588,15 @@ package and installed app; changes to either project file invalidate dependency
 setup. Cache reuse also depends on the base image and target architecture.
 Both CI build jobs import and export GitHub Actions layer caches, including
 intermediate dependency layers.
-Build-time precompilation uses Xvfb for GLMakie; the runtime entrypoint remains
-unchanged, and interactive plotting still requires a graphical display.
+Build-time precompilation and PNG rendering need no virtual display.
+The runtime entrypoint and CPU-specific BLAS selection remain unchanged.
 
 GitHub Actions builds the image for pull requests without publishing, then
-publishes multi-platform `linux/amd64` and `linux/arm64` images to Docker Hub
-on pushes to `main` and `v*` tags. Docker selects the image matching the host
-architecture. Before the first publish, create the public Docker Hub repository
+publishes `linux/amd64` images to Docker Hub on pushes to `main` and `v*` tags.
+ARM hosts need amd64 emulation to run these published images, or can build a
+native image locally from the Dockerfile. Existing published tags are not
+retroactively modified; future publishing replaces `latest` (or a reused tag)
+with an amd64-only image. Before the first publish, create the public Docker Hub repository
 `moblin88/survivormodel.jl` and configure these repository Actions settings:
 
 - `DOCKERHUB_USERNAME` as a repository Actions variable, set to your Docker

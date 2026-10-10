@@ -123,7 +123,7 @@ end
 
 @testset "regular-season forecast" begin
     schedule, historical, current = _forecast_fixture()
-    @test !isdefined(SurvivorModel, :GLMakie)
+    @test !isdefined(SurvivorModel, :CairoMakie)
 
     @testset "league Gamma prior percentile axes" begin
         offense_prior = GammaParams(1.0, 2.0)
@@ -249,7 +249,7 @@ end
             end
         end
         @test week_three_data.defense_rate != week_two_data.defense_rate
-        @test !isdefined(SurvivorModel, :GLMakie)
+        @test !isdefined(SurvivorModel, :CairoMakie)
 
         invalid_context = fit_regular_season_forecast(
             2023;

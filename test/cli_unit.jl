@@ -175,6 +175,7 @@ end
             refresh_data=false,
             refresh_priors=false,
             plot_strength_week=nothing,
+            plot_output=nothing,
             grid=false,
         )
         @test SurvivorModel._parse_survivor_cli_args(
@@ -255,6 +256,7 @@ end
             refresh_data=true,
             refresh_priors=false,
             plot_strength_week=nothing,
+            plot_output=nothing,
             grid=false,
         )
         @test SurvivorModel._parse_survivor_cli_args(
@@ -833,17 +835,53 @@ end
     end
 
     @testset "plot-only CLI mode" begin
+        for argument in (["--plot-output", "strength.png"], ["--plot-output=strength.png"])
+            options = SurvivorModel._parse_survivor_cli_args(
+                vcat(["--season=2023", "--plot-strength=3"], argument),
+            )
+            @test options.plot_output == "strength.png"
+        end
+        for args in (
+            ["--season=2023", "--plot-output=out.png"],
+            ["--plot-output=out.png"],
+            ["--season=2023", "--grid", "--plot-output=out.png"],
+            ["--season=2023", "--plot-strength=3", "--plot-output="],
+            ["--season=2023", "--plot-strength=3", "--plot-output=  "],
+            ["--season=2023", "--plot-strength=3", "--plot-output=out.pdf"],
+            ["--season=2023", "--plot-strength=3", "--plot-output=out"],
+            ["--season=2023", "--plot-strength=3", "--plot-output"],
+            ["--season=2023", "--plot-strength=3", "--plot-output=a.png", "--plot-output", "b.png"],
+        )
+            @test_throws ArgumentError SurvivorModel._parse_survivor_cli_args(args)
+        end
         schedule, historical, current = _survivor_context_fixture()
         input = IOBuffer("this is not a pick\n")
         output = IOBuffer()
         contexts = SurvivorModel.RegularSeasonForecastContext[]
         raw_cache_clears = Ref(0)
-        display_plot = context -> begin
+        display_plot = (context, path) -> begin
+            @test path == "team-strength-2023-week-3.png"
             push!(contexts, context)
             return nothing
         end
-        @test !isdefined(SurvivorModel, :GLMakie)
+        @test !isdefined(SurvivorModel, :CairoMakie)
         mktempdir() do cache_directory
+            for argument in (["--plot-output", "custom.png"], ["--plot-output=custom.png"])
+                @test SurvivorModel._run_survivor_cli(
+                    vcat(["--season=2023", "--plot-strength=3"], argument);
+                    input, output, schedule,
+                    historical_drives=historical,
+                    current_drives=current,
+                    cache_directory,
+                    show_team_strength_plot=(context, path) -> begin
+                        @test context.as_of_week == 3
+                        @test path == "custom.png"
+                        return nothing
+                    end,
+                ) == 0
+                @test position(input) == 0
+                @test isempty(String(take!(output)))
+            end
             exit_code = withenv(
                 "SURVIVORMODEL_REFRESH_DATA" => "false",
             ) do
@@ -889,7 +927,7 @@ end
                     ),
                 ),
             )
-            @test !isdefined(SurvivorModel, :GLMakie)
+            @test !isdefined(SurvivorModel, :CairoMakie)
         end
     end
 
@@ -950,8 +988,8 @@ end
                 @test occursin("Hessian-adjusted", text)
                 @test length(grid.teams) == (week == 1 ? 4 : 3)
                 @test week == 1 || !("A" in grid.teams)
-                @test !isdefined(SurvivorModel, :GLMakie)
-                @test !any(package -> package.name == "GLMakie", keys(Base.loaded_modules))
+                @test !isdefined(SurvivorModel, :CairoMakie)
+                @test !any(package -> package.name in ("CairoMakie", "Makie", "GLMakie", "GLFW"), keys(Base.loaded_modules))
             end
 
             write(stale_prior, "cached")
@@ -982,7 +1020,7 @@ end
             @test position(input) == 0
             @test occursin("--grid", String(take!(output)))
             @test isfile(stale_prior)
-            @test !isdefined(SurvivorModel, :GLMakie)
+            @test !isdefined(SurvivorModel, :CairoMakie)
             @test_throws ArgumentError SurvivorModel._run_survivor_cli(
                 ["--season=2023", "--grid", "--strikes=0"];
                 input=IOBuffer("A\n"),

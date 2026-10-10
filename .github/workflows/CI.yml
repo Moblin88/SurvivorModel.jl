@@ -16,9 +16,6 @@ jobs:
     name: Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.arch }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
-    env:
-      DISPLAY: ":99"
-      LIBGL_ALWAYS_SOFTWARE: "1"
     permissions: # needed to allow julia-actions/cache to proactively delete old caches that it has created
       actions: write
       contents: read
@@ -39,29 +36,11 @@ jobs:
           version: ${{ matrix.version }}
           arch: ${{ matrix.arch }}
       - uses: julia-actions/cache@v3
-      - name: Set up virtual display for Julia builds and tests
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes xvfb xauth x11-utils libgl1-mesa-dri libxrandr2 libxinerama1 libxcursor1 libxi6
-          Xvfb "$DISPLAY" -screen 0 1600x1200x24 +extension GLX -nolisten tcp > "$RUNNER_TEMP/xvfb.log" 2>&1 &
-          xvfb_pid=$!
-          for attempt in {1..30}; do
-            if xdpyinfo -display "$DISPLAY" >/dev/null 2>&1; then
-              exit 0
-            fi
-            if ! kill -0 "$xvfb_pid" 2>/dev/null; then
-              break
-            fi
-            sleep 1
-          done
-          echo "::error::Xvfb failed to become ready"
-          tail -50 "$RUNNER_TEMP/xvfb.log"
-          exit 1
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
       - name: Exercise parallel branch-and-bound workers
         run: julia --threads=2 --project=. test/survivor_branch_and_bound_unit.jl
-      - name: Test interactive team-strength plot
+      - name: Test headless team-strength PNG rendering
         run: julia --project=. test/team_strength_plot_rendering.jl
       - uses: julia-actions/julia-processcoverage@v1
       - uses: codecov/codecov-action@v7

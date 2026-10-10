@@ -4,7 +4,31 @@ using Logging
 
 include("forecast_unit.jl")
 
-using GLMakie
+pop!(ENV, "DISPLAY", nothing)
+pop!(ENV, "WAYLAND_DISPLAY", nothing)
+using CairoMakie
+
+function _test_png(path, width, height)
+    bytes = read(path)
+    @test length(bytes) > 1000
+    @test bytes[1:8] == UInt8[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]
+    @test String(bytes[13:16]) == "IHDR"
+    @test foldl((value, byte) -> 256value + Int(byte), bytes[17:20]; init=0) == width
+    @test foldl((value, byte) -> 256value + Int(byte), bytes[21:24]; init=0) == height
+    return nothing
+end
+
+function _test_saved_labels(figure, mapped, width, height)
+    path = joinpath(@__DIR__, "cairo-layout-$(getpid()).png")
+    try
+        CairoMakie.save(path, figure; px_per_unit=1)
+        _test_png(path, width, height)
+        _test_rendered_team_labels(figure.content[1], mapped)
+    finally
+        rm(path; force=true)
+    end
+    return nothing
+end
 
 schedule, historical, current = _forecast_fixture()
 schedule.away_team = replace.(schedule.away_team, "AWAY" => "KC", "HOME" => "JAX")
@@ -23,7 +47,7 @@ context = fit_regular_season_forecast(
 data = SurvivorModel._team_strength_plot_data(context)
 percentiles = SurvivorModel._team_strength_plot_percentiles(data, context.model.prior)
 figure = SurvivorModel._team_strength_figure(
-    GLMakie,
+    CairoMakie,
     data,
     context,
 )
@@ -31,23 +55,23 @@ axis = figure.content[1]
 plots = axis.scene.plots
 
 function _test_team_strength_plot_colors(axis, teams)
-    colors = GLMakie.Makie.to_color.(
+    colors = CairoMakie.Makie.to_color.(
         SurvivorModel._team_strength_team_colors(teams)
     )
     plots = axis.scene.plots
     @test plots[1].color[] == colors
     @test plots[2].color[] == colors
     @test plots[3].color[] == colors
-    labels = filter(plot -> plot isa GLMakie.TextLabel, plots)
+    labels = filter(plot -> plot isa CairoMakie.TextLabel, plots)
     @test [plot.text[] for plot in labels] == teams
     @test [plot.text_color[] for plot in labels] == colors
     @test [plot.strokecolor[] for plot in labels] == colors
-    leaders = only(filter(plot -> plot isa GLMakie.LineSegments, plots))
+    leaders = only(filter(plot -> plot isa CairoMakie.LineSegments, plots))
     @test leaders.color[] == repeat(colors; inner=2)
     return colors
 end
 
-@testset "GLMakie team-strength figure" begin
+@testset "CairoMakie team-strength figure" begin
     @test length(plots) == nrow(data) + 4
     team_colors = _test_team_strength_plot_colors(axis, data.team)
     scatter = plots[1][1][]
@@ -72,7 +96,7 @@ end
         interval[3] == percentiles.defense_upper_percentile[index]
         for (index, interval) in enumerate(plots[3][1][])
     )
-    labels = filter(plot -> plot isa GLMakie.TextLabel, plots)
+    labels = filter(plot -> plot isa CairoMakie.TextLabel, plots)
     @test [plot.text[] for plot in labels] == data.team
     @test all(plot.fontsize[] >= 17 for plot in labels)
     @test all(plot.background_color[] === :white for plot in labels)
@@ -92,7 +116,7 @@ end
     reordered_data = data[[2, 1], :]
     reordered_data.team = ["OAK", "SD"]
     reordered_figure = SurvivorModel._team_strength_figure(
-        GLMakie,
+        CairoMakie,
         reordered_data,
         context,
     )
@@ -106,7 +130,7 @@ end
     skewed_data = copy(data)
     skewed_data.offense_rate[1] = 4.0 * maximum(data.offense_upper)
     skewed_data.defense_rate[1] = 0.5 * minimum(data.defense_lower)
-    skewed_figure = SurvivorModel._team_strength_figure(GLMakie, skewed_data, context)
+    skewed_figure = SurvivorModel._team_strength_figure(CairoMakie, skewed_data, context)
     skewed_axis = skewed_figure.content[1]
     mapped = SurvivorModel._team_strength_plot_percentiles(skewed_data, context.model.prior)
     @test skewed_axis.scene.plots[1][1][][1][1] == mapped.offense_percentile[1]
@@ -117,11 +141,11 @@ end
 end
 
 function _rendered_team_label_boxes(axis)
-    labels = filter(plot -> plot isa GLMakie.TextLabel, axis.scene.plots)
+    labels = filter(plot -> plot isa CairoMakie.TextLabel, axis.scene.plots)
     return [
         begin
-            background = only(filter(child -> child isa GLMakie.Poly, label.plots))
-            box = GLMakie.boundingbox(background)
+            background = only(filter(child -> child isa CairoMakie.Poly, label.plots))
+            box = CairoMakie.boundingbox(background)
             (
                 box.origin[1], box.origin[2],
                 box.origin[1] + box.widths[1], box.origin[2] + box.widths[2],
@@ -132,13 +156,13 @@ function _rendered_team_label_boxes(axis)
 end
 
 function _test_rendered_team_labels(axis, mapped)
-    width, height = GLMakie.viewport(axis.scene)[].widths
+    width, height = CairoMakie.viewport(axis.scene)[].widths
     boxes = _rendered_team_label_boxes(axis)
     @test length(boxes) == nrow(mapped)
-    segments = only(filter(plot -> plot isa GLMakie.LineSegments, axis.scene.plots))[1][]
+    segments = only(filter(plot -> plot isa CairoMakie.LineSegments, axis.scene.plots))[1][]
     @test length(segments) == 2 * nrow(mapped)
     anchors = [
-        GLMakie.Makie.project(
+        CairoMakie.Makie.project(
             axis.scene, :data, :pixel,
             Point2f(row.offense_percentile, row.defense_percentile),
         ) for row in eachrow(mapped)
@@ -183,7 +207,7 @@ dense_data = DataFrame(
     defense_lower=fill(SurvivorModel.quantile(defense_distribution, 0.25), 32),
     defense_upper=fill(SurvivorModel.quantile(defense_distribution, 0.75), 32),
 )
-dense_figure = SurvivorModel._team_strength_figure(GLMakie, dense_data, context)
+dense_figure = SurvivorModel._team_strength_figure(CairoMakie, dense_data, context)
 dense_axis = dense_figure.content[1]
 dense_mapped = SurvivorModel._team_strength_plot_percentiles(dense_data, context.model.prior)
 @testset "team colors follow all dense rows" begin
@@ -192,15 +216,15 @@ dense_mapped = SurvivorModel._team_strength_plot_percentiles(dense_data, context
 end
 
 @testset "dense team labels and resize" begin
-    _test_rendered_team_labels(dense_axis, dense_mapped)
+    _test_saved_labels(dense_figure, dense_mapped, 1100, 760)
     old_positions = [box[1:2] for box in _rendered_team_label_boxes(dense_axis)]
-    GLMakie.resize!(dense_figure, 680, 500)
-    _test_rendered_team_labels(dense_axis, dense_mapped)
+    CairoMakie.resize!(dense_figure, 680, 500)
+    _test_saved_labels(dense_figure, dense_mapped, 680, 500)
     @test old_positions != [box[1:2] for box in _rendered_team_label_boxes(dense_axis)]
-    GLMakie.resize!(dense_figure, 1100, 760)
-    _test_rendered_team_labels(dense_axis, dense_mapped)
+    CairoMakie.resize!(dense_figure, 1100, 760)
+    _test_saved_labels(dense_figure, dense_mapped, 1100, 760)
     image = get(ENV, "TEAM_STRENGTH_PLOT_SMOKE_IMAGE", "")
-    isempty(image) || GLMakie.save(image, dense_figure)
+    isempty(image) || CairoMakie.save(image, dense_figure)
 
     edge_data = copy(dense_data)
     edge_data.offense_rate = repeat([0.0, 1e308], 16)
@@ -209,70 +233,62 @@ end
     edge_data.offense_upper .= 1e308
     edge_data.defense_lower .= 0.0
     edge_data.defense_upper .= 1e308
-    edge_figure = SurvivorModel._team_strength_figure(GLMakie, edge_data, context)
-    _test_rendered_team_labels(
-        edge_figure.content[1],
+    edge_figure = SurvivorModel._team_strength_figure(CairoMakie, edge_data, context)
+    _test_saved_labels(
+        edge_figure,
         SurvivorModel._team_strength_plot_percentiles(edge_data, context.model.prior),
+        1100, 760,
     )
 end
 
-@testset "GLMakie popup lifecycle" begin
-    opened_screen = Ref{Any}(nothing)
-    owned_scene = Ref{Union{Nothing,GLMakie.Scene}}(nothing)
-    close_timer = Ref{Union{Nothing,Timer}}(nothing)
-    closing_task = Ref{Union{Nothing,Task}}(nothing)
-    lifecycle_events = Symbol[]
-    on_screen = screen -> begin
-        opened_screen[] = screen
-        owned_scene[] = screen.scene
-        @test isopen(screen)
-        @test !isempty(screen.scene.children)
-        close_timer[] = Timer(1.0) do _
-            closing_task[] = current_task()
-            push!(lifecycle_events, :closing)
-            isopen(screen) && close(screen)
+@testset "headless PNG save and overwrite" begin
+    directory = mkdir(joinpath(@__DIR__, "cairo-rendering-$(getpid())"))
+    try
+        path = joinpath(directory, "strength.png")
+        write(path, "replace me")
+        @test SurvivorModel._save_team_strength_plot(context, path) === nothing
+        _test_png(path, 1100, 760)
+        @test SurvivorModel._save_team_strength_plot(context, path) === nothing
+        _test_png(path, 1100, 760)
+        @test_throws Exception SurvivorModel._save_team_strength_plot(
+            context, joinpath(directory, "missing", "strength.png"),
+        )
+        for (name, plotted, mapped) in (
+            ("dense", dense_figure, dense_mapped),
+        )
+            path = joinpath(directory, "$name.png")
+            CairoMakie.save(path, plotted; px_per_unit=1)
+            _test_png(path, 1100, 760)
+            _test_rendered_team_labels(plotted.content[1], mapped)
         end
-        return nothing
+        cd(directory) do
+            for args in (
+                ["--season=2023", "--plot-strength=2"],
+                ["--season=2023", "--plot-strength=2", "--plot-output", "custom.png"],
+                ["--season=2023", "--plot-strength=2", "--plot-output=custom.png"],
+            )
+                input = IOBuffer("not a pick\n")
+                output = IOBuffer()
+                logger = Test.TestLogger()
+                result = with_logger(logger) do
+                    return SurvivorModel._run_survivor_cli(
+                        args; input, output, schedule,
+                        historical_drives=historical,
+                        current_drives=current,
+                        cache_directory=joinpath(pwd(), "cache"),
+                    )
+                end
+                @test result == 0
+                @test position(input) == 0
+                @test isempty(String(take!(output)))
+                path = length(args) == 2 ? "team-strength-2023-week-2.png" : "custom.png"
+                _test_png(path, 1100, 760)
+                @test any(record -> record.level == Logging.Info &&
+                    record.message == "team-strength PNG saved" &&
+                    record.kwargs[:path] == abspath(path), logger.logs)
+            end
+        end
+    finally
+        rm(directory; recursive=true)
     end
-
-    @test SurvivorModel._show_team_strength_plot(
-        context;
-        on_screen,
-    ) === nothing
-    push!(lifecycle_events, :returned)
-    @test lifecycle_events == [:closing, :returned]
-    @test closing_task[] !== nothing
-    closing_task[] !== nothing && wait(closing_task[])
-    @test opened_screen[] !== nothing
-    @test !isopen(opened_screen[])
-    @test isempty(owned_scene[].children)
-    close_timer[] !== nothing && close(close_timer[])
-
-    failed_screen = Ref{Any}(nothing)
-    failed_scene = Ref{Union{Nothing,GLMakie.Scene}}(nothing)
-    on_failed_screen = screen -> begin
-        failed_screen[] = screen
-        failed_scene[] = screen.scene
-        throw(ErrorException("test plot callback failure"))
-    end
-    @test_throws ErrorException("test plot callback failure") SurvivorModel._show_team_strength_plot(
-        context;
-        on_screen=on_failed_screen,
-    )
-    @test failed_screen[] !== nothing
-    @test !isopen(failed_screen[])
-    @test isempty(failed_scene[].children)
-
-    immediately_closed_scene = Ref{Union{Nothing,GLMakie.Scene}}(nothing)
-    on_immediate_close = screen -> begin
-        immediately_closed_scene[] = screen.scene
-        close(screen)
-        return nothing
-    end
-    @test SurvivorModel._show_team_strength_plot(
-        context;
-        on_screen=on_immediate_close,
-    ) === nothing
-    @test isempty(immediately_closed_scene[].children)
-    @test_logs min_level=Logging.Warn GLMakie.closeall()
 end

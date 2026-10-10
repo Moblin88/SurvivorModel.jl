@@ -11,4 +11,5 @@ using Test
     include("survivor_unit.jl")
     include("survivor_branch_and_bound_unit.jl")
     include("cli_unit.jl")
+    include("headless_cli_unit.jl")
 end

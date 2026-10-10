@@ -244,15 +244,18 @@ warn rather than silently hiding teams.
 
 CLI `--plot-strength WEEK` fits the same forecast context as a normal run, but
 uses the start of `WEEK` as its cutoff and returns before reading picks or
-building a survivor optimization. GLMakie is a direct app dependency but is
-imported only by this plot path. It opens a native window and waits until it is
-closed, so an available desktop/OpenGL display is required. The rendering
-smoke test runs under Xvfb with software Mesa in CI; headless operation is not
-silently treated as a successful plot. The display wrapper closes its owned
-screen and empties the figure on completion or failure to release scene
-callbacks. Headless percentile tests are in `test/forecast_unit.jl`, layout
-tests in `test/team_strength_labels_unit.jl`, and native geometry, dense-team,
-resize, and lifecycle coverage in `test/team_strength_plot_rendering.jl`.
+building a survivor optimization. CairoMakie is a direct app dependency but is
+imported only by this plot path, with `Base.invokelatest` bridging the lazy import.
+`_save_team_strength_plot` writes a 1100 × 760 PNG and empties the figure on
+completion or failure to release scene callbacks. The default filename is
+`team-strength-SEASON-week-WEEK.png` in the working directory; `--plot-output`
+accepts a PNG override in spaced or equals form, only with `--plot-strength`.
+Existing files are overwritten. Successful saves log their path on stderr;
+write errors propagate. No GPU, OpenGL context, or virtual display is needed
+for builds, runtime plotting, or CI. Headless percentile tests are in
+`test/forecast_unit.jl`, layout tests in `test/team_strength_labels_unit.jl`,
+and PNG signature/dimension, geometry, dense-team, resize, overwrite, and
+failure coverage in `test/team_strength_plot_rendering.jl`.
 
 ## Survivor grid
 
@@ -283,7 +286,7 @@ also separates groups of five team rows, without a trailing rule. Recorded
 future results are included for replay but do not replace model probabilities.
 
 Grid mode allows strikes and cache-refresh flags, rejects selection/export
-options and `--plot-strength`, and never imports GLMakie. Numerical, sorting,
+options and `--plot-strength`, and never imports CairoMakie. Numerical, sorting,
 formatting, and replay coverage is in `test/survivor_grid_unit.jl`; CLI
 integration coverage remains in `test/cli_unit.jl`.
 

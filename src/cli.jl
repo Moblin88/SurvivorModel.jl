@@ -14,8 +14,8 @@ function _survivor_cli_usage()
       survivor --refresh-data [--refresh-priors]
       julia --project=. -m SurvivorModel --refresh-priors
       julia --project=. -m SurvivorModel --refresh-data [--refresh-priors]
-      survivor --season YEAR --plot-strength WEEK
-      julia --project=. -m SurvivorModel --season YEAR --plot-strength WEEK
+      survivor --season YEAR --plot-strength WEEK [--plot-output FILE.png]
+      julia --project=. -m SurvivorModel --season YEAR --plot-strength WEEK [--plot-output FILE.png]
       survivor --season YEAR --grid [--strikes N] < picks.txt
       julia --project=. -m SurvivorModel --season YEAR --grid [--strikes N] < picks.txt
 
@@ -45,11 +45,13 @@ function _survivor_cli_usage()
                           caches and exit.
       --refresh-priors    Clear cached historical prior fits. Without
                           --season, clear the cache and exit.
-      --plot-strength WEEK  Show a plot at the start of WEEK (1-18), using
-                            prior weeks only; no picks or run options, and a
-                            native desktop/OpenGL display is required.
+      --plot-strength WEEK  Save a PNG at the start of WEEK (1-18), using
+                            prior weeks only; no picks or run options.
+                            Defaults to team-strength-SEASON-week-WEEK.png.
                             League-prior percentile axes and central 50%
                             posterior intervals with labeled team points.
+      --plot-output FILE.png  Override the PNG path; requires --plot-strength.
+                            Existing files are overwritten; no display needed.
       --grid              Print all unused teams and remaining weeks, with
                           opponents and Hessian-adjusted win percentages,
                           sorted by current-week probability; byes are blank.
@@ -104,6 +106,7 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
     refresh_priors_specified = false
     plot_strength_week = nothing
     plot_strength_specified = false
+    plot_output = nothing
     grid = false
     show_help = false
     index = 1
@@ -169,7 +172,8 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
             argument == "--hessian-weeks" ||
             argument == "--timeout" ||
             argument == "--branch-and-bound-workers" ||
-            argument == "--plot-strength"
+            argument == "--plot-strength" ||
+            argument == "--plot-output"
             option = argument
             index += 1
             index <= length(args) ||
@@ -199,6 +203,9 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
         elseif startswith(argument, "--plot-strength=")
             option = "--plot-strength"
             value = argument[length("--plot-strength=") + 1:end]
+        elseif startswith(argument, "--plot-output=")
+            option = "--plot-output"
+            value = argument[length("--plot-output=") + 1:end]
         else
             throw(ArgumentError("unknown option: $argument"))
         end
@@ -258,6 +265,14 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
             plot_strength_specified = true
             1 <= plot_strength_week <= 18 ||
                 throw(ArgumentError("--plot-strength must be between 1 and 18"))
+        elseif option == "--plot-output"
+            plot_output === nothing ||
+                throw(ArgumentError("--plot-output may only be specified once"))
+            isempty(strip(value)) &&
+                throw(ArgumentError("--plot-output requires a nonempty PNG path"))
+            lowercase(splitext(value)[2]) == ".png" ||
+                throw(ArgumentError("--plot-output requires a .png path"))
+            plot_output = value
         end
         index += 1
     end
@@ -275,8 +290,11 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
         refresh_data=false,
         refresh_priors=false,
         plot_strength_week=nothing,
+        plot_output=nothing,
         grid=false,
     )
+    plot_output !== nothing && !plot_strength_specified &&
+        throw(ArgumentError("--plot-output requires --plot-strength"))
     plot_strength_specified && season === nothing &&
         throw(ArgumentError("--plot-strength requires --season"))
     grid && season === nothing &&
@@ -351,6 +369,7 @@ function _parse_survivor_cli_args(args::AbstractVector{<:AbstractString})
         refresh_data=refresh_data,
         refresh_priors=refresh_priors,
         plot_strength_week=plot_strength_week,
+        plot_output=plot_output,
         grid=grid,
     )
 end
@@ -576,7 +595,7 @@ function _run_survivor_cli(
     through_week::Int=18,
     schedule_loader::Function=load_schedule,
     clear_data_cache::Function=NFLData.clear_cache,
-    show_team_strength_plot::Function=_show_team_strength_plot,
+    show_team_strength_plot::Function=_save_team_strength_plot,
 )
     phase_started = time_ns()
     log_phase_timing = function(phase::Symbol)
@@ -637,7 +656,11 @@ function _run_survivor_cli(
             refresh_data,
             log_phase_timing,
         )
-        show_team_strength_plot(context)
+        output_path = options.plot_output === nothing ?
+            "team-strength-$(options.season)-week-$(options.plot_strength_week).png" :
+            options.plot_output
+        show_team_strength_plot(context, output_path)
+        @info "team-strength PNG saved" path=abspath(output_path)
         return 0
     end
 

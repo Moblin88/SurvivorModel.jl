@@ -325,6 +325,10 @@ julia -e 'using Pkg; Pkg.Apps.develop(path="/path/to/SurvivorModel")'
 ```
 
 The installed app loads Julia's `startup.jl`, including user startup settings.
+Immediately before launching multiple branch-and-bound workers, the solver
+sets BLAS to one thread to avoid oversubscription. Other commands and
+single-worker solves leave BLAS settings unchanged; the one-thread setting
+remains in effect after a parallel solve.
 After changing the app's launcher configuration, rerun `Pkg.Apps.develop` to
 regenerate an existing launcher.
 

@@ -374,6 +374,9 @@ end
     function observe(event)
         push!(events, event)
         if event.kind == :node_start
+            if hasproperty(event, :worker) && Threads.nthreads(:default) >= 2
+                @test BNB.LinearAlgebra.BLAS.get_num_threads() == 1
+            end
             push!(active, hasproperty(event, :worker) ? event.worker : 1)
             max_active[] = max(max_active[], length(active))
         elseif event.kind in (
@@ -398,7 +401,13 @@ end
             @test event.retained == length(necessary)
         end
     end
-    plan = BNB._optimize_survivor_branch_and_bound!(tree; observer=observe)
+    original_blas_threads = BNB.LinearAlgebra.BLAS.get_num_threads()
+    plan = try
+        BNB.LinearAlgebra.BLAS.set_num_threads(2)
+        BNB._optimize_survivor_branch_and_bound!(tree; observer=observe)
+    finally
+        BNB.LinearAlgebra.BLAS.set_num_threads(original_blas_threads)
+    end
     first_index = only(findall((data.week .== 1) .&
                               (data.team .== only(plan.current_pick.team))))
     @test exhaustive[first_index] >= maximum(values(exhaustive)) - 5e-6

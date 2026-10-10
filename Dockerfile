@@ -17,4 +17,6 @@ COPY src/ /app/src/
 RUN xvfb-run -a julia --startup-file=no --project=/app -e 'using Pkg; Pkg.precompile(["SurvivorModel"]; workspace=false, strict=true); Pkg.Apps.develop(path="/app")' \
     && /root/.julia/bin/survivor --help
 
+ENV JULIA_NUM_THREADS=auto
+
 ENTRYPOINT ["/root/.julia/bin/survivor"]

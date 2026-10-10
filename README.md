@@ -567,6 +567,10 @@ docker build -t survivormodel .
 docker run --rm -i survivormodel --season 2026 < picks.txt
 ```
 
+The image defaults to `JULIA_NUM_THREADS=auto` for runtime Julia processes.
+Override it with `docker run -e JULIA_NUM_THREADS=N` to set a specific thread
+count.
+
 Dependency installation and precompilation run before copying `src/`, in a
 separate Docker layer. Source-only rebuilds reuse that layer and recompile the
 package and installed app; changes to either project file invalidate dependency

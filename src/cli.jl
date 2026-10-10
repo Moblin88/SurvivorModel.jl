@@ -1,74 +1,5 @@
 const SURVIVOR_CLI_APP_NAME = "survivor"
 
-function _survivor_parse_blas_threads(value::AbstractString, option::AbstractString)
-    parsed = tryparse(Int, strip(value))
-    parsed !== nothing && 1 <= parsed <= typemax(Int32) ||
-        throw(ArgumentError("$option must be a positive integer no greater than $(typemax(Int32))"))
-    return parsed
-end
-
-function _survivor_validate_blas_thread_environment(
-    key::AbstractString,
-    value::AbstractString,
-)
-    if key == "MKL_DOMAIN_NUM_THREADS"
-        isempty(strip(value)) &&
-            throw(ArgumentError("$key must not be empty"))
-        return nothing
-    end
-    values = key == "OMP_NUM_THREADS" ? split(value, ',') : (value,)
-    for item in values
-        _survivor_parse_blas_threads(item, key)
-    end
-    return nothing
-end
-
-function _survivor_blas_thread_environment_keys(blas_config::AbstractString)
-    config = lowercase(blas_config)
-    if occursin("mkl", config)
-        return ("MKL_NUM_THREADS", "MKL_DOMAIN_NUM_THREADS", "OMP_NUM_THREADS")
-    elseif occursin("aocl", config) || occursin("blis", config) ||
-        occursin("armpl", config)
-        return ("AOCL_NUM_THREADS", "BLIS_NUM_THREADS", "OMP_NUM_THREADS")
-    elseif occursin("openblas", config)
-        return ("OPENBLAS_NUM_THREADS", "GOTO_NUM_THREADS")
-    elseif occursin("accelerate", config)
-        return ("VECLIB_MAXIMUM_THREADS",)
-    end
-    return ()
-end
-
-function _survivor_blas_thread_count(
-    blas_config::AbstractString,
-    env::AbstractDict{<:AbstractString,<:AbstractString},
-)
-    key = "SURVIVORMODEL_BLAS_THREADS"
-    if haskey(env, key)
-        return _survivor_parse_blas_threads(env[key], key)
-    end
-    for key in _survivor_blas_thread_environment_keys(blas_config)
-        haskey(env, key) || continue
-        _survivor_validate_blas_thread_environment(key, env[key])
-        return nothing
-    end
-    return 1
-end
-
-function _survivor_configure_blas_threads!(; env=ENV)
-    blas = LinearAlgebra.BLAS
-    config = sprint(show, blas.get_config())
-    thread_count = _survivor_blas_thread_count(config, env)
-    thread_count === nothing && return nothing
-    blas.set_num_threads(thread_count)
-    actual_thread_count = blas.get_num_threads()
-    actual_thread_count == thread_count ||
-        throw(ArgumentError(
-            "active BLAS backend did not apply the requested $thread_count threads " *
-            "(reported $actual_thread_count)",
-        ))
-    return thread_count
-end
-
 function _survivor_cli_refresh_data_enabled()
     value = lowercase(strip(get(ENV, "SURVIVORMODEL_REFRESH_DATA", "false")))
     return value in ("1", "true", "yes", "on")
@@ -781,7 +712,6 @@ end
 
 function (@main)(args)
     try
-        _survivor_configure_blas_threads!()
         return _run_survivor_cli(args)
     catch error
         if error isa ArgumentError

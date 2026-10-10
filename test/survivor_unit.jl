@@ -926,7 +926,6 @@ end
             market_guard_weeks=0,
             through_week=3,
             hessian_weeks=3,
-            branch_and_bound=false,
         )
         plan = SurvivorModel._optimize_survivor_expected_weeks_scalar_milp(
             candidates,
@@ -1055,7 +1054,6 @@ end
             market_guard_weeks=0,
             through_week=3,
             hessian_weeks=3,
-            branch_and_bound=false,
         )
         plan = SurvivorModel._optimize_survivor_expected_weeks_scalar_milp(
             data,
@@ -1134,7 +1132,6 @@ end
             market_guard_weeks=0,
             through_week=2,
             hessian_weeks=2,
-            branch_and_bound=false,
         )
         parameter_only_plan =
             SurvivorModel._optimize_survivor_expected_weeks_scalar_milp(
@@ -1517,7 +1514,6 @@ end
             market_guard_weeks=0,
             through_week=2,
             hessian_weeks=2,
-            branch_and_bound=false,
         )
 
         greedy_data = DataFrame(data)
@@ -1553,7 +1549,6 @@ end
                 market_guard_weeks=0,
                 through_week=2,
                 hessian_weeks=hessian_weeks,
-                branch_and_bound=false,
             )
             plan = SurvivorModel._optimize_survivor_expected_weeks_scalar_milp(
                 data, state, selection_config, inputs,

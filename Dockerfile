@@ -2,6 +2,7 @@ FROM julia:1.13
 
 WORKDIR /app
 ENV JULIA_DEPOT_PATH=/root/.julia
+ENV JULIA_CPU_TARGET="generic,clone_all;znver1,base(0)"
 
 COPY Project.toml /app/Project.toml
 COPY test/Project.toml /app/test/Project.toml

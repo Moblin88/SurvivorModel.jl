@@ -591,10 +591,22 @@ intermediate dependency layers.
 Build-time precompilation and PNG rendering need no virtual display.
 The runtime entrypoint and CPU-specific BLAS selection remain unchanged.
 
+The amd64 image sets `JULIA_CPU_TARGET="generic,clone_all;znver1,base(0)"` before all
+precompilation steps. Package images include a generic x86-64 fallback and
+selectively cloned Zen 1 code; functions not cloned use the generic target.
+Julia 1.13 package images require the explicit base target to be marked
+`clone_all`; Zen 1 itself remains selectively cloned.
+Julia 1.13 already excludes XSAVES on Zen 1, so no explicit exclusion is needed.
+This avoids CPU-related cache incompatibility without changing runtime JIT
+tuning. Julia/package versions, preferences, compiler flags, or missing caches
+can still require recompilation, and previously uncompiled methods still JIT
+compile normally. Multiple targets can increase build time and cache size.
+
 GitHub Actions builds the image for pull requests without publishing, then
 publishes `linux/amd64` images to Docker Hub on pushes to `main` and `v*` tags.
 ARM hosts need amd64 emulation to run these published images, or can build a
-native image locally from the Dockerfile. Existing published tags are not
+native image locally after changing the Dockerfile's CPU target to an
+ARM-appropriate setting (such as `generic`). Existing published tags are not
 retroactively modified; future publishing replaces `latest` (or a reused tag)
 with an amd64-only image. Before the first publish, create the public Docker Hub repository
 `moblin88/survivormodel.jl` and configure these repository Actions settings:

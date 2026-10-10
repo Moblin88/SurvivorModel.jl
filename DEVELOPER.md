@@ -273,16 +273,18 @@ CLI `--plot-strength WEEK` fits the same forecast context as a normal run, but
 uses the start of `WEEK` as its cutoff and returns before reading picks or
 building a survivor optimization. GLMakie is a direct app dependency but is
 imported only by this plot path. It opens a native window and waits until it is
-closed, so an available desktop/OpenGL display is required. The rendering
-smoke test runs under Xvfb with software Mesa in CI; headless operation is not
-silently treated as a successful plot. The display wrapper closes its owned
-screen and empties the figure on completion or failure to release scene
-callbacks. The standalone two-thread branch-and-bound CI test also runs under
-Xvfb with software Mesa because GLMakie initialization can occur during
-precompilation even when that test does not render. Headless percentile tests
-are in `test/forecast_unit.jl`, layout
-tests in `test/team_strength_labels_unit.jl`, and native geometry, dense-team,
-resize, and lifecycle coverage in `test/team_strength_plot_rendering.jl`.
+closed, so an available desktop/OpenGL display is required. On Linux the
+display check fails before GLMakie loads if both `DISPLAY` and
+`WAYLAND_DISPLAY` are unset. The rendering smoke test runs under Xvfb with
+software Mesa in CI; headless operation is not silently treated as a
+successful plot. The display wrapper closes its owned screen and empties the
+figure on completion or failure to release scene callbacks. The standalone
+two-thread branch-and-bound CI test also runs under Xvfb with software Mesa
+because GLMakie initialization can occur during precompilation even when that
+test does not render. Headless percentile tests are in
+`test/forecast_unit.jl`, layout tests in `test/team_strength_labels_unit.jl`,
+and native geometry, dense-team, resize, and lifecycle coverage in
+`test/team_strength_plot_rendering.jl`.
 
 ## Survivor grid
 

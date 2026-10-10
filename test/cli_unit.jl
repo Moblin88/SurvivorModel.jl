@@ -532,6 +532,25 @@ end
             ["A"],
             0,
         )
+        incomplete_schedule = copy(schedule)
+        incomplete_schedule.result[incomplete_schedule.week .== 1] .= missing
+        incomplete_pick_error = try
+            SurvivorModel._survivor_cli_state(
+                SurvivorModel.load_schedule(incomplete_schedule),
+                2023,
+                ["A"],
+                2,
+            )
+            ""
+        catch error
+            error isa ArgumentError || rethrow()
+            sprint(showerror, error)
+        end
+        @test occursin(
+            "a previous pick refers to an uncompleted game (week 1, team A)",
+            incomplete_pick_error,
+        )
+        @test occursin("wait until the game is final", incomplete_pick_error)
         two_loss_schedule = copy(schedule)
         two_loss_schedule.result[two_loss_schedule.week .== 2] .= 7
         @test_throws ArgumentError SurvivorModel._survivor_cli_state(
@@ -603,6 +622,37 @@ end
             ["A", "A", "A"],
             2,
         )
+    end
+
+    @testset "headless team-strength plot diagnostic" begin
+        @test_throws ArgumentError SurvivorModel._require_team_strength_plot_display(
+            is_linux=true,
+            display="",
+            wayland_display="",
+        )
+        if Sys.islinux()
+            withenv("DISPLAY" => nothing, "WAYLAND_DISPLAY" => nothing) do
+                @test_throws ArgumentError SurvivorModel._run_survivor_cli(
+                    ["--season=2023", "--plot-strength=3"];
+                    schedule_loader=() -> error("headless plot loaded a schedule"),
+                )
+            end
+        end
+        @test SurvivorModel._require_team_strength_plot_display(
+            is_linux=true,
+            display=":0",
+            wayland_display="",
+        ) === nothing
+        @test SurvivorModel._require_team_strength_plot_display(
+            is_linux=true,
+            display="",
+            wayland_display="wayland-0",
+        ) === nothing
+        @test SurvivorModel._require_team_strength_plot_display(
+            is_linux=false,
+            display="",
+            wayland_display="",
+        ) === nothing
     end
 
     @testset "historical prior cache" begin
@@ -893,6 +943,7 @@ end
         mktempdir() do cache_directory
             exit_code = withenv(
                 "SURVIVORMODEL_REFRESH_DATA" => "false",
+                "DISPLAY" => ":test",
             ) do
                 SurvivorModel._run_survivor_cli(
                     [

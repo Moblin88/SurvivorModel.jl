@@ -436,13 +436,24 @@ function _read_survivor_cli_picks(input::IO)
     return picks
 end
 
-function _survivor_cli_result_value(value)
+const _SURVIVOR_CLI_UNCOMPLETED_PICK_PREFIX =
+    "a previous pick refers to an uncompleted game"
+
+function _survivor_cli_result_value(value, team::AbstractString, week::Integer)
     ismissing(value) &&
-        throw(ArgumentError("a previous pick refers to an uncompleted game"))
+        throw(ArgumentError(
+            "$_SURVIVOR_CLI_UNCOMPLETED_PICK_PREFIX (week $week, team $team); " *
+            "wait until the game is final or retry after its schedule result is updated",
+        ))
     result = value isa Real ? Float64(value) : tryparse(Float64, string(value))
     result === nothing ||
         (isfinite(result) && return result)
     throw(ArgumentError("schedule results must be finite numeric margins"))
+end
+
+function _survivor_cli_is_uncompleted_pick_error(error)
+    return error isa ArgumentError &&
+        startswith(error.msg, _SURVIVOR_CLI_UNCOMPLETED_PICK_PREFIX)
 end
 
 function _survivor_cli_schedule_and_state(
@@ -464,11 +475,9 @@ function _survivor_cli_schedule_and_state(
             initial_strikes,
         )
     catch error
-        stale_schedule = schedule === nothing &&
-            error isa ArgumentError &&
-            error.msg ==
-            "a previous pick refers to an uncompleted game"
-        stale_schedule || rethrow()
+        incomplete_pick = schedule === nothing &&
+            _survivor_cli_is_uncompleted_pick_error(error)
+        incomplete_pick || rethrow()
         clear_data_cache()
         normalized_schedule = schedule_loader()
         _survivor_cli_state(
@@ -519,7 +528,7 @@ function _survivor_cli_state(
                 "pick $team is not uniquely scheduled in season $season week $week",
             ))
 
-        result = _survivor_cli_result_value(matching.result[1])
+        result = _survivor_cli_result_value(matching.result[1], team, week)
         home_team = String(matching.home_team[1])
         away_team = String(matching.away_team[1])
         team_won = team == home_team ? result > 0 : result < 0
@@ -662,6 +671,8 @@ function _run_survivor_cli(
         print(output, _survivor_cli_usage())
         return 0
     end
+    options.plot_strength_week !== nothing &&
+        _require_team_strength_plot_display()
     if options.season === nothing
         if options.refresh_priors
             clear_historical_prior_cache!(; cache_directory=cache_directory)

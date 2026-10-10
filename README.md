@@ -367,9 +367,10 @@ windows may still crowd labels; enlarge the window if a warning appears.
 
 GLMakie loads only for this option. The command opens a native desktop window
 and stays open until you close it; a working graphical/OpenGL display is
-required. Headless servers and containers cannot use this popup without a
-configured display, and there is no file-output fallback. Cache refreshes can
-be combined with plotting:
+required. On Linux, if both `DISPLAY` and `WAYLAND_DISPLAY` are unset, the
+command reports this requirement before loading GLMakie. Headless servers and
+containers cannot use this popup without a configured display, and there is no
+file-output fallback. Cache refreshes can be combined with plotting:
 
 ```sh
 survivor --refresh-priors --season 2026 --plot-strength 5
@@ -387,8 +388,11 @@ survivor --season 2026 --grid --strikes 3 < picks.txt > grid.txt
 
 The grid has one row per unused target-season team and columns from the
 current week through week 18. Picks on stdin infer the current week and are
-validated just as in a selection run; empty input starts at week 1. Each cell
-shows a left-aligned opponent and right-aligned one-decimal model win
+validated just as in a selection run; empty input starts at week 1. Every
+previous pick must have a final schedule result so the CLI can count losses
+and strikes. If a result is missing, it refreshes the schedule cache once and
+reports the affected week and team if the result is still unavailable. Each
+cell shows a left-aligned opponent and right-aligned one-decimal model win
 percentage (`@SF 67.4%` for an away game, `SF 67.4%` for a home game); byes
 are blank. Percentages, decimal points, and the fixed-width star slots align
 within each week, and horizontal rules separate groups of five team rows

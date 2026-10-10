@@ -143,14 +143,31 @@ function _team_strength_plot_data(
     )
 end
 
+function _require_team_strength_plot_display(;
+    is_linux::Bool=Sys.islinux(),
+    display::AbstractString=get(ENV, "DISPLAY", ""),
+    wayland_display::AbstractString=get(ENV, "WAYLAND_DISPLAY", ""),
+)
+    if is_linux && isempty(strip(display)) && isempty(strip(wayland_display))
+        throw(ArgumentError(
+            "`--plot-strength` requires a graphical/OpenGL display, but " *
+            "DISPLAY and WAYLAND_DISPLAY are both unset; run it from a " *
+            "desktop session or omit it in a headless environment",
+        ))
+    end
+    return nothing
+end
+
 function _load_glmakie()
+    _require_team_strength_plot_display()
     if !isdefined(@__MODULE__, :GLMakie)
         try
             Base.eval(@__MODULE__, :(import GLMakie))
         catch error
-            throw(ErrorException(
-                "could not load GLMakie for the interactive team-strength " *
-                "plot: $(sprint(showerror, error))",
+            throw(ArgumentError(
+                "could not initialize GLMakie for the interactive team-strength " *
+                "plot: $(sprint(showerror, error)). Check that a working " *
+                "desktop/OpenGL display is available",
             ))
         end
     end
@@ -270,8 +287,8 @@ function _show_team_strength_plot(
     context::RegularSeasonForecastContext;
     on_screen::Function=(_screen -> nothing),
 )
-    data = _team_strength_plot_data(context)
     makie = _load_glmakie()
+    data = _team_strength_plot_data(context)
     return Base.invokelatest(
         _show_team_strength_plot_latest!,
         makie,
@@ -298,7 +315,7 @@ function _show_team_strength_plot_latest!(
                 title="SurvivorModel team strength",
             )
         catch error
-            throw(ErrorException(
+            throw(ArgumentError(
                 "could not open the GLMakie team-strength window; a working " *
                 "desktop/OpenGL display is required: $(sprint(showerror, error))",
             ))

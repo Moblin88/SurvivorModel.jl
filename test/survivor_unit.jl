@@ -1054,6 +1054,7 @@ end
             market_guard_weeks=0,
             through_week=3,
             hessian_weeks=3,
+            branch_and_bound=false,
         )
         plan = SurvivorModel._optimize_survivor_expected_weeks_scalar_milp(
             data,
@@ -1097,6 +1098,32 @@ end
         )
         @test plan.objective_value ≈ objective(selected_values)
         @test plan.objective_value ≈ exhaustive_objective
+
+        tree_config = SurvivorSelectionConfig(
+            minimum_favorite_spread=nothing,
+            market_guard_weeks=0,
+            through_week=3,
+            hessian_weeks=3,
+            branch_and_bound=true,
+        )
+        tree = SurvivorModel._build_survivor_full_model(data, state, tree_config, inputs)
+        events = []
+        tree_plan = SurvivorModel._optimize_survivor_branch_and_bound!(
+            tree; observer=event -> push!(events, event),
+        )
+        first_pick = first(SurvivorModel._survivor_fixed_selected_indices(
+            data, tree_plan.selections, state, 3,
+        ))
+        best_for_first_pick = maximum(
+            objective(SurvivorModel._survivor_scalar_forward_values(
+                [first_pick, second, third], inputs, 3, 2;
+                curvature_weeks=3, gradient_reference_indices=references,
+            ))
+            for second in 3:4, third in 5:6
+        )
+        @test last(events).proven
+        @test best_for_first_pick ≈ exhaustive_objective
+        @test tree_plan.objective_value <= best_for_first_pick + 1e-8
 
         parameter_only_positions = [1, 1, 1, 2, 2, 2]
         parameter_only_references =

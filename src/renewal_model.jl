@@ -1,205 +1,17 @@
 """
-Piecewise-constant two-outcome drive model.
+Cause-specific Weibull competing-risk drive model.
 
-Each drive is modeled as a race between an offensive touchdown hazard and a
-defensive-event hazard. The hazards are independent conditional on their
-team-specific rates, piecewise constant in elapsed time since drive start,
-and do not depend on field position.
-
-Team-specific hazards use Gamma posteriors. An historical empirical-Bayes prior
-can be fitted from any positive number of supplied seasons and updated with
-current-season exposure and event counts as data arrive. Historical
-hyperparameters are fit
-with the event-process marginal likelihood, including the competing-risk
-exposure term and the season-to-season reset transition. The historical fit
-can also estimate global offensive and defensive home multipliers, which
-remain fixed during current-season updates.
+Conditional on the team rates, a drive is a race between an offensive
+touchdown process and a defensive-event process. Each cause has a
+team-shared Weibull shape, with one Gamma-distributed cumulative-hazard rate
+per team. End-of-half drives are right-censored.
 """
 
-# ----------------------------------------------------------------------
-# 1. Time bins and exposure records
-# ----------------------------------------------------------------------
-
-"""
-    DEFAULT_TIME_EDGES
-
-Default elapsed-drive-time edges in seconds: 0-2, 2-4, 4-6, and 6+ minutes.
-"""
-const DEFAULT_TIME_EDGES = (0.0, 120.0, 240.0, 360.0, Inf)
-# Compatibility export; historical fitting itself accepts any positive window.
 const MAX_HISTORICAL_SEASONS = typemax(Int)
-const RESET_EM_MAX_ITERATIONS = 100
-const RESET_EM_ABSOLUTE_TOLERANCE = 1.0e-8
-const RESET_EM_RELATIVE_TOLERANCE = 1.0e-8
-const RESET_GAMMA_SHAPE_LOWER = 0.05
-const RESET_GAMMA_SHAPE_UPPER = 1.0e8
-const RESET_NEWTON_MAX_ITERATIONS = 80
-const RESET_NEWTON_SCORE_TOLERANCE = 1.0e-5
-const RESET_NEWTON_STEP_TOLERANCE = 1.0e-8
-const RESET_NEWTON_MAX_BACKTRACKS = 20
-const RESET_BLOCK_NEWTON_MAX_SWEEPS = 40
-const RESET_MOMENT_MAX_ITERATIONS = 32
-const RESET_MOMENT_TOLERANCE = 1.0e-6
-const RESET_MOMENT_DAMPING = 0.75
-
-"""
-    _validate_time_edges(edges) -> Vector{Float64}
-
-Validate and copy a piecewise-constant elapsed-time partition. The first edge
-must be zero, all finite edges must be strictly increasing, and the final
-edge must be `Inf`.
-"""
-function _validate_time_edges(edges)
-    values = Float64.(collect(edges))
-    length(values) >= 2 || throw(ArgumentError("time_edges must contain at least two values"))
-    values[1] == 0.0 || throw(ArgumentError("time_edges must start at 0.0"))
-    isinf(values[end]) || throw(ArgumentError("time_edges must end at Inf"))
-    all(isfinite, values[1:(end - 1)]) ||
-        throw(ArgumentError("only the final time edge may be infinite"))
-    all(diff(values) .> 0) || throw(ArgumentError("time_edges must be strictly increasing"))
-    return values
-end
-
-"""
-    _classify_event(drive_result::AbstractString) -> Symbol
-
-Classify a drive result into the two hazard-model outcomes:
-
-- `:td` — the offense scored a touchdown.
-- `:defensive` — every other non-censored drive-ending result.
-- `:censored` — the game or half clock ended the observation.
-"""
-function _classify_event(drive_result::AbstractString)
-    drive_result == "Touchdown" && return :td
-    drive_result == "End of half" && return :censored
-    return :defensive
-end
-
-"""
-    _drive_exposure_records(T, edges, event) -> Vector{NamedTuple}
-
-Expand one drive into one risk-exposure record per elapsed-time bin. A
-censored drive contributes exposure but no event.
-"""
-function _drive_exposure_records(T::Real, edges::AbstractVector{<:Real}, event::Symbol)
-    records = NamedTuple{(:time_bin, :exposure, :event),Tuple{Int,Float64,Symbol}}[]
-    n = length(edges) - 1
-    for k in 1:n
-        lo, hi = edges[k], edges[k + 1]
-        T <= lo && break
-        exposure = min(T, hi) - lo
-        exposure <= 0 && continue
-        terminal = T <= hi || k == n
-        ev = terminal && event !== :censored ? event : :none
-        push!(records, (time_bin=k, exposure=exposure, event=ev))
-        terminal && break
-    end
-    return records
-end
-
-function _season_from_game_id(game_id)
-    match_result = match(r"^(\d{4})", string(game_id))
-    return isnothing(match_result) ? missing : parse(Int, match_result.captures[1])
-end
-
-function _season_value(value)
-    ismissing(value) && return missing
-    value isa Integer && return Int(value)
-    return parse(Int, string(value))
-end
-
-function _drive_season(drives::AbstractDataFrame, i::Integer)
-    if :season in propertynames(drives)
-        return _season_value(drives.season[i])
-    end
-    return _season_from_game_id(drives.game_id[i])
-end
-
-function _latest_observed_season(drives::AbstractDataFrame)
-    seasons = Int[]
-    for i in 1:nrow(drives)
-        season = _drive_season(drives, i)
-        ismissing(season) || push!(seasons, Int(season))
-    end
-    return isempty(seasons) ? nothing : maximum(seasons)
-end
-
-"""
-    build_exposure_data(drives; time_edges=DEFAULT_TIME_EDGES) -> (data, time_edges)
-
-Build the long-format at-risk data used by the hazard model. The returned
-`DataFrame` has one row per `(drive, time_bin)` risk interval and columns
-`game_id`, `fixed_drive`, `season`, `posteam`, `defteam`, `posteam_home`,
-`defteam_home`, `time_bin`, `exposure`, `td`, and `defensive`.
-
-Rows with missing event result, duration, or teams are dropped. Field position
-is not required because it is not a covariate in this model.
-"""
-function build_exposure_data(
-    drives::AbstractDataFrame;
-    time_edges=DEFAULT_TIME_EDGES,
-)
-    edges = _validate_time_edges(time_edges)
-    complete = subset(
-        drives,
-        :drive_result => ByRow(!ismissing),
-        :time_of_possession => ByRow(!ismissing),
-        :posteam => ByRow(!ismissing),
-        :defteam => ByRow(!ismissing),
-        :posteam_home => ByRow(!ismissing),
-        :defteam_home => ByRow(!ismissing),
-        skipmissing=true,
-    )
-
-    durations = Float64[Dates.value(Second(t)) for t in complete.time_of_possession]
-    events = _classify_event.(complete.drive_result)
-
-    game_ids = eltype(complete.game_id)[]
-    fixed_drives = eltype(complete.fixed_drive)[]
-    seasons = Union{Missing,Int}[]
-    posteams = eltype(complete.posteam)[]
-    defteams = eltype(complete.defteam)[]
-    posteam_home = Bool[]
-    defteam_home = Bool[]
-    time_bins = Int[]
-    exposures = Float64[]
-    touchdowns = Int[]
-    defensive_events = Int[]
-    for i in 1:nrow(complete)
-        season = _drive_season(complete, i)
-        for rec in _drive_exposure_records(durations[i], edges, events[i])
-            push!(game_ids, complete.game_id[i])
-            push!(fixed_drives, complete.fixed_drive[i])
-            push!(seasons, season)
-            push!(posteams, complete.posteam[i])
-            push!(defteams, complete.defteam[i])
-            push!(posteam_home, Bool(complete.posteam_home[i]))
-            push!(defteam_home, Bool(complete.defteam_home[i]))
-            push!(time_bins, rec.time_bin)
-            push!(exposures, rec.exposure)
-            push!(touchdowns, rec.event === :td ? 1 : 0)
-            push!(defensive_events, rec.event === :defensive ? 1 : 0)
-        end
-    end
-
-    return DataFrame(
-        game_id=game_ids,
-        fixed_drive=fixed_drives,
-        season=seasons,
-        posteam=posteams,
-        defteam=defteams,
-        posteam_home=posteam_home,
-        defteam_home=defteam_home,
-        time_bin=time_bins,
-        exposure=exposures,
-        td=touchdowns,
-        defensive=defensive_events,
-    ), edges
-end
-
-# ----------------------------------------------------------------------
-# 2. Sufficient statistics and empirical-Bayes priors
-# ----------------------------------------------------------------------
+const DEFAULT_HISTORICAL_SEASONS = 5
+const SECONDS_PER_MINUTE = 60.0
+struct WeibullEmpiricalBayesFit end
+const DEFAULT_PRIOR_FIT_METHOD = WeibullEmpiricalBayesFit()
 
 """
     GammaParams
@@ -246,7 +58,7 @@ struct GammaMixture
             throw(ArgumentError("mixture weights must be finite and nonnegative"))
         total_weight = sum(normalized_weights)
         isfinite(total_weight) && total_weight > 0.0 ||
-            throw(ArgumentError("Gamma mixture weights must have positive mass"))
+            throw(ArgumentError("Gamma mixtures must have positive finite mass"))
         sources = Int.(collect(source_seasons))
         length(sources) == length(components) ||
             throw(ArgumentError("mixture source seasons must match components"))
@@ -259,14 +71,14 @@ struct GammaMixture
 end
 
 function _gamma_mixture_log_moments(mixture::GammaMixture)
-    log_means = [
+    component_log_means = [
         SpecialFunctions.digamma(component.shape) - log(component.rate)
         for component in mixture.components
     ]
-    mean_log = sum(weight * value for (weight, value) in zip(
-        mixture.weights,
-        log_means,
-    ))
+    mean_log = sum(
+        weight * value
+        for (weight, value) in zip(mixture.weights, component_log_means)
+    )
     second_log = sum(
         weight * (
             SpecialFunctions.trigamma(component.shape) + value^2
@@ -274,7 +86,7 @@ function _gamma_mixture_log_moments(mixture::GammaMixture)
         for (weight, component, value) in zip(
             mixture.weights,
             mixture.components,
-            log_means,
+            component_log_means,
         )
     )
     return mean_log, second_log - mean_log^2
@@ -288,12 +100,34 @@ function _gamma_mixture_mean(mixture::GammaMixture)
 end
 
 function _gamma_mixture_variance(mixture::GammaMixture)
-    second_moment = sum(
-        weight * component.shape * (component.shape + 1.0) /
-            component.rate^2
+    mean = _gamma_mixture_mean(mixture)
+    return sum(
+        weight * (
+            component.shape / component.rate / component.rate +
+            (component.shape / component.rate - mean)^2
+        )
         for (weight, component) in zip(mixture.weights, mixture.components)
     )
-    return second_moment - _gamma_mixture_mean(mixture)^2
+end
+
+function _gamma_mixture_quantile(mixture::GammaMixture, probability::Real)
+    probability_value = Float64(probability)
+    isfinite(probability_value) && 0.0 < probability_value < 1.0 ||
+        throw(ArgumentError("Gamma mixture quantile probability must be between 0 and 1"))
+    active = findall(>(0.0), mixture.weights)
+    components = Gamma{Float64}[]
+    for index in active
+        component = mixture.components[index]
+        scale = inv(component.rate)
+        isfinite(scale) && scale > 0.0 ||
+            throw(ArgumentError("Gamma mixture quantiles require finite positive scales"))
+        push!(components, Gamma(component.shape, scale))
+    end
+    distribution = MixtureModel(components, mixture.weights[active])
+    value = quantile(distribution, probability_value)
+    isfinite(value) && value >= 0.0 ||
+        throw(ArgumentError("Gamma mixture quantile must be finite and nonnegative"))
+    return Float64(value)
 end
 
 function _gamma_mixture_home_adjusted(
@@ -329,7 +163,6 @@ function _log_gamma_poisson_predictive(
         throw(ArgumentError("event counts must be integer-valued"))
     exposure_value == 0.0 &&
         return count_integer == 0 ? 0.0 : -Inf
-
     probability = component.rate / (component.rate + exposure_value)
     return logpdf(
         NegativeBinomial(component.shape, probability),
@@ -342,18 +175,20 @@ function _update_gamma_mixture(
     count::Real,
     exposure::Real,
 )
+    count_value = Float64(count)
+    exposure_value = Float64(exposure)
     updated_components = [
         GammaParams(
-            component.shape + Float64(count),
-            component.rate + Float64(exposure),
+            component.shape + count_value,
+            component.rate + exposure_value,
         )
         for component in mixture.components
     ]
     log_weights = [
         log(weight) + _log_gamma_poisson_predictive(
             component,
-            count,
-            exposure,
+            count_value,
+            exposure_value,
         )
         for (weight, component) in zip(mixture.weights, mixture.components)
     ]
@@ -372,8 +207,7 @@ end
     LikelihoodFitDiagnostics
 
 Diagnostics from a historical event-process likelihood fit. The likelihood is
-reported without data-only counting-process constants, so it is suitable for
-comparing parameter values fitted to the same data.
+reported without data-only point-process constants.
 """
 struct LikelihoodFitDiagnostics
     log_likelihood::Float64
@@ -383,22 +217,116 @@ struct LikelihoodFitDiagnostics
     status::Symbol
     boundary_parameters::Vector{Symbol}
 end
+
+function _classify_event(drive_result::AbstractString)
+    drive_result == "Touchdown" && return :td
+    drive_result == "End of half" && return :censored
+    return :defensive
+end
+
+function _season_from_game_id(game_id)
+    match_result = match(r"^(\d{4})", string(game_id))
+    return isnothing(match_result) ? missing : parse(Int, match_result.captures[1])
+end
+
+function _season_value(value)
+    ismissing(value) && return missing
+    value isa Integer && return Int(value)
+    return parse(Int, string(value))
+end
+
+function _drive_season(drives::AbstractDataFrame, index::Integer)
+    if :season in propertynames(drives)
+        return _season_value(drives.season[index])
+    end
+    :game_id in propertynames(drives) ||
+        throw(ArgumentError("drives must include either season or game_id"))
+    return _season_from_game_id(drives.game_id[index])
+end
+
+function _latest_observed_season(drives::AbstractDataFrame)
+    seasons = Int[]
+    for index in 1:nrow(drives)
+        season = _drive_season(drives, index)
+        ismissing(season) || push!(seasons, Int(season))
+    end
+    return isempty(seasons) ? nothing : maximum(seasons)
+end
+
+function _drive_duration_minutes(duration)
+    seconds = Float64(Dates.value(Second(duration)))
+    isfinite(seconds) && seconds >= 0.0 ||
+        throw(ArgumentError("drive durations must be finite and nonnegative"))
+    return seconds / SECONDS_PER_MINUTE
+end
+
+"""
+    build_drive_data(drives) -> DataFrame
+
+Build one continuous-duration record per complete drive. End-of-half drives
+remain in the data as right-censored records with `event == :censored`.
+Durations are represented in minutes; zero-second observed event times are
+floored to one second, the source data's time resolution.
+"""
+function build_drive_data(drives::AbstractDataFrame)
+    required = (
+        :drive_result,
+        :time_of_possession,
+        :posteam,
+        :defteam,
+        :posteam_home,
+        :defteam_home,
+    )
+    missing_columns = filter(column -> !(column in propertynames(drives)), required)
+    isempty(missing_columns) ||
+        throw(ArgumentError("drives are missing required columns: $missing_columns"))
+    complete = subset(
+        drives,
+        :drive_result => ByRow(!ismissing),
+        :time_of_possession => ByRow(!ismissing),
+        :posteam => ByRow(!ismissing),
+        :defteam => ByRow(!ismissing),
+        :posteam_home => ByRow(!ismissing),
+        :defteam_home => ByRow(!ismissing);
+        skipmissing=true,
+    )
+    seasons = Union{Missing,Int}[
+        _drive_season(complete, index)
+        for index in 1:nrow(complete)
+    ]
+    events = Symbol[
+        _classify_event(String(complete.drive_result[index]))
+        for index in 1:nrow(complete)
+    ]
+    durations = Float64[
+        _drive_duration_minutes(complete.time_of_possession[index])
+        for index in 1:nrow(complete)
+    ]
+    for index in eachindex(durations)
+        events[index] === :censored && continue
+        durations[index] == 0.0 && (durations[index] = 1.0 / SECONDS_PER_MINUTE)
+    end
+    return DataFrame(
+        season=seasons,
+        posteam=String.(complete.posteam),
+        defteam=String.(complete.defteam),
+        posteam_home=Bool.(complete.posteam_home),
+        defteam_home=Bool.(complete.defteam_home),
+        duration=durations,
+        event=events,
+    )
+end
+
 mutable struct OutcomeStats
-    counts::Dict{Tuple{String,Int},Float64}
-    exposure::Dict{Tuple{String,Int},Float64}
-    home_counts::Dict{Tuple{String,Int},Float64}
-    away_counts::Dict{Tuple{String,Int},Float64}
-    home_exposure::Dict{Tuple{String,Int},Float64}
-    away_exposure::Dict{Tuple{String,Int},Float64}
+    counts::Dict{String,Int}
+    home_exposure::Dict{String,Float64}
+    away_exposure::Dict{String,Float64}
 end
 
 OutcomeStats() = OutcomeStats(
-    Dict{Tuple{String,Int},Float64}(),
-    Dict{Tuple{String,Int},Float64}(),
-    Dict{Tuple{String,Int},Float64}(),
-    Dict{Tuple{String,Int},Float64}(),
-    Dict{Tuple{String,Int},Float64}(),
-    Dict{Tuple{String,Int},Float64}(),
+    Dict{String,Int}(),
+    Dict{String,Float64}(),
+    Dict{String,Float64}(),
 )
 
 mutable struct HazardSufficientStats
@@ -413,20 +341,71 @@ function _outcome_stats(stats::HazardSufficientStats, kind::Symbol)
     kind === :defensive && return stats.defensive
     throw(ArgumentError("kind must be :td or :defensive; got $kind"))
 end
+
+function _add_stat!(
+    values::Dict{String,Float64},
+    key::String,
+    amount::Real,
+)
+    values[key] = get(values, key, 0.0) + Float64(amount)
+    return nothing
+end
+
+function _record_cause_exposure!(
+    stats::OutcomeStats,
+    team::String,
+    is_home::Bool,
+    exposure::Float64,
+    is_event::Bool,
+)
+    _add_stat!(is_home ? stats.home_exposure : stats.away_exposure, team, exposure)
+    if is_event
+        stats.counts[team] = get(stats.counts, team, 0) + 1
+    end
+    return nothing
+end
+
+function _add_drive_stats!(
+    stats::HazardSufficientStats,
+    data::AbstractDataFrame,
+    td_shape::Real,
+    defensive_shape::Real,
+)
+    for row in eachrow(data)
+        td_exposure = row.duration^td_shape
+        defensive_exposure = row.duration^defensive_shape
+        _record_cause_exposure!(
+            stats.td,
+            row.posteam,
+            row.posteam_home,
+            td_exposure,
+            row.event === :td,
+        )
+        _record_cause_exposure!(
+            stats.defensive,
+            row.defteam,
+            row.defteam_home,
+            defensive_exposure,
+            row.event === :defensive,
+        )
+    end
+    return stats
+end
+
 """
     HazardPrior
 
-Historical empirical-Bayes hyperparameters and team-specific finite-mixture
-season-opening priors for the touchdown and defensive-event hazards. The
-fitted home multipliers are shared across teams and time bins, and each
-outcome has one persistence probability shared across its hazard curve.
+Empirical-Bayes Weibull shapes, Gamma hyperparameters, home multipliers,
+season-reset probabilities, and team-specific finite-mixture priors for
+touchdown and defensive-event cumulative-hazard rates.
 """
 struct HazardPrior
-    time_edges::Vector{Float64}
-    td_hyperparameters::Vector{GammaParams}
-    defensive_hyperparameters::Vector{GammaParams}
-    td_team_mixtures::Dict{String,Vector{GammaMixture}}
-    defensive_team_mixtures::Dict{String,Vector{GammaMixture}}
+    td_shape::Float64
+    defensive_shape::Float64
+    td_hyperparameters::GammaParams
+    defensive_hyperparameters::GammaParams
+    td_team_mixtures::Dict{String,GammaMixture}
+    defensive_team_mixtures::Dict{String,GammaMixture}
     td_home_multiplier::Float64
     defensive_home_multiplier::Float64
     td_persistence::Float64
@@ -436,16 +415,15 @@ struct HazardPrior
     defensive_fit_diagnostics::Union{Nothing,LikelihoodFitDiagnostics}
 end
 
-function _default_hazard_prior(time_edges::AbstractVector{<:Real})
-    n_bins = length(time_edges) - 1
-    td = [GammaParams(1.0, 100.0) for _ in 1:n_bins]
-    defensive = [GammaParams(1.0, 100.0) for _ in 1:n_bins]
+function _default_hazard_prior()
+    default_rate_prior = GammaParams(1.0, 10.0)
     return HazardPrior(
-        Float64.(time_edges),
-        td,
-        defensive,
-        Dict{String,Vector{GammaMixture}}(),
-        Dict{String,Vector{GammaMixture}}(),
+        1.0,
+        1.0,
+        default_rate_prior,
+        default_rate_prior,
+        Dict{String,GammaMixture}(),
+        Dict{String,GammaMixture}(),
         1.0,
         1.0,
         0.5,
@@ -456,50 +434,47 @@ function _default_hazard_prior(time_edges::AbstractVector{<:Real})
     )
 end
 
-"""
-    home_multiplier(prior::HazardPrior, kind::Symbol) -> Float64
+function _validate_cause(kind::Symbol)
+    kind === :td && return nothing
+    kind === :defensive && return nothing
+    throw(ArgumentError("kind must be :td or :defensive; got $kind"))
+end
 
-Return the empirical-Bayes home multiplier for `:td` or `:defensive`.
 """
+    weibull_shape(prior, kind) -> Float64
+
+Return the fitted Weibull shape for `:td` or `:defensive`.
+"""
+function weibull_shape(prior::HazardPrior, kind::Symbol)
+    _validate_cause(kind)
+    return kind === :td ? prior.td_shape : prior.defensive_shape
+end
+
 function home_multiplier(prior::HazardPrior, kind::Symbol)
-    kind === :td && return prior.td_home_multiplier
-    kind === :defensive && return prior.defensive_home_multiplier
-    throw(ArgumentError("kind must be :td or :defensive; got $kind"))
+    _validate_cause(kind)
+    return kind === :td ?
+        prior.td_home_multiplier : prior.defensive_home_multiplier
 end
 
-"""
-    hazard_persistence(prior::HazardPrior, kind::Symbol) -> Float64
-
-Return the season-to-season persistence probability for `:td` or
-`:defensive`.
-"""
 function hazard_persistence(prior::HazardPrior, kind::Symbol)
-    kind === :td && return prior.td_persistence
-    kind === :defensive && return prior.defensive_persistence
-    throw(ArgumentError("kind must be :td or :defensive; got $kind"))
+    _validate_cause(kind)
+    return kind === :td ? prior.td_persistence : prior.defensive_persistence
 end
 
-function likelihood_fit_diagnostics(
-    prior::HazardPrior,
-    kind::Symbol,
-)
-    kind === :td && return prior.td_fit_diagnostics
-    kind === :defensive && return prior.defensive_fit_diagnostics
-    throw(ArgumentError("kind must be :td or :defensive; got $kind"))
+function likelihood_fit_diagnostics(prior::HazardPrior, kind::Symbol)
+    _validate_cause(kind)
+    return kind === :td ?
+        prior.td_fit_diagnostics : prior.defensive_fit_diagnostics
 end
-# ----------------------------------------------------------------------
-# 3. Hazard model and posterior updates
-# ----------------------------------------------------------------------
 
 """
     HazardModel
 
-Mutable current-season hazard state. The prior stores historical
-empirical-Bayes information; the sufficient statistics store only observations
-added since that prior was initialized.
+Mutable current-season Weibull rate state. The prior stores historical
+empirical-Bayes mixtures; sufficient statistics contain only current-season
+event counts and transformed exposures.
 """
 mutable struct HazardModel
-    time_edges::Vector{Float64}
     prior::HazardPrior
     stats::HazardSufficientStats
 end
@@ -507,92 +482,98 @@ end
 home_multiplier(model::HazardModel, kind::Symbol) =
     home_multiplier(model.prior, kind)
 
-function _prior_mixture(
-    prior::HazardPrior,
-    kind::Symbol,
-    team::String,
-    time_bin::Int,
-)
-    1 <= time_bin <= length(prior.time_edges) - 1 ||
-        throw(BoundsError(prior.time_edges, time_bin))
-    if kind === :td
-        mixtures = get(prior.td_team_mixtures, team, nothing)
-        isnothing(mixtures) ||
-            return mixtures[time_bin]
-        return GammaMixture(
-            [1.0],
-            [prior.td_hyperparameters[time_bin]];
-            source_seasons=[0],
-        )
-    elseif kind === :defensive
-        mixtures = get(prior.defensive_team_mixtures, team, nothing)
-        isnothing(mixtures) ||
-            return mixtures[time_bin]
-        return GammaMixture(
-            [1.0],
-            [prior.defensive_hyperparameters[time_bin]];
-            source_seasons=[0],
-        )
-    end
-    throw(ArgumentError("kind must be :td or :defensive; got $kind"))
+function _prior_mixture(prior::HazardPrior, kind::Symbol, team::String)
+    _validate_cause(kind)
+    mixtures = kind === :td ? prior.td_team_mixtures : prior.defensive_team_mixtures
+    haskey(mixtures, team) && return mixtures[team]
+    hyperparameter = kind === :td ?
+        prior.td_hyperparameters : prior.defensive_hyperparameters
+    return GammaMixture([1.0], [hyperparameter]; source_seasons=[0])
 end
 
 """
     update_hazard_model!(model, drives) -> HazardModel
 
-Add new drive exposure and event counts to the model and update its Gamma
-posteriors. This is the intended in-season update operation.
+Add current-season drive durations, event counts, and transformed exposures.
 """
 function update_hazard_model!(model::HazardModel, drives::AbstractDataFrame)
-    data, edges = build_exposure_data(drives; time_edges=model.time_edges)
-    edges == model.time_edges ||
-        throw(ArgumentError("new exposure data uses incompatible time_edges"))
-    _add_exposure_data!(model.stats, data)
+    data = build_drive_data(drives)
+    _add_drive_stats!(
+        model.stats,
+        data,
+        model.prior.td_shape,
+        model.prior.defensive_shape,
+    )
     return model
 end
 
 """
-    hazard_posterior(model, kind, team, time_bin; home=false) -> GammaMixture
+    hazard_posterior(model, kind, team; home=false) -> GammaMixture
 
-Return the exact finite Gamma-mixture posterior for one team's hazard in one
-elapsed-time bin. When `home=true`, return the mixture of home-adjusted
-hazards rather than the baseline (away) hazards.
+Return the finite Gamma-mixture posterior for a team's Weibull
+cumulative-hazard rate. With `home=true`, return the mixture for the
+home-adjusted rate.
 """
 function hazard_posterior(
     model::HazardModel,
     kind::Symbol,
-    team,
-    time_bin::Integer,
-    ;
+    team;
     home::Bool=false,
 )
+    _validate_cause(kind)
     team_name = string(team)
-    prior = _prior_mixture(model.prior, kind, team_name, Int(time_bin))
-    outcome = _outcome_stats(model.stats, kind)
-    key = (team_name, Int(time_bin))
+    prior = _prior_mixture(model.prior, kind, team_name)
+    stats = _outcome_stats(model.stats, kind)
     multiplier = home_multiplier(model.prior, kind)
     posterior = _update_gamma_mixture(
         prior,
-        get(outcome.home_counts, key, 0.0) +
-            get(outcome.away_counts, key, 0.0),
-        get(outcome.away_exposure, key, 0.0) +
-            multiplier * get(outcome.home_exposure, key, 0.0),
+        get(stats.counts, team_name, 0.0),
+        get(stats.away_exposure, team_name, 0.0) +
+            multiplier * get(stats.home_exposure, team_name, 0.0),
     )
     return home ? _gamma_mixture_home_adjusted(posterior, multiplier) : posterior
 end
 
+"""
+    hazard_rate(model, kind, team, elapsed_minutes; home=false) -> Float64
+
+Return the posterior-mean instantaneous Weibull hazard at `elapsed_minutes`.
+The elapsed time is measured in minutes.
+"""
+function hazard_rate(
+    model::HazardModel,
+    kind::Symbol,
+    team,
+    elapsed_minutes::Real;
+    home::Bool=false,
+)
+    time_value = Float64(elapsed_minutes)
+    isfinite(time_value) && time_value >= 0.0 ||
+        throw(ArgumentError("elapsed_minutes must be finite and nonnegative"))
+    shape = weibull_shape(model.prior, kind)
+    rate_mean = _gamma_mixture_mean(
+        hazard_posterior(model, kind, team; home=home),
+    )
+    if time_value == 0.0
+        shape < 1.0 && return Inf
+        shape > 1.0 && return 0.0
+        return rate_mean
+    end
+    return rate_mean * shape * time_value^(shape - 1.0)
+end
+
 mutable struct _HazardLogMomentCache
     model::HazardModel
-    posteriors::Dict{Tuple{Symbol,String,Int},GammaMixture}
-    log_moments::Dict{Tuple{Symbol,String,Int,Bool},Tuple{Float64,Float64}}
+    posteriors::Dict{Tuple{Symbol,String},GammaMixture}
+    log_moments::Dict{Tuple{Symbol,String,Bool},Tuple{Float64,Float64}}
     hits::Int
     misses::Int
 end
 
 _HazardLogMomentCache(model::HazardModel) = _HazardLogMomentCache(
     model,
-    Dict{Tuple{Symbol,String,Int},GammaMixture}(),
-    Dict{Tuple{Symbol,String,Int,Bool},Tuple{Float64,Float64}}(),
+    Dict{Tuple{Symbol,String},GammaMixture}(),
+    Dict{Tuple{Symbol,String,Bool},Tuple{Float64,Float64}}(),
     0,
     0,
 )
@@ -602,15 +583,13 @@ function _cached_hazard_posterior(
     model::HazardModel,
     kind::Symbol,
     team,
-    time_bin::Integer,
 )
     cache.model === model ||
         throw(ArgumentError("hazard log-moment cache belongs to a different model"))
     team_name = string(team)
-    key = (kind, team_name, Int(time_bin))
+    key = (kind, team_name)
     haskey(cache.posteriors, key) && return cache.posteriors[key]
-
-    posterior = hazard_posterior(model, kind, team_name, time_bin)
+    posterior = hazard_posterior(model, kind, team_name)
     cache.posteriors[key] = posterior
     return posterior
 end
@@ -618,80 +597,34 @@ end
 function _hazard_log_moments(
     model::HazardModel,
     kind::Symbol,
-    team,
-    time_bin::Integer;
+    team;
     home::Bool=false,
     cache::Union{Nothing,_HazardLogMomentCache}=nothing,
 )
-    if isnothing(cache)
+    isnothing(cache) &&
         return _gamma_mixture_log_moments(
-            hazard_posterior(model, kind, team, time_bin; home=home),
+            hazard_posterior(model, kind, team; home=home),
         )
-    end
-
     cache.model === model ||
         throw(ArgumentError("hazard log-moment cache belongs to a different model"))
     team_name = string(team)
-    key = (kind, team_name, Int(time_bin), home)
+    key = (kind, team_name, home)
     if haskey(cache.log_moments, key)
         cache.hits += 1
         return cache.log_moments[key]
     end
-
     cache.misses += 1
-    posterior = _cached_hazard_posterior(
-        cache,
-        model,
-        kind,
-        team_name,
-        time_bin,
-    )
+    posterior = _cached_hazard_posterior(cache, model, kind, team_name)
     adjusted_posterior = home ?
         _gamma_mixture_home_adjusted(
             posterior,
             home_multiplier(model.prior, kind),
-        ) :
-        posterior
+        ) : posterior
     moments = _gamma_mixture_log_moments(adjusted_posterior)
     cache.log_moments[key] = moments
     return moments
 end
 
-"""
-    hazard_rate(model, kind, team, time_bin; home=false) -> Float64
-
-Return the posterior-mean instantaneous hazard rate. `kind` is `:td` for an
-offensive touchdown hazard or `:defensive` for a defensive-event hazard.
-When `home=true`, apply the fitted home multiplier.
-"""
-function hazard_rate(
-    model::HazardModel,
-    kind::Symbol,
-    team,
-    time_bin::Integer,
-    ;
-    home::Bool=false,
-)
-    posterior = hazard_posterior(model, kind, team, time_bin; home=home)
-    return _gamma_mixture_mean(posterior)
-end
-
-"""
-    HazardTheta
-
-Posterior moments of a matchup's log-hazard parameter vector. The vector is
-ordered by time-bin blocks:
-
-1. home team's offensive touchdown hazards;
-2. away team's defensive-event hazards;
-3. away team's offensive touchdown hazards;
-4. home team's defensive-event hazards.
-
-Each block contains one value per elapsed-time bin. `log_mean` and
-`covariance` describe the posterior mean and covariance of the log hazards.
-The covariance is conditional on the fitted empirical-Bayes prior and home
-multipliers.
-"""
 struct HazardTheta
     log_mean::Vector{Float64}
     covariance::Matrix{Float64}
@@ -716,50 +649,33 @@ struct HazardTheta
 end
 
 function _matchup_theta_posteriors(model::HazardModel, home_team, away_team)
-    n_bins = length(model.time_edges) - 1
     requests = (
-        (:td, home_team, true, "home_td"),
-        (:defensive, away_team, false, "away_defensive"),
-        (:td, away_team, false, "away_td"),
-        (:defensive, home_team, true, "home_defensive"),
+        (:td, home_team, true, :home_td),
+        (:defensive, away_team, false, :away_defensive),
+        (:td, away_team, false, :away_td),
+        (:defensive, home_team, true, :home_defensive),
     )
     posteriors = GammaMixture[]
-    posterior_keys = Tuple{Symbol,String,Int}[]
+    posterior_keys = Tuple{Symbol,String}[]
     labels = Symbol[]
-
-    for (kind, team, home, label_prefix) in requests
-        for time_bin in 1:n_bins
-            push!(
-                posteriors,
-                hazard_posterior(model, kind, team, time_bin; home=home),
-            )
-            push!(posterior_keys, (kind, string(team), time_bin))
-            push!(labels, Symbol(label_prefix, "_", time_bin))
-        end
+    for (kind, team, home, label) in requests
+        push!(posteriors, hazard_posterior(model, kind, team; home=home))
+        push!(posterior_keys, (kind, string(team)))
+        push!(labels, label)
     end
-
     return posteriors, posterior_keys, labels
 end
 
-"""
-    hazard_theta(model, home_team, away_team) -> HazardTheta
-
-Return the ordered posterior mean and covariance of the matchup log-hazard
-vector. The four blocks correspond to home offense, away defense, away
-offense, and home defense, respectively, with one entry per model time bin.
-The finite-mixture posteriors are transformed exactly to their mixture
-log-hazard moments.
-"""
 function hazard_theta(model::HazardModel, home_team, away_team)
     posteriors, posterior_keys, labels =
         _matchup_theta_posteriors(model, home_team, away_team)
-    log_mean = [_gamma_mixture_log_moments(posterior)[1] for posterior in posteriors]
+    log_moments = [_gamma_mixture_log_moments(posterior) for posterior in posteriors]
     covariance = zeros(Float64, length(posteriors), length(posteriors))
     for i in eachindex(posteriors), j in eachindex(posteriors)
         posterior_keys[i] == posterior_keys[j] || continue
-        covariance[i, j] = _gamma_mixture_log_moments(posteriors[i])[2]
+        covariance[i, j] = log_moments[i][2]
     end
-    return HazardTheta(log_mean, covariance, labels)
+    return HazardTheta(first.(log_moments), covariance, labels)
 end
 
 function _hazard_theta_with_cache(
@@ -770,52 +686,41 @@ function _hazard_theta_with_cache(
 )
     cache.model === model ||
         throw(ArgumentError("hazard log-moment cache belongs to a different model"))
-    n_bins = length(model.time_edges) - 1
     requests = (
-        (:td, home_team, true, "home_td"),
-        (:defensive, away_team, false, "away_defensive"),
-        (:td, away_team, false, "away_td"),
-        (:defensive, home_team, true, "home_defensive"),
+        (:td, home_team, true, :home_td),
+        (:defensive, away_team, false, :away_defensive),
+        (:td, away_team, false, :away_td),
+        (:defensive, home_team, true, :home_defensive),
     )
-    log_moments = Tuple{Float64,Float64}[]
-    posterior_keys = Tuple{Symbol,String,Int}[]
+    moments = Tuple{Float64,Float64}[]
+    posterior_keys = Tuple{Symbol,String}[]
     labels = Symbol[]
-
-    for (kind, team, home, label_prefix) in requests
-        for time_bin in 1:n_bins
-            push!(
-                log_moments,
-                _hazard_log_moments(
-                    model,
-                    kind,
-                    team,
-                    time_bin;
-                    home=home,
-                    cache=cache,
-                ),
-            )
-            push!(posterior_keys, (kind, string(team), time_bin))
-            push!(labels, Symbol(label_prefix, "_", time_bin))
-        end
+    for (kind, team, home, label) in requests
+        push!(
+            moments,
+            _hazard_log_moments(
+                model,
+                kind,
+                team;
+                home=home,
+                cache=cache,
+            ),
+        )
+        push!(posterior_keys, (kind, string(team)))
+        push!(labels, label)
     end
-
-    log_mean = [moments[1] for moments in log_moments]
-    covariance = zeros(Float64, length(log_moments), length(log_moments))
-    for i in eachindex(log_moments), j in eachindex(log_moments)
+    covariance = zeros(Float64, length(moments), length(moments))
+    for i in eachindex(moments), j in eachindex(moments)
         posterior_keys[i] == posterior_keys[j] || continue
-        covariance[i, j] = log_moments[i][2]
+        covariance[i, j] = moments[i][2]
     end
-    return HazardTheta(log_mean, covariance, labels)
+    return HazardTheta(first.(moments), covariance, labels)
 end
-
-# ----------------------------------------------------------------------
-# 4. Conditional score marks
-# ----------------------------------------------------------------------
 
 """
     ScoreMarks
 
-Empirical mean/variance of the possessing team's point differential,
+Empirical mean and variance of the possessing team's point differential,
 conditional on a touchdown or defensive event.
 """
 struct ScoreMarks
@@ -828,29 +733,32 @@ end
 """
     fit_score_marks(drives) -> ScoreMarks
 
-Estimate outcome-conditional score moments. Censored drives are excluded.
-All non-touchdown, non-censored outcomes are included in the defensive-event
-mark.
+Estimate outcome-conditional score moments from uncensored training drives.
 """
 function fit_score_marks(drives::AbstractDataFrame)
+    :home_spread_change in propertynames(drives) ||
+        throw(ArgumentError("drives are missing required column :home_spread_change"))
+    :posteam_home in propertynames(drives) ||
+        throw(ArgumentError("drives are missing required column :posteam_home"))
     complete = subset(
         drives,
-        :drive_result => ByRow(x -> _classify_event(x) !== :censored);
+        :drive_result => ByRow(!ismissing),
+        :home_spread_change => ByRow(!ismissing),
+        :posteam_home => ByRow(!ismissing);
         skipmissing=true,
     )
-    offense_points = ifelse.(
-        complete.posteam_home,
-        complete.home_spread_change,
-        -complete.home_spread_change,
+    events = _classify_event.(String.(complete.drive_result))
+    points = ifelse.(
+        Bool.(complete.posteam_home),
+        Float64.(complete.home_spread_change),
+        -Float64.(complete.home_spread_change),
     )
-    events = _classify_event.(complete.drive_result)
-
-    td_points = offense_points[events .=== :td]
-    defensive_points = offense_points[events .=== :defensive]
-    isempty(td_points) && throw(ArgumentError("no touchdown drives available for score marks"))
+    td_points = points[events .=== :td]
+    defensive_points = points[events .=== :defensive]
+    isempty(td_points) &&
+        throw(ArgumentError("no touchdown drives available for score marks"))
     isempty(defensive_points) &&
         throw(ArgumentError("no defensive-event drives available for score marks"))
-
     return ScoreMarks(
         mean(td_points),
         var(td_points; corrected=false),
@@ -859,16 +767,6 @@ function fit_score_marks(drives::AbstractDataFrame)
     )
 end
 
-# ----------------------------------------------------------------------
-# 5. Per-drive moments
-# ----------------------------------------------------------------------
-
-"""
-    DriveMoments
-
-Moments of one drive's duration and possessing-team score under the
-two-hazard race.
-"""
 struct DriveMoments{T<:Real}
     p_td::T
     p_defensive::T
@@ -879,123 +777,267 @@ struct DriveMoments{T<:Real}
     cov_TS::T
 end
 
-_bin_widths(edges::AbstractVector{<:Real}) = diff(edges)
+struct WeibullRaceIntegrals
+    values::Vector{Float64}
+    jacobian::Matrix{Float64}
+    hessians::Array{Float64,3}
+end
 
-function _drive_moments_from_hazards(
-    edges::AbstractVector{<:Real},
-    marks::ScoreMarks,
-    lambda_td::AbstractVector{<:Real},
-    lambda_defensive::AbstractVector{<:Real},
+function _integral_value_index(cause::Int, moment_order::Int)
+    return (cause - 1) * 3 + moment_order + 1
+end
+
+function _integral_gradient_index(value_index::Int, parameter::Int)
+    return 6 + (value_index - 1) * 2 + parameter
+end
+
+function _integral_hessian_index(
+    value_index::Int,
+    first_parameter::Int,
+    second_parameter::Int,
 )
-    widths = _bin_widths(edges)
-    n = length(widths)
-    length(lambda_td) == n && length(lambda_defensive) == n ||
-        throw(ArgumentError("hazard vectors must contain one value per time bin"))
-    T = promote_type(eltype(lambda_td), eltype(lambda_defensive), Float64)
+    return 18 + (value_index - 1) * 4 +
+        (first_parameter - 1) * 2 + second_parameter
+end
 
-    lambda = lambda_td .+ lambda_defensive
-    S_prev = one(T)
-    p_event = zeros(T, n)
-    e_time = zeros(T, n)
-    contrib_ET = zeros(T, n)
-    contrib_ET2 = zeros(T, n)
-
-    for k in 1:n
-        lo, width, total_rate = edges[k], widths[k], lambda[k]
-        if isinf(width)
-            p_event[k] = S_prev
-            e_time[k] = lo + 1 / total_rate
-            contrib_ET[k] = S_prev / total_rate
-            contrib_ET2[k] = S_prev * (2 * lo / total_rate + 2 / total_rate^2)
-        else
-            decay = exp(-total_rate * width)
-            p_event[k] = S_prev * (1 - decay)
-            e_local = (1 - decay * (1 + total_rate * width)) /
-                (total_rate * (1 - decay))
-            e_time[k] = lo + e_local
-            contrib_ET[k] = S_prev * (1 - decay) / total_rate
-            local_sq = (1 - decay * (1 + total_rate * width)) / total_rate^2
-            contrib_ET2[k] = S_prev * (
-                2 * lo * (1 - decay) / total_rate + 2 * local_sq
-            )
-            S_prev *= decay
+function _weibull_race_integrand(
+    x::Float64,
+    rho_td::Float64,
+    td_shape::Float64,
+    rho_defensive::Float64,
+    defensive_shape::Float64,
+    q::Float64,
+    log_time_scale::Float64,
+)
+    result = zeros(Float64, 42)
+    if x == 0.0
+        for cause in 1:2
+            shape = cause == 1 ? td_shape : defensive_shape
+            rho = cause == 1 ? rho_td : rho_defensive
+            shape == q || continue
+            value_index = _integral_value_index(cause, 0)
+            limit = rho * exp(q * log_time_scale)
+            result[value_index] = limit
+            for parameter in 1:2
+                score = parameter == cause ? 1.0 : 0.0
+                result[_integral_gradient_index(value_index, parameter)] =
+                    limit * score
+                for second_parameter in 1:2
+                    result[_integral_hessian_index(
+                        value_index,
+                        parameter,
+                        second_parameter,
+                    )] = limit * score *
+                        (second_parameter == cause ? 1.0 : 0.0)
+                end
+            end
         end
+        return result
     end
 
-    td_weights = [
-        p_event[k] * (lambda_td[k] / lambda[k]) for k in 1:n
-    ]
-    defensive_weights = [
-        p_event[k] * (lambda_defensive[k] / lambda[k]) for k in 1:n
-    ]
-    p_td = sum(td_weights)
-    p_defensive = sum(defensive_weights)
+    log_x = log(x)
+    log_time = log_time_scale + log_x / q
+    if log_time > log(floatmax(Float64))
+        return result
+    end
+    time = exp(log_time)
+    log_jacobian = log_time_scale - log(q) + (1.0 / q - 1.0) * log_x
+    log_exposure_td = log(rho_td) + td_shape * log_time
+    log_exposure_defensive = log(rho_defensive) +
+        defensive_shape * log_time
+    exposure_td = log_exposure_td > log(floatmax(Float64)) ?
+        Inf : exp(log_exposure_td)
+    exposure_defensive = log_exposure_defensive > log(floatmax(Float64)) ?
+        Inf : exp(log_exposure_defensive)
+    total_exposure = exposure_td + exposure_defensive
+    total_exposure > 745.0 && return result
 
-    conditional_mean_time = (weights, probability) ->
-        probability > 0 ?
-            sum(weights[k] * e_time[k] for k in 1:n) / probability :
-            zero(T)
-    mean_T_td = conditional_mean_time(td_weights, p_td)
-    mean_T_defensive = conditional_mean_time(defensive_weights, p_defensive)
+    for cause in 1:2
+        rho = cause == 1 ? rho_td : rho_defensive
+        shape = cause == 1 ? td_shape : defensive_shape
+        cause_exposure = cause == 1 ? exposure_td : exposure_defensive
+        log_density_base = log(rho) + log(shape) +
+            (shape - 1.0) * log_time + log_jacobian - total_exposure
+        for moment_order in 0:2
+            log_integrand = log_density_base + moment_order * log_time
+            value = log_integrand < -745.0 ? 0.0 : exp(log_integrand)
+            value_index = _integral_value_index(cause, moment_order)
+            result[value_index] = value
+            scores = (
+                (cause == 1 ? 1.0 : 0.0) - exposure_td,
+                (cause == 2 ? 1.0 : 0.0) - exposure_defensive,
+            )
+            for parameter in 1:2
+                result[_integral_gradient_index(value_index, parameter)] =
+                    value * scores[parameter]
+                for second_parameter in 1:2
+                    log_hessian = parameter == second_parameter ?
+                        -(second_parameter == 1 ?
+                            exposure_td : exposure_defensive) : 0.0
+                    result[_integral_hessian_index(
+                        value_index,
+                        parameter,
+                        second_parameter,
+                    )] = value * (
+                        scores[parameter] * scores[second_parameter] +
+                        log_hessian
+                    )
+                end
+            end
+        end
+    end
+    return result
+end
 
-    mean_T = sum(contrib_ET)
-    mean_T2 = sum(contrib_ET2)
-    var_T = mean_T2 - mean_T^2
+"""
+    _weibull_race_integrals(rho_td, td_shape, rho_def, def_shape)
 
-    mean_S = p_td * marks.mean_td + p_defensive * marks.mean_defensive
-    mean_S2 = p_td * (marks.var_td + marks.mean_td^2) +
+Integrate the two cause densities and their first two time moments. The
+gradient and Hessian arrays are with respect to the two log rates.
+"""
+function _weibull_race_integrals(
+    rho_td::Real,
+    td_shape::Real,
+    rho_defensive::Real,
+    defensive_shape::Real;
+    rtol::Real=1e-9,
+)
+    values = Float64.((rho_td, td_shape, rho_defensive, defensive_shape))
+    rho_td_value, td_shape_value, rho_defensive_value,
+        defensive_shape_value = values
+    all(isfinite, values) ||
+        throw(ArgumentError("Weibull rates and shapes must be finite"))
+    rho_td_value > 0.0 && rho_defensive_value > 0.0 ||
+        throw(ArgumentError("Weibull rates must be positive"))
+    td_shape_value > 0.0 && defensive_shape_value > 0.0 ||
+        throw(ArgumentError("Weibull shapes must be positive"))
+    isfinite(rtol) && rtol > 0.0 ||
+        throw(ArgumentError("quadrature rtol must be finite and positive"))
+
+    q = min(td_shape_value, defensive_shape_value)
+    log_time_scale = min(
+        -log(rho_td_value) / td_shape_value,
+        -log(rho_defensive_value) / defensive_shape_value,
+    )
+    isfinite(log_time_scale) ||
+        throw(ArgumentError("Weibull time scale is not finite"))
+    log_time_scale = clamp(
+        log_time_scale,
+        log(floatmin(Float64)) + 10.0,
+        log(floatmax(Float64)) - 10.0,
+    )
+    integral, _ = QuadGK.quadgk(
+        x -> _weibull_race_integrand(
+            Float64(x),
+            rho_td_value,
+            td_shape_value,
+            rho_defensive_value,
+            defensive_shape_value,
+            q,
+            log_time_scale,
+        ),
+        0.0,
+        Inf;
+        rtol=Float64(rtol),
+    )
+    integral_values = integral[1:6]
+    all(isfinite, integral_values) ||
+        throw(ArgumentError("Weibull race integration returned non-finite moments"))
+    probability_sum = integral_values[1] + integral_values[4]
+    abs(probability_sum - 1.0) <= 1e-6 ||
+        throw(ArgumentError(
+            "Weibull race probabilities do not sum to one: $probability_sum",
+        ))
+    jacobian = Matrix{Float64}(undef, 6, 2)
+    hessians = Array{Float64}(undef, 6, 2, 2)
+    for value_index in 1:6
+        for parameter in 1:2
+            jacobian[value_index, parameter] =
+                integral[_integral_gradient_index(value_index, parameter)]
+            for second_parameter in 1:2
+                hessians[value_index, parameter, second_parameter] =
+                    integral[_integral_hessian_index(
+                        value_index,
+                        parameter,
+                        second_parameter,
+                    )]
+            end
+        end
+    end
+    return WeibullRaceIntegrals(integral_values, jacobian, hessians)
+end
+
+function _drive_moment_values(integrals, marks::ScoreMarks)
+    p_td, mean_time_td, second_time_td,
+        p_defensive, mean_time_defensive, second_time_defensive = integrals
+    mean_time = mean_time_td + mean_time_defensive
+    variance_time = second_time_td + second_time_defensive - mean_time^2
+    mean_score = p_td * marks.mean_td +
+        p_defensive * marks.mean_defensive
+    second_score = p_td * (marks.var_td + marks.mean_td^2) +
         p_defensive * (marks.var_defensive + marks.mean_defensive^2)
-    var_S = mean_S2 - mean_S^2
-    mean_TS = p_td * mean_T_td * marks.mean_td +
-        p_defensive * mean_T_defensive * marks.mean_defensive
-    cov_TS = mean_TS - mean_T * mean_S
-
-    return DriveMoments(
+    variance_score = second_score - mean_score^2
+    mean_time_score = mean_time_td * marks.mean_td +
+        mean_time_defensive * marks.mean_defensive
+    covariance_time_score = mean_time_score - mean_time * mean_score
+    result = similar(integrals, 7)
+    result .= (
         p_td,
         p_defensive,
-        mean_T,
-        var_T,
-        mean_S,
-        var_S,
-        cov_TS,
+        mean_time,
+        variance_time,
+        mean_score,
+        variance_score,
+        covariance_time_score,
     )
+    return result
 end
 
-"""
-    drive_moments(model, marks, posteam, defteam; posteam_home=false) -> DriveMoments
-
-Compute closed-form duration, score, and time/score covariance moments for a
-drive with the given offensive and defensive teams. `posteam_home` selects the
-home-adjusted offensive hazard; the defensive team is assigned the
-complementary away/home status.
-"""
-function drive_moments(
-    model::HazardModel,
+function _drive_moments_from_weibull(
+    rho_td::Real,
+    td_shape::Real,
+    rho_defensive::Real,
+    defensive_shape::Real,
     marks::ScoreMarks,
-    posteam,
-    defteam,
-    ;
-    posteam_home::Bool=false,
 )
-    edges = model.time_edges
-    widths = _bin_widths(edges)
-    n = length(widths)
-
-    lambda_td = [
-        hazard_rate(model, :td, posteam, k; home=posteam_home)
-        for k in 1:n
-    ]
-    lambda_defensive = [
-        hazard_rate(model, :defensive, defteam, k; home=!posteam_home)
-        for k in 1:n
-    ]
-    return _drive_moments_from_hazards(edges, marks, lambda_td, lambda_defensive)
+    integrals = _weibull_race_integrals(
+        rho_td,
+        td_shape,
+        rho_defensive,
+        defensive_shape,
+    )
+    values = _drive_moment_values(integrals.values, marks)
+    return DriveMoments(values...)
 end
 
-drive_moments(
-    model::HazardModel,
-    marks::ScoreMarks,
-    posteam,
-    defteam,
-    posteam_home::Bool,
-) = drive_moments(model, marks, posteam, defteam; posteam_home=posteam_home)
+"""
+    fit_hazard_model(drives; historical_drives=nothing, prior=nothing, kwargs...) -> HazardModel
+
+Initialize a current-season Weibull competing-risk model. Supply either a
+precomputed prior or historical drives from which to fit one.
+"""
+function fit_hazard_model(
+    drives::AbstractDataFrame;
+    historical_drives::Union{Nothing,AbstractDataFrame}=nothing,
+    prior::Union{Nothing,HazardPrior}=nothing,
+    max_seasons::Int=DEFAULT_HISTORICAL_SEASONS,
+    current_season::Union{Nothing,Integer}=nothing,
+    method=DEFAULT_PRIOR_FIT_METHOD,
+)
+    fitted_prior = if prior !== nothing
+        prior
+    elseif historical_drives !== nothing
+        reference_season = current_season === nothing ?
+            _latest_observed_season(drives) : Int(current_season)
+        fit_empirical_bayes_prior(
+            historical_drives;
+            max_seasons=max_seasons,
+            current_season=reference_season,
+            method=method,
+        )
+    else
+        _default_hazard_prior()
+    end
+    model = HazardModel(fitted_prior, HazardSufficientStats())
+    return update_hazard_model!(model, drives)
+end
